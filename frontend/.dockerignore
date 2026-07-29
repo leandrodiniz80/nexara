@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+build
+coverage
+npm-debug.log*
+.env
+.env.local
+.git
+.husky
