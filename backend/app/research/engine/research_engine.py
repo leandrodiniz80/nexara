@@ -3,7 +3,10 @@ import io
 import json
 from typing import Literal
 
-from app.research.exceptions.provider_exceptions import NoProviderAvailableError, ProviderNotAvailableError
+from app.research.exceptions.provider_exceptions import (
+    NoProviderAvailableError,
+    ProviderNotAvailableError,
+)
 from app.research.models.enums import ResearchSource
 from app.research.models.research_result import ResearchResult
 from app.research.providers.base.research_provider import ResearchProvider
@@ -130,7 +133,9 @@ class ResearchEngine:
         state: str | None = None,
         source: ResearchSource | None = None,
     ) -> list[ResearchResult]:
-        return await self._run_strategy(SearchByCNAEStrategy(), source, cnae=cnae, city=city, state=state)
+        return await self._run_strategy(
+            SearchByCNAEStrategy(), source, cnae=cnae, city=city, state=state
+        )
 
     async def search_nearby(
         self,

@@ -5,6 +5,7 @@ from app.research.providers.google_maps_provider import GoogleMapsProvider
 from app.research.providers.instagram_provider import InstagramProvider
 from app.research.providers.linkedin_provider import LinkedInProvider
 from app.research.providers.manual_provider import ManualProvider
+from app.research.providers.mock_provider import MockProvider
 from app.research.providers.website_provider import WebsiteProvider
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "InstagramProvider",
     "LinkedInProvider",
     "ManualProvider",
+    "MockProvider",
     "WebsiteProvider",
 ]

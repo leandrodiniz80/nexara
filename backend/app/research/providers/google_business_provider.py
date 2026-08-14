@@ -19,7 +19,9 @@ class GoogleBusinessProvider(ProviderBase):
         raise NotImplementedError("GoogleBusinessProvider.get_company() is not implemented yet.")
 
     async def search_contacts(self, company: ResearchResult) -> list[ContactLead]:
-        raise NotImplementedError("GoogleBusinessProvider.search_contacts() is not implemented yet.")
+        raise NotImplementedError(
+            "GoogleBusinessProvider.search_contacts() is not implemented yet."
+        )
 
     async def health_check(self) -> bool:
         raise NotImplementedError("GoogleBusinessProvider.health_check() is not implemented yet.")

@@ -1,6 +1,6 @@
 from app.ai.agents.agent_base import AgentBase
 from app.ai.agents.analytics_agent import AnalyticsAgent
-from app.ai.agents.copy_agent import CopyAgent
+from app.ai.agents.copy.copy_agent import CopyAgent
 from app.ai.agents.enrichment_agent import EnrichmentAgent
 from app.ai.agents.enums import AgentType
 from app.ai.agents.qualification_agent import QualificationAgent

@@ -22,6 +22,13 @@ class ResearchResultRepository:
         self._results.extend(results)
         return results
 
+    def remove_many(self, results: list[ResearchResult]) -> None:
+        """Removes exactly the given instances (by identity, not value) — the
+        rollback counterpart to add_many(), used when a later pipeline step fails
+        after PersistResultsStep already ran."""
+        to_remove = {id(r) for r in results}
+        self._results = [r for r in self._results if id(r) not in to_remove]
+
     def list_all(self) -> list[ResearchResult]:
         return list(self._results)
 

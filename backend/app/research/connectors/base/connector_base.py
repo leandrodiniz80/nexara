@@ -26,7 +26,11 @@ class HTTPConnector(ConnectorBase):
     """
 
     def __init__(
-        self, *, base_url: str | None = None, timeout: float = 10.0, headers: dict[str, str] | None = None
+        self,
+        *,
+        base_url: str | None = None,
+        timeout: float = 10.0,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url
         self.timeout = timeout

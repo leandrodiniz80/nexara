@@ -1,0 +1,3 @@
+from app.api.docs.openapi import API_DESCRIPTION, API_TITLE, API_VERSION, OPENAPI_TAGS
+
+__all__ = ["API_TITLE", "API_VERSION", "API_DESCRIPTION", "OPENAPI_TAGS"]

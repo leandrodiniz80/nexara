@@ -17,6 +17,10 @@ class SearchNearbyStrategy(SearchStrategy):
         **_ignored,
     ) -> list[ResearchResult]:
         query = CompanySearchQuery(
-            latitude=latitude, longitude=longitude, radius_km=radius_km, category=category, limit=limit
+            latitude=latitude,
+            longitude=longitude,
+            radius_km=radius_km,
+            category=category,
+            limit=limit,
         )
         return await provider.search(query)

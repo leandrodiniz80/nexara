@@ -13,7 +13,9 @@ def _normalize_phone(phone: str) -> str:
 
 
 def _normalize_domain(url: str) -> str:
-    domain = url.lower().strip().removeprefix("https://").removeprefix("http://").removeprefix("www.")
+    domain = (
+        url.lower().strip().removeprefix("https://").removeprefix("http://").removeprefix("www.")
+    )
     return domain.split("/")[0]
 
 
@@ -36,7 +38,8 @@ class DuplicateDetector:
         ]
 
         if a.website and b.website:
-            signals.append(1.0 if _normalize_domain(a.website) == _normalize_domain(b.website) else 0.0)
+            same_domain = _normalize_domain(a.website) == _normalize_domain(b.website)
+            signals.append(1.0 if same_domain else 0.0)
 
         a_phones = {_normalize_phone(p) for p in a.phones}
         b_phones = {_normalize_phone(p) for p in b.phones}
@@ -46,7 +49,10 @@ class DuplicateDetector:
         if a.city and b.city and a.state and b.state:
             # Name similarity means little across different cities/states (two
             # unrelated "Bar do João" are not the same company) — weight location in.
-            same_location = a.city.strip().lower() == b.city.strip().lower() and a.state.upper() == b.state.upper()
+            same_location = (
+                a.city.strip().lower() == b.city.strip().lower()
+                and a.state.upper() == b.state.upper()
+            )
             signals.append(1.0 if same_location else 0.0)
 
         return sum(signals) / len(signals)
