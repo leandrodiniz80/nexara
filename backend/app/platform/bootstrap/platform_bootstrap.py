@@ -29,7 +29,6 @@ from app.platform.features.platform_features_factory import build_default_platfo
 from app.platform.health.platform_health_facade_factory import (
     build_default_platform_health_facade,
 )
-from app.platform.lifecycle.platform_lifecycle_factory import build_default_platform_lifecycle
 from app.platform.orchestration.platform_execution_orchestrator_factory import (
     build_default_platform_execution_orchestrator,
 )
@@ -91,6 +90,19 @@ class PlatformBootstrap(BaseModel):
         return self._get_or_build("health", build_default_platform_health_facade)
 
     def lifecycle(self) -> Any:
+        # Local import: build_default_platform_lifecycle's own construction
+        # chain (lifecycle -> kernel_facade -> container -> bootstrap_factory)
+        # reaches back into this module to build a fresh PlatformBootstrap.
+        # Importing it eagerly at module scope makes that back-edge run while
+        # this module is still mid-execution, which is a circular import;
+        # deferring it here matches this method's own already-lazy contract
+        # (only called well after every module has finished loading) and
+        # changes nothing else about what lifecycle() returns or how it's
+        # cached.
+        from app.platform.lifecycle.platform_lifecycle_factory import (
+            build_default_platform_lifecycle,
+        )
+
         return self._get_or_build("lifecycle", build_default_platform_lifecycle)
 
     def events(self) -> Any:
