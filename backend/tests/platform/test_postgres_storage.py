@@ -184,7 +184,7 @@ def test_usage_persiste_entre_instancias_com_postgres_storage():
 
         auth2 = PlatformAuth(storage=PostgresStorage("postgresql://fake-dsn"))
 
-        assert auth2._usage_record(org_id)["requests_today"] == 2
+        assert auth2.get_usage_for_org(org_id) == 2
 
 
 def test_sessoes_nao_persistem_com_postgres_storage():

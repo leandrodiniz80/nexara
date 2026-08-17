@@ -81,7 +81,7 @@ def test_get_membro_comum_sem_organizacao_e_bloqueado():
     """A user with no organization at all is neither admin nor owner."""
     client, container = _client()
     token = _login(client, "user@test.com")
-    container.auth()._users["user@test.com"]["organization_id"] = None
+    container.auth().set_user_organization_for_test("user@test.com", None)
 
     response = client.get(
         "/api/v1/tenants/auto-actions", headers={"Authorization": f"Bearer {token}"}

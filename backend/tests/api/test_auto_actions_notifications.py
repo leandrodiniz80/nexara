@@ -130,7 +130,8 @@ def test_notificacao_nao_disparada_para_downgrade_recommendations():
     _login(client, "owner-a@test.com")
     org_a = container.auth().get_user_organization("owner-a@test.com")
     container.auth().set_organization_plan(org_a, "pro")
-    container.auth()._organizations[org_a]["created_at"] -= 40 * 86400
+    org = container.auth().get_organization(org_a)
+    container.auth().set_organization_created_at(org_a, org["created_at"] - 40 * 86400)
 
     client.post(
         "/api/v1/tenants/auto-actions/apply",

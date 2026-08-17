@@ -2523,7 +2523,7 @@ def test_execute_with_limit_funciona_e_incrementa_uso():
         return "ok"
 
     assert c.execute_with_limit("requests_per_day", fn) == "ok"
-    assert auth._usage_record(org_id)["requests_today"] == 1
+    assert auth.get_usage_for_org(org_id) == 1
 
 
 def test_execute_with_limit_bloqueia_apos_esgotar_cota():

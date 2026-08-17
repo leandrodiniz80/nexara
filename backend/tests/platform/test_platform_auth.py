@@ -72,7 +72,7 @@ def test_senha_nao_e_armazenada_em_texto_puro():
     auth = PlatformAuth()
     auth.register_user(_EMAIL, _PASSWORD)
 
-    user = auth._users[_EMAIL]
+    user = auth.get_user_credentials_for_test(_EMAIL)
 
     assert isinstance(user["salt"], bytes)
     assert isinstance(user["hash"], bytes)
@@ -85,8 +85,8 @@ def test_dois_usuarios_com_mesma_senha_tem_hashes_diferentes():
     auth.register_user("a@example.com", _PASSWORD)
     auth.register_user("b@example.com", _PASSWORD)
 
-    hash_a = auth._users["a@example.com"]["hash"]
-    hash_b = auth._users["b@example.com"]["hash"]
+    hash_a = auth.get_user_credentials_for_test("a@example.com")["hash"]
+    hash_b = auth.get_user_credentials_for_test("b@example.com")["hash"]
 
     assert hash_a != hash_b
 
@@ -184,9 +184,7 @@ def test_primeiro_usuario_da_org_auto_criada_e_owner():
     auth = PlatformAuth()
     auth.register_user(_EMAIL, _PASSWORD)
 
-    user = auth._users[_EMAIL]
-
-    assert user["organization_role"] == "owner"
+    assert auth.get_user_organization_role(_EMAIL) == "owner"
 
 
 def test_register_com_org_explicita_usa_org_informada():
@@ -204,9 +202,7 @@ def test_register_com_org_explicita_usa_role_padrao_member():
 
     auth.register_user(_EMAIL, _PASSWORD, organization_id=org_id)
 
-    user = auth._users[_EMAIL]
-
-    assert user["organization_role"] == "member"
+    assert auth.get_user_organization_role(_EMAIL) == "member"
 
 
 def test_create_organization_retorna_id_unico():
@@ -482,7 +478,7 @@ def test_increment_usage_incrementa_contador():
     auth.increment_usage(org_id, "requests_per_day")
     auth.increment_usage(org_id, "requests_per_day")
 
-    assert auth._usage_record(org_id)["requests_today"] == 2
+    assert auth.get_usage_for_org(org_id) == 2
 
 
 def test_reset_diario_zera_contador():
@@ -490,11 +486,11 @@ def test_reset_diario_zera_contador():
     org_id = auth.create_organization("Acme")
 
     auth.increment_usage(org_id, "requests_per_day")
-    assert auth._usage_record(org_id)["requests_today"] == 1
+    assert auth.get_usage_for_org(org_id) == 1
 
-    auth._usage[org_id]["last_reset"] -= 1
+    auth.expire_usage_for_org(org_id)
 
-    assert auth._usage_record(org_id)["requests_today"] == 0
+    assert auth.get_usage_for_org(org_id) == 0
 
 
 def test_check_limit_projects_nao_bloqueia_sem_tracking():
