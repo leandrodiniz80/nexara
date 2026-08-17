@@ -18,6 +18,12 @@ CMD ["npm", "run", "dev"]
 # ---------- Build ----------
 FROM base AS build
 ENV NODE_ENV=production
+# Next.js inlines NEXT_PUBLIC_* variables into the browser bundle at build
+# time (not read at container runtime), so Railway's service Variable alone
+# never reaches `next build` inside a Dockerfile build unless a matching ARG
+# is declared here for Railway to pass as a --build-arg into.
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
