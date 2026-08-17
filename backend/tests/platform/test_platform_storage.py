@@ -107,7 +107,7 @@ def test_usage_persiste_entre_instancias(tmp_path):
 
     auth2 = PlatformAuth(storage=FileStorage(path))
 
-    assert auth2._usage_record(org_id)["requests_today"] == 2
+    assert auth2.get_usage_for_org(org_id) == 2
 
 
 def test_sessoes_nao_persistem(tmp_path):

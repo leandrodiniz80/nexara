@@ -406,7 +406,7 @@ def test_auto_upgrade_criterio_de_saude_e_estruturalmente_inalcancavel_no_mundo_
     auto_upgrade()'s own docstring."""
     real_auth = PlatformAuth()
     org_id = real_auth.create_organization("Acme")
-    real_auth._organizations[org_id]["created_at"] = _days_ago(60)
+    real_auth.set_organization_created_at(org_id, _days_ago(60))
     real_analytics = BillingAnalytics(real_auth, get_usage=None)
 
     org = real_auth.get_organization(org_id)
@@ -429,8 +429,8 @@ def test_auto_downgrade_criterio_de_saude_e_estruturalmente_inalcancavel_no_mund
     real_auth = PlatformAuth()
     org_id = real_auth.create_organization("Acme")
     real_auth.set_organization_plan(org_id, "pro")
-    real_auth._organizations[org_id]["subscription_status"] = "canceled"
-    real_auth._organizations[org_id]["created_at"] = _days_ago(60)
+    real_auth.set_subscription_status(org_id, "canceled")
+    real_auth.set_organization_created_at(org_id, _days_ago(60))
     real_analytics = BillingAnalytics(real_auth, get_usage=lambda org_id, metric: 0)
 
     org = real_auth.get_organization(org_id)

@@ -78,7 +78,7 @@ def test_get_user_role_usa_cache_quando_disponivel():
 
     assert auth.get_user_role("user@test.com") == "user"
 
-    auth._users["user@test.com"]["role"] = "admin"
+    auth.set_user_role_for_test("user@test.com", "admin")
 
     assert auth.get_user_role("user@test.com") == "user"
 
@@ -90,7 +90,7 @@ def test_get_user_permissions_usa_cache_quando_disponivel():
 
     assert auth.get_user_permissions("user@test.com") == ["read"]
 
-    auth._users["user@test.com"]["permissions"] = ["read", "write"]
+    auth.set_user_permissions_for_test("user@test.com", ["read", "write"])
 
     assert auth.get_user_permissions("user@test.com") == ["read"]
 
@@ -102,7 +102,7 @@ def test_get_user_organization_usa_cache_quando_disponivel():
     original_org = auth.get_user_organization("user@test.com")
 
     other_org = auth.create_organization("Other Org")
-    auth._users["user@test.com"]["organization_id"] = other_org
+    auth.set_user_organization_for_test("user@test.com", other_org)
 
     assert auth.get_user_organization("user@test.com") == original_org
 
@@ -114,7 +114,7 @@ def test_get_organization_plan_usa_cache_quando_disponivel():
 
     assert auth.get_organization_plan(org_id) == "free"
 
-    auth._organizations[org_id]["plan"] = "pro"
+    auth.set_organization_plan_for_test(org_id, "pro")
 
     assert auth.get_organization_plan(org_id) == "free"
 
@@ -172,7 +172,7 @@ def test_cache_nao_afeta_usage():
     auth.increment_usage(org_id, "requests_per_day")
     auth.increment_usage(org_id, "requests_per_day")
 
-    assert auth._usage_record(org_id)["requests_today"] == 2
+    assert auth.get_usage_for_org(org_id) == 2
 
 
 def test_container_repassa_cache_para_auth():

@@ -158,11 +158,11 @@ def test_usage_alerts_e_isolado_por_tenant():
 
 def test_usage_alerts_sem_organizacao_retorna_404():
     """No public API removes a user's organization membership, so this
-    reaches into PlatformAuth's private `_users` dict directly — test
-    setup only, not a pattern used in production code."""
+    uses PlatformAuth's explicit test-support setter — test setup only,
+    not a pattern used in production code."""
     client, container, _ = _client()
     token = _login(client, "owner@test.com")
-    container.auth()._users["owner@test.com"]["organization_id"] = None
+    container.auth().set_user_organization_for_test("owner@test.com", None)
 
     res = client.get(
         "/api/v1/tenants/usage/alerts", headers={"Authorization": f"Bearer {token}"}
