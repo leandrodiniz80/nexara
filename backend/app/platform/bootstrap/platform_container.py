@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
 from app.platform.audit.platform_audit import PlatformAudit
+from app.platform.auth.auth_repository import AuthRepository
 from app.platform.auth.platform_auth import PlatformAuth
 from app.platform.bootstrap.platform_bootstrap import PlatformBootstrap
 from app.platform.bootstrap.platform_read_models import PlatformReadModels
@@ -38,6 +39,14 @@ class PlatformContainer(BaseModel):
     audit: PlatformAudit | None = None
     metrics: PlatformMetrics | None = None
     logger: PlatformLogger | None = None
+    # Fase 1 (auth persistence). Both additive and optional so every
+    # existing `PlatformContainer(bootstrap=..., ...)` call site (~50+ in
+    # tests) keeps constructing a dict-mode PlatformAuth exactly as
+    # before. Only the production container (app/api/dependencies/auth.py)
+    # passes these, to get real Postgres persistence and a stable
+    # session-signing secret across restarts.
+    auth_secret: bytes | None = None
+    auth_repository: AuthRepository | None = None
 
     _v2_registry: dict = PrivateAttr(default_factory=dict)
     _v2_counter: list = PrivateAttr(default_factory=lambda: [0])
@@ -56,11 +65,13 @@ class PlatformContainer(BaseModel):
     @model_validator(mode="after")
     def _init_auth(self) -> "PlatformContainer":
         self._auth = PlatformAuth(
+            secret=self.auth_secret,
             storage=self.storage,
             cache=self.cache,
             audit=self.audit,
             metrics=self.metrics,
             logger=self.logger,
+            repository=self.auth_repository,
         )
 
         return self

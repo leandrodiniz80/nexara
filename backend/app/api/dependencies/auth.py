@@ -1,7 +1,10 @@
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.core.config import settings
+from app.db.sync_session import SyncSessionLocal
 from app.platform.audit.platform_audit import PlatformAudit
+from app.platform.auth.auth_repository import AuthRepository
 from app.platform.bootstrap.platform_bootstrap import PlatformBootstrap
 from app.platform.bootstrap.platform_container import PlatformContainer
 
@@ -16,7 +19,22 @@ from app.platform.bootstrap.platform_container import PlatformContainer
 # configured. In-memory only (bounded to 10,000 events by PlatformAudit
 # itself) — same "evolves to real persistence later" scope as everything
 # else in this platform still backed by InMemoryStorage.
-_container = PlatformContainer(bootstrap=PlatformBootstrap(), audit=PlatformAudit())
+#
+# Fase 1 (auth persistence): `auth_secret`/`auth_repository` are what turn
+# on real Postgres persistence for users/organizations/sessions/usage
+# (see PlatformAuth.__init__ and PlatformContainer._init_auth). Without
+# `auth_secret=settings.SECRET_KEY.encode()`, PlatformAuth would keep
+# generating a random HMAC secret on every process start (`os.urandom(32)`
+# in PlatformAuth.__init__) — every session token signed before a restart
+# or redeploy would fail verification afterward. `SECRET_KEY` is already
+# a required setting for the whole platform, not a new secret to
+# provision.
+_container = PlatformContainer(
+    bootstrap=PlatformBootstrap(),
+    audit=PlatformAudit(),
+    auth_secret=settings.SECRET_KEY.encode(),
+    auth_repository=AuthRepository(SyncSessionLocal),
+)
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
