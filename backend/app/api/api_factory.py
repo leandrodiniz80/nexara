@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.docs.openapi import API_DESCRIPTION, API_TITLE, API_VERSION, OPENAPI_TAGS
 from app.api.exceptions.handlers import register_exception_handlers
@@ -45,14 +46,24 @@ def create_app() -> FastAPI:
     # Registered innermost-first: the *last* middleware added runs *first* on the
     # way in (and last on the way out) — RequestIdMiddleware must be outermost of
     # the original three so request.state.request_id exists before Timing/Logging
-    # (or any exception handler) ever look for it. TracingMiddleware is added last
-    # of all (truly outermost) so request.state.correlation_id is set before
-    # anything else runs, and its trace log captures the complete round trip.
+    # (or any exception handler) ever look for it. TracingMiddleware is added
+    # after that so request.state.correlation_id is set before anything else
+    # runs, and its trace log captures the complete round trip. CORSMiddleware is
+    # added last of all (truly outermost) so it can answer a browser's OPTIONS
+    # preflight — and attach Access-Control-* headers to every response, including
+    # error ones — before any other middleware or route ever runs.
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(TimingMiddleware)
     app.add_middleware(RequestIdMiddleware)
     app.add_middleware(TracingMiddleware)
     app.add_middleware(TenantMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.BACKEND_CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     register_exception_handlers(app)
 

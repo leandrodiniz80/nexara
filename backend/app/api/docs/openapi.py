@@ -1,4 +1,4 @@
-API_TITLE = "Elevel Prospect AI"
+API_TITLE = "Nexara"
 API_VERSION = "v1"
 API_DESCRIPTION = "AI Sales Prospecting Platform"
 

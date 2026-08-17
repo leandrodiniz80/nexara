@@ -2,42 +2,53 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Canonical Nexara design tokens — mirrors backend
+   app/platform/branding/nexara_theme.py exactly, so the frontend's default
+   look matches the platform's own served-at-runtime default theme
+   (GET /api/v1/branding/public) rather than inventing a separate palette. */
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
-    --radius: 0.5rem;
-  }
+    --background: #0b0f1a;
+    --foreground: #e6eaf2;
 
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
+    --card: #121826;
+    --card-foreground: #e6eaf2;
+
+    --primary: #6366f1;
+    --primary-foreground: #e6eaf2;
+
+    --secondary: #121826;
+    --secondary-foreground: #e6eaf2;
+
+    --muted: #121826;
+    --muted-foreground: #9aa4bf;
+
+    --accent: #1f2a44;
+    --accent-foreground: #e6eaf2;
+
+    --destructive: #ef4444;
+    --destructive-foreground: #e6eaf2;
+
+    --success: #22c55e;
+    --success-foreground: #0b0f1a;
+
+    --warning: #f59e0b;
+    --warning-foreground: #0b0f1a;
+
+    --info: #3b82f6;
+    --info-foreground: #e6eaf2;
+
+    --border: #1f2a44;
+    --input: #1f2a44;
+    --ring: #6366f1;
+
+    --radius: 8px;
+
+    --gradient-main: linear-gradient(135deg, #6366f1, #8b5cf6, #3b82f6);
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.15);
   }
 }
 
@@ -46,6 +57,9 @@
     @apply border-border;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background font-sans text-foreground antialiased;
+    font-feature-settings:
+      "rlig" 1,
+      "calt" 1;
   }
 }
