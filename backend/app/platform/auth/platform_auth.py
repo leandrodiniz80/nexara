@@ -3,8 +3,10 @@ import hmac
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 
 from app.platform.audit.platform_audit import PlatformAudit
+from app.platform.auth.auth_repository import AuthRepository
 from app.platform.cache.platform_cache import PlatformCache
 from app.platform.logging.platform_logger import PlatformLogger
 from app.platform.metrics.platform_metrics import PlatformMetrics
@@ -77,13 +79,31 @@ class PlatformAuth:
         audit: PlatformAudit | None = None,
         metrics: PlatformMetrics | None = None,
         logger: PlatformLogger | None = None,
+        repository: AuthRepository | None = None,
     ):
+        """Fase 1 (auth persistence). `repository` is additive and
+        optional: when `None` (the default — every one of the ~430
+        existing call sites and ~400 existing tests never pass it), every
+        method below runs exactly the same in-memory dict logic as
+        before, untouched. When a repository IS provided (only the
+        production composition root does this — see
+        `app/api/dependencies/auth.py`), the same methods delegate to real
+        Postgres instead, through the small `self._get_user()`/
+        `self._get_org()` read helpers and explicit `if self._repository
+        is not None:` branches at each write site. `self._users`/
+        `self._organizations`/`self._sessions`/`self._usage` keep existing
+        even in repository mode (harmless — nothing ever reads or writes
+        them in that mode) rather than making them conditionally absent,
+        since several call sites (and dict-mode-only tests) already assume
+        they exist as attributes.
+        """
         self._storage = storage or InMemoryStorage()
         self._cache = cache
         self._audit = audit
         self._metrics = metrics
         self._logger = logger
         self._rate_limiter = PlatformRateLimiter()
+        self._repository = repository
 
         data = self._storage.load()
 
@@ -100,6 +120,12 @@ class PlatformAuth:
         self._ttl = session_ttl
 
     def _persist(self) -> None:
+        if self._repository is not None:
+            # Repository-mode writes already commit to Postgres at the
+            # point they happen (see e.g. AuthRepository.update_organization);
+            # there's no in-memory blob left to flush here.
+            return
+
         self._storage.save(
             {
                 "users": self._users,
@@ -107,6 +133,25 @@ class PlatformAuth:
                 "usage": self._usage,
             }
         )
+
+    def _get_user(self, email: str) -> dict | None:
+        """Read helper used by every user-lookup method below. In
+        dict-mode this returns the *live* `self._users[email]` reference
+        (existing mutation-in-place callers keep working); in
+        repository-mode it returns a fresh dict built from the Postgres
+        row — mutating write paths never rely on mutating this returned
+        value, they always go through an explicit repository call."""
+        if self._repository is not None:
+            return self._repository.get_user(email)
+
+        return self._users.get(email)
+
+    def _get_org(self, org_id: str) -> dict | None:
+        """Same contract as `_get_user()`, for organizations."""
+        if self._repository is not None:
+            return self._repository.get_organization(org_id)
+
+        return self._organizations.get(org_id)
 
     def _invalidate_user_cache(self, email: str) -> None:
         if self._cache is None:
@@ -173,19 +218,31 @@ class PlatformAuth:
         correlation_id: str | None = None,
     ) -> None:
         salt = os.urandom(16)
+        password_hash = self._hash(password, salt)
 
         if organization_id is None:
             organization_id = self.create_organization(f"{email}'s organization")
             organization_role = "owner"
 
-        self._users[email] = {
-            "salt": salt,
-            "hash": self._hash(password, salt),
-            "role": role,
-            "permissions": permissions or [],
-            "organization_id": organization_id,
-            "organization_role": organization_role,
-        }
+        if self._repository is not None:
+            self._repository.create_or_replace_user(
+                email,
+                salt,
+                password_hash,
+                role,
+                permissions or [],
+                organization_id,
+                organization_role,
+            )
+        else:
+            self._users[email] = {
+                "salt": salt,
+                "hash": password_hash,
+                "role": role,
+                "permissions": permissions or [],
+                "organization_id": organization_id,
+                "organization_role": organization_role,
+            }
 
         self.add_user_to_organization(email, organization_id)
         self._invalidate_user_cache(email)
@@ -202,12 +259,15 @@ class PlatformAuth:
     def create_organization(self, name: str) -> str:
         org_id = uuid.uuid4().hex
 
-        self._organizations[org_id] = {
-            "name": name,
-            "created_at": int(time.time()),
-            "users": [],
-            "plan": "free",
-        }
+        if self._repository is not None:
+            self._repository.create_organization(org_id, name)
+        else:
+            self._organizations[org_id] = {
+                "name": name,
+                "created_at": int(time.time()),
+                "users": [],
+                "plan": "free",
+            }
 
         self._persist()
         self._log_event("organization_created", None, org_id, {"name": name})
@@ -223,7 +283,7 @@ class PlatformAuth:
             if cached is not None:
                 return cached
 
-        user = self._users.get(email)
+        user = self._get_user(email)
 
         if user is None:
             return None
@@ -236,7 +296,7 @@ class PlatformAuth:
         return organization_id
 
     def get_user_organization_role(self, email: str) -> str | None:
-        user = self._users.get(email)
+        user = self._get_user(email)
 
         if user is None:
             return None
@@ -255,10 +315,13 @@ class PlatformAuth:
         consistent with this whole platform's registration already having
         no invite/approval gate for regular accounts either.
         """
+        if self._repository is not None:
+            return self._repository.has_any_admin()
+
         return any(user["role"] == "admin" for user in self._users.values())
 
     def get_organization(self, org_id: str) -> dict | None:
-        return self._organizations.get(org_id)
+        return self._get_org(org_id)
 
     def list_organizations(self) -> dict[str, dict]:
         """Sprint 272. `BillingMetrics` needs to iterate every
@@ -271,6 +334,9 @@ class PlatformAuth:
         `dict(...)` copy, not the live dict, so a caller iterating it
         can't accidentally mutate organization state through it.
         """
+        if self._repository is not None:
+            return self._repository.list_organizations()
+
         return dict(self._organizations)
 
     def get_organization_plan(self, org_id: str) -> str | None:
@@ -281,7 +347,7 @@ class PlatformAuth:
             if cached is not None:
                 return cached
 
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             return None
@@ -293,77 +359,75 @@ class PlatformAuth:
 
         return plan
 
-    def _append_plan_history(self, org_id: str, old_plan: str, new_plan: str) -> None:
-        """Sprint 275. `BillingAnalytics.expansion_revenue()`/
-        `contraction_revenue()` need to know when an organization's plan
-        changed, and to/from what — nothing in this codebase persisted
-        that before now.
-        """
-        org = self._organizations.get(org_id)
-
-        if org is None:
-            return
-
-        history = org.setdefault("plan_history", [])
-        history.append({"from": old_plan, "to": new_plan, "timestamp": int(time.time())})
-
     def set_organization_plan(self, org_id: str, plan: str) -> None:
-        """Sprint 275 adds plan-history tracking (`_append_plan_history()`)
-        ahead of the actual plan change, so `expansion_revenue()`/
-        `contraction_revenue()` can reconstruct upgrade/downgrade deltas
-        later. The spec's own version of this method replaced the whole
-        thing wholesale, silently dropping three things this method
-        already did and that other code already depends on: the
-        `plan not in self._plans` validation (`ValueError` for an unknown
-        plan — see `test_upgrade_plano_invalido_...`-style tests),
-        `LookupError` for a nonexistent org (the spec's replacement
-        silently no-ops instead), and `_invalidate_org_cache()` (without
-        it, `get_organization_plan()`'s own cache — see right above —
-        would keep serving the *old* plan until the cache entry expired
-        on its own, even though the org's stored plan already changed).
-        All three preserved here; only the history append is new.
+        """Sprint 275 adds plan-history tracking ahead of the actual plan
+        change, so `expansion_revenue()`/`contraction_revenue()` can
+        reconstruct upgrade/downgrade deltas later. Validates `plan`,
+        raises `LookupError` for a nonexistent org, invalidates the plan
+        cache, and only appends a history entry when the plan actually
+        changes — see `test_set_organization_plan_invalido_nao_registra_
+        historico` (a rejected plan change must not create a phantom
+        `plan_history` entry, and an org that never had a successful plan
+        change must not have a `plan_history` key at all).
         """
         if plan not in self._plans:
             raise ValueError(f"Unknown plan '{plan}'")
 
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
         old_plan = org.get("plan", "free")
+        new_history: list | None = None
 
         if old_plan != plan:
-            self._append_plan_history(org_id, old_plan, plan)
+            new_history = list(org.get("plan_history", []))
+            new_history.append({"from": old_plan, "to": plan, "timestamp": int(time.time())})
 
-        org["plan"] = plan
+        if self._repository is not None:
+            fields: dict = {"plan": plan}
+            if new_history is not None:
+                fields["plan_history"] = new_history
+            self._repository.update_organization(org_id, **fields)
+        else:
+            if new_history is not None:
+                org["plan_history"] = new_history
+            org["plan"] = plan
+
         self._invalidate_org_cache(org_id)
         self._persist()
 
+    def set_organization_plan_for_test(self, org_id: str, plan: str) -> None:
+        """Test-support only: writes the plan directly, bypassing cache
+        invalidation and plan-history tracking, so cache-staleness tests
+        (e.g. `test_get_organization_plan_usa_cache_quando_disponivel`)
+        can prove a cached value keeps being served after the underlying
+        data changes out of band. Use `set_organization_plan()` for
+        anything that isn't specifically testing that."""
+        if self._repository is not None:
+            self._repository.update_organization(org_id, plan=plan)
+        elif org_id in self._organizations:
+            self._organizations[org_id]["plan"] = plan
+
     def set_retention_flag(self, org_id: str, flag: bool) -> None:
         """Sprint 278. `BillingDecisionEngine.auto_retention()` needs a
-        way to mark a high-churn-risk organization for follow-up. The
-        spec's own version mutated `org["retention_flag"] = True`
-        directly on whatever `get_organization()` handed back — but that
-        method returns this class's own *live* internal dict, not a
-        copy, so mutating it from outside `PlatformAuth` bypasses
-        `_persist()` entirely (the flag would vanish on the next storage
-        reload) and is exactly the "reach into private state from
-        outside the class" pattern this codebase's convention forbids
-        everywhere else (`list_organizations()`'s own docstring makes
-        the same point). A proper method instead, mirroring
-        `set_organization_plan()`'s own shape.
+        way to mark a high-churn-risk organization for follow-up.
         """
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
-        org["retention_flag"] = flag
+        if self._repository is not None:
+            self._repository.update_organization(org_id, retention_flag=flag)
+        else:
+            org["retention_flag"] = flag
+
         self._persist()
 
     def get_retention_flag(self, org_id: str) -> bool:
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             return False
@@ -373,12 +437,10 @@ class PlatformAuth:
     def set_lead_state(self, org_id: str, lead_type: str, state: str) -> None:
         """Sprint 285. `LeadExecutionTracker` needs somewhere durable to
         record what a sales rep has done about a given playbook lead
-        (Sprint 284's `SalesPlaybookEngine`) — mirrors `set_retention_
-        flag()`'s own shape exactly, storing per-`lead_type` state under
-        `org["lead_states"]` rather than a single flat field, since one
-        organization can independently be a lead for more than one
-        `lead_type` at once (e.g. both `"upgrade_offer"` and
-        `"retention_offer"`).
+        (Sprint 284's `SalesPlaybookEngine`) — storing per-`lead_type`
+        state under `org["lead_states"]` rather than a single flat field,
+        since one organization can independently be a lead for more than
+        one `lead_type` at once.
 
         Only validates `state` here, not `lead_type` — `PlatformAuth`
         has no business knowing about `"upgrade_offer"`/`"retention_
@@ -389,16 +451,22 @@ class PlatformAuth:
         if state not in _VALID_LEAD_STATES:
             raise ValueError(f"Unknown lead state '{state}'")
 
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
-        org.setdefault("lead_states", {})[lead_type] = state
+        if self._repository is not None:
+            lead_states = dict(org.get("lead_states", {}))
+            lead_states[lead_type] = state
+            self._repository.update_organization(org_id, lead_states=lead_states)
+        else:
+            org.setdefault("lead_states", {})[lead_type] = state
+
         self._persist()
 
     def get_lead_state(self, org_id: str, lead_type: str) -> str:
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             return "pending"
@@ -409,19 +477,34 @@ class PlatformAuth:
         """Sprint 265's tenant-onboarding "name your business" step
         (`POST /tenants`) — every organization already gets a default
         name at creation (`f"{email}'s organization"`, `register_user()`)
-        but had no way to change it afterward. No cache entry to
-        invalidate (`get_organization()` isn't cached, unlike
-        `get_organization_plan()`), so this mirrors
-        `set_organization_plan()` minus that step.
+        but had no way to change it afterward.
         """
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
-        org["name"] = name
+        if self._repository is not None:
+            self._repository.update_organization(org_id, name=name)
+        else:
+            org["name"] = name
+
         self._persist()
         self._log_event("organization_renamed", None, org_id, {"name": name})
+
+    def set_organization_created_at(self, org_id: str, timestamp: int) -> None:
+        """Test-support only (Fase 1): backdates an organization's
+        creation time. `BillingAnalytics`/`BillingDecisionEngine`'s
+        tenure-based scoring needs an org "created N days ago" and there
+        is no production path that ever needs to change this after the
+        fact — this exists purely so those tests don't have to sleep in
+        real time."""
+        if self._repository is not None:
+            self._repository.update_organization(
+                org_id, created_at=datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            )
+        elif org_id in self._organizations:
+            self._organizations[org_id]["created_at"] = timestamp
 
     def get_plan_limits(self, plan: str) -> dict:
         plan_def = self._plans.get(plan)
@@ -432,18 +515,9 @@ class PlatformAuth:
         return plan_def["limits"]
 
     def get_usage_limit(self, tenant_id: str, metric: str) -> int:
-        """Sprint 270. The spec's own version called
-        `self.get_plan_limits(tenant_id)` directly — but `get_plan_limits()`
-        takes a *plan name* (`"free"`/`"pro"`/`"enterprise"`), not a
-        tenant/organization id. A tenant_id would never match any real
-        plan key, so `get_plan_limits()` would always return `{}`, and
-        this method would always return the `-1` ("unlimited") default —
-        silently making every tenant appear unlimited regardless of their
-        actual plan, defeating this entire sprint's purpose. Fixed by
-        resolving the tenant's plan first, exactly as every other plan-
-        limit lookup in this codebase already does (e.g.
-        `check_limit()`, or `/metrics/alerts`' own `get_alert_limit()`
-        closure in cdn.py).
+        """Sprint 270. Resolves the tenant's plan first, then looks up
+        the limit on that plan — `get_plan_limits()` takes a *plan name*
+        (`"free"`/`"pro"`/`"enterprise"`), not a tenant/organization id.
         """
         plan = self.get_organization_plan(tenant_id)
         limits = self.get_plan_limits(plan)
@@ -454,29 +528,33 @@ class PlatformAuth:
         self, org_id: str, customer_id: str | None, subscription_id: str | None
     ) -> None:
         """Sprint 269 — persists the Stripe customer/subscription linked
-        to this organization, alongside its `plan`/`name` on the same
-        `_organizations` record (not a separate `BillingManager`/store:
-        this *is* the organization's own billing identity, the same
-        reasoning Sprint 265 already applied to plans themselves). Either
-        id may be omitted (`None`) without clearing the other — a
-        `customer.subscription.updated` event, for instance, has no
-        reason to touch `stripe_customer_id` at all.
+        to this organization. Either id may be omitted (`None`) without
+        clearing the other — a `customer.subscription.updated` event, for
+        instance, has no reason to touch `stripe_customer_id` at all.
         """
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
+        fields: dict = {}
+
         if customer_id is not None:
-            org["stripe_customer_id"] = customer_id
+            fields["stripe_customer_id"] = customer_id
 
         if subscription_id is not None:
-            org["stripe_subscription_id"] = subscription_id
+            fields["stripe_subscription_id"] = subscription_id
+
+        if fields:
+            if self._repository is not None:
+                self._repository.update_organization(org_id, **fields)
+            else:
+                org.update(fields)
 
         self._persist()
 
     def get_stripe_ids(self, org_id: str) -> dict:
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             return {}
@@ -490,13 +568,11 @@ class PlatformAuth:
         """Reverse lookup (Sprint 269): most Stripe webhook events after
         checkout (`invoice.payment_failed`, `customer.subscription.
         updated`/`deleted`) carry a `customer` id but not necessarily the
-        original checkout metadata (`org_id`/`plan`) — Stripe doesn't
-        guarantee that metadata propagates from a Checkout Session onto
-        every later event for the resulting subscription. A linear scan,
-        not a maintained index: nothing else in `PlatformAuth` needs a
-        reverse organization lookup, and this only ever runs on the
-        (rare, not-hot-path) webhook delivery path, not per-request.
+        original checkout metadata (`org_id`/`plan`).
         """
+        if self._repository is not None:
+            return self._repository.find_organization_by_stripe_customer(customer_id)
+
         for org_id, org in self._organizations.items():
             if org.get("stripe_customer_id") == customer_id:
                 return org_id
@@ -507,16 +583,16 @@ class PlatformAuth:
         """Distinct from `plan` — a `past_due` subscription (a failed
         payment Stripe is still retrying) keeps its current plan/limits
         during that grace window; only `customer.subscription.deleted`
-        (the subscription is genuinely gone, not just temporarily unpaid)
         also reverts the plan itself, via the webhook handler's own logic
         in `stripe_service.py`, not this method.
         """
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             raise LookupError(f"Organization '{org_id}' not found")
 
-        org["subscription_status"] = status
+        fields: dict = {"subscription_status": status}
+        canceled_at_epoch: int | None = None
 
         # Sprint 273's BillingAnalytics.churn_over_time() needs to know
         # *when* a cancellation happened to bucket it by month — nothing
@@ -527,12 +603,23 @@ class PlatformAuth:
         # `stripe_webhook()` in billing.py, rather than in
         # `stripe_service.py` itself.
         if status == "canceled":
-            org["canceled_at"] = int(time.time())
+            canceled_at_epoch = int(time.time())
+            fields["canceled_at"] = canceled_at_epoch
+
+        if self._repository is not None:
+            repo_fields = dict(fields)
+            if canceled_at_epoch is not None:
+                repo_fields["canceled_at"] = datetime.fromtimestamp(
+                    canceled_at_epoch, tz=timezone.utc
+                )
+            self._repository.update_organization(org_id, **repo_fields)
+        else:
+            org.update(fields)
 
         self._persist()
 
     def get_subscription_status(self, org_id: str) -> str | None:
-        org = self._organizations.get(org_id)
+        org = self._get_org(org_id)
 
         if org is None:
             return None
@@ -540,18 +627,34 @@ class PlatformAuth:
         return org.get("subscription_status")
 
     def add_user_to_organization(self, email: str, org_id: str) -> None:
-        org = self._organizations.get(org_id)
+        if self._repository is not None:
+            org = self._repository.get_organization(org_id)
 
-        if org is None:
-            return
+            if org is None:
+                return
 
-        if email not in org["users"]:
-            org["users"].append(email)
-            self._invalidate_user_cache(email)
-            self._persist()
-            self._log_event("user_added_to_org", email, org_id, {})
+            added = self._repository.add_membership(email, org_id)
+
+            if added:
+                self._invalidate_user_cache(email)
+                self._log_event("user_added_to_org", email, org_id, {})
+        else:
+            org = self._organizations.get(org_id)
+
+            if org is None:
+                return
+
+            if email not in org["users"]:
+                org["users"].append(email)
+                self._invalidate_user_cache(email)
+                self._persist()
+                self._log_event("user_added_to_org", email, org_id, {})
 
     def _usage_record(self, org_id: str) -> dict:
+        """Dict-mode only. Repository-mode usage reads/writes go through
+        `get_usage_for_org()`/`increment_usage()` directly — there's no
+        single "live record" object once usage is a per-day Postgres row
+        (see `AuthRepository.get_usage()`/`increment_usage()`)."""
         today = int(time.time()) // _SECONDS_PER_DAY
         usage = self._usage.get(org_id)
 
@@ -561,12 +664,35 @@ class PlatformAuth:
 
         return usage
 
+    def get_usage_for_org(self, org_id: str) -> int:
+        """Today's request count for this organization. Public (unlike
+        the dict-mode-only `_usage_record()`) so both production callers
+        and tests have one stable way to read it regardless of storage
+        mode."""
+        if self._repository is not None:
+            return self._repository.get_usage(org_id, datetime.now(timezone.utc).date())
+
+        return self._usage_record(org_id)["requests_today"]
+
+    def expire_usage_for_org(self, org_id: str) -> None:
+        """Test-support only (Fase 1): clears today's usage bucket for
+        this org, so the next read/increment starts over at 0 —
+        simulates a day boundary without waiting for one. Dict-mode drops
+        the cached bucket entirely (equivalent to backdating
+        `last_reset`); repo-mode deletes today's row (a real day rollover
+        needs no such call — a new calendar date is already a new primary
+        key and starts at 0 on its own)."""
+        if self._repository is not None:
+            self._repository.clear_usage(org_id, datetime.now(timezone.utc).date())
+        else:
+            self._usage.pop(org_id, None)
+
     def _current_usage(self, org_id: str, limit_key: str) -> int | None:
         if limit_key == "requests_per_day":
-            return self._usage_record(org_id)["requests_today"]
+            return self.get_usage_for_org(org_id)
 
         if limit_key == "users":
-            org = self._organizations.get(org_id)
+            org = self._get_org(org_id)
             return len(org["users"]) if org is not None else 0
 
         return None
@@ -587,10 +713,16 @@ class PlatformAuth:
             raise PermissionError("Limit exceeded")
 
     def increment_usage(self, org_id: str, limit_key: str) -> None:
-        if limit_key == "requests_per_day":
+        if limit_key != "requests_per_day":
+            return
+
+        if self._repository is not None:
+            self._repository.increment_usage(org_id, datetime.now(timezone.utc).date())
+        else:
             usage = self._usage_record(org_id)
             usage["requests_today"] += 1
-            self._persist()
+
+        self._persist()
 
     def check_rate_limit(self, email: str, correlation_id: str | None = None) -> None:
         org_id = self.get_user_organization(email)
@@ -629,7 +761,7 @@ class PlatformAuth:
             if cached is not None:
                 return cached
 
-        user = self._users.get(email)
+        user = self._get_user(email)
 
         if user is None:
             return None
@@ -641,6 +773,18 @@ class PlatformAuth:
 
         return role
 
+    def set_user_role_for_test(self, email: str, role: str) -> None:
+        """Test-support only: changes a user's role WITHOUT invalidating
+        the role cache — used by cache-staleness tests (e.g.
+        `test_get_user_role_usa_cache_quando_disponivel`) that need to
+        prove a cached value keeps being served after the underlying data
+        changes out of band. There is no production path that would ever
+        want this; role changes normally go through `register_user()`."""
+        if self._repository is not None:
+            self._repository.set_user_fields(email, role=role)
+        elif email in self._users:
+            self._users[email]["role"] = role
+
     def get_user_permissions(self, email: str) -> list[str]:
         cache_key = f"user_permissions:{email}"
 
@@ -649,7 +793,7 @@ class PlatformAuth:
             if cached is not None:
                 return cached
 
-        user = self._users.get(email)
+        user = self._get_user(email)
 
         if user is None:
             return []
@@ -660,6 +804,30 @@ class PlatformAuth:
             self._cache.set(cache_key, permissions)
 
         return permissions
+
+    def set_user_permissions_for_test(self, email: str, permissions: list[str]) -> None:
+        """Test-support only — same rationale as `set_user_role_for_test()`."""
+        if self._repository is not None:
+            self._repository.set_user_fields(email, permissions=list(permissions))
+        elif email in self._users:
+            self._users[email]["permissions"] = permissions
+
+    def set_user_organization_for_test(self, email: str, organization_id: str | None) -> None:
+        """Test-support only — same rationale as `set_user_role_for_test()`,
+        also used to simulate an orphaned user (`organization_id=None`)
+        without going through any real organization-removal flow."""
+        if self._repository is not None:
+            self._repository.set_user_fields(email, organization_id=organization_id)
+        elif email in self._users:
+            self._users[email]["organization_id"] = organization_id
+
+    def get_user_credentials_for_test(self, email: str) -> dict:
+        """Test-support only: exposes the stored password salt/hash so
+        tests can assert they're non-trivial, per-user-unique bytes
+        without either handling a real password in plaintext or reaching
+        into `_users` directly."""
+        user = self._get_user(email)
+        return {"salt": user["salt"], "hash": user["hash"]}
 
     def _hash(self, password: str, salt: bytes) -> bytes:
         return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _PBKDF2_ITERATIONS)
@@ -687,7 +855,7 @@ class PlatformAuth:
         login_started_at = time.perf_counter()
 
         try:
-            user = self._users.get(email)
+            user = self._get_user(email)
 
             if user is None:
                 self._log(
@@ -713,13 +881,24 @@ class PlatformAuth:
             session_id = uuid.uuid4().hex
             token = self._sign(f"{session_id}:{issued_at}")
 
-            self._sessions[token] = {
-                "email": email,
-                "issued_at": issued_at,
-                "organization_id": user["organization_id"],
-                "role": user["role"],
-                "permissions": user["permissions"],
-            }
+            if self._repository is not None:
+                self._repository.create_session(
+                    token,
+                    email,
+                    user["organization_id"],
+                    user["role"],
+                    user["permissions"],
+                    issued_at,
+                    self._ttl,
+                )
+            else:
+                self._sessions[token] = {
+                    "email": email,
+                    "issued_at": issued_at,
+                    "organization_id": user["organization_id"],
+                    "role": user["role"],
+                    "permissions": user["permissions"],
+                }
 
             self._log_event("user_logged_in", email, user["organization_id"], {})
             self._increment("auth.login.success", organization_id=user["organization_id"])
@@ -748,6 +927,18 @@ class PlatformAuth:
         if payload is None:
             return None
 
+        if self._repository is not None:
+            session = self._repository.get_session(token)
+
+            if session is None:
+                return None
+
+            if int(time.time()) - session["issued_at"] > self._ttl:
+                self._repository.delete_session(token)
+                return None
+
+            return session
+
         session = self._sessions.get(token)
 
         if session is None:
@@ -763,10 +954,16 @@ class PlatformAuth:
         return self.get_session(token) is not None
 
     def logout(self, token: str) -> None:
-        session = self._sessions.pop(token, None)
+        if self._repository is not None:
+            session = self._repository.delete_session(token)
+        else:
+            session = self._sessions.pop(token, None)
 
         if session is not None:
             self._log_event("user_logged_out", session["email"], session["organization_id"], {})
 
     def exists(self, email: str) -> bool:
+        if self._repository is not None:
+            return self._repository.user_exists(email)
+
         return email in self._users
