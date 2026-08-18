@@ -25,6 +25,12 @@ export interface LoginRequest {
   password: string;
 }
 
+/** backend/app/api/routers/auth.py: RegisterRequest (email/password only — every other field defaults) */
+export interface RegisterRequest {
+  email: string;
+  password: string;
+}
+
 /** backend/app/api/routers/auth.py: SessionResponse */
 export interface SessionResponse {
   token: string;
