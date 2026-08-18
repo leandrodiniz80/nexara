@@ -1,4 +1,4 @@
-import { apiClient, toApiClientError } from "@/lib/api/client";
+import { apiClient, ApiClientError, toApiClientError } from "@/lib/api/client";
 import type {
   ApiResponse,
   LoginRequest,
@@ -38,9 +38,13 @@ export async function registerOrLogin(email: string, password: string): Promise<
   try {
     await register({ email, password });
   } catch (error) {
-    const apiError = toApiClientError(error);
-    if (apiError.status !== 409) {
-      throw apiError;
+    // register() above already throws an ApiClientError (not a raw Axios
+    // error) — re-running toApiClientError() on it here would fail
+    // axios.isAxiosError()'s check and silently reset .status to null,
+    // making this 409 check never match. Check the already-wrapped error
+    // directly instead.
+    if (!(error instanceof ApiClientError) || error.status !== 409) {
+      throw error;
     }
   }
 
