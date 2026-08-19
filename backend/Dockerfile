@@ -18,9 +18,10 @@ COPY . .
 
 EXPOSE 8000
 
-# Fase 1: applies pending Alembic migrations before every boot -- Railway's
-# deploy process never ran them on its own, so the platform_auth tables
-# (and any future migration) would otherwise only ever exist if someone
-# happened to run `alembic upgrade head` by hand. `exec` hands off PID 1 to
-# uvicorn so it still receives Railway's shutdown signal directly.
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Incident rollback: running `alembic upgrade head` on every boot (added
+# for Fase 1, to apply the platform_auth migration automatically) is
+# suspected of causing repeat/overlapping migration runs when this
+# monorepo's frontend-only commits also redeploy this service -- the
+# platform_auth migration is already applied, so re-running it on boot
+# isn't needed right now. Plain uvicorn start until root-caused properly.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
