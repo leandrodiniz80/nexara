@@ -22,6 +22,19 @@ class HealthStatus(BaseModel):
     components: dict[str, str] = Field(default_factory=dict)
 
 
+@router.get("/", response_model=ApiResponse[dict[str, str]])
+async def root(request: Request) -> ApiResponse[dict[str, str]]:
+    """Friendly landing response for the bare root path — there was no
+    registered route there at all before, so it fell through to a plain
+    404. Doesn't replace /health as the real liveness check."""
+    return ApiResponse(
+        success=True,
+        data={"status": "NEXARA ONLINE \U0001f680"},
+        request_id=getattr(request.state, "request_id", "unknown"),
+        execution_time=0.0,
+    )
+
+
 @router.get("/health", response_model=ApiResponse[HealthStatus])
 async def health(
     request: Request,
