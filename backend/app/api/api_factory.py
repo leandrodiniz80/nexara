@@ -79,6 +79,12 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health_router)
+    # Every other router already sits under settings.API_V1_PREFIX; health.py
+    # itself stays prefix-less so the pre-existing bare "/" and "/health"
+    # (used by Railway's own healthcheck) keep working unchanged — this
+    # second registration adds "/api/v1/health" alongside them without
+    # touching health.py at all.
+    app.include_router(health_router, prefix=settings.API_V1_PREFIX)
     app.include_router(missions_router)
     app.include_router(prospects_router)
     app.include_router(workspace_router)
