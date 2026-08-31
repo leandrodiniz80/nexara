@@ -41,6 +41,11 @@ def create_app() -> FastAPI:
         openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
         docs_url=f"{settings.API_V1_PREFIX}/docs",
         redoc_url=f"{settings.API_V1_PREFIX}/redoc",
+        swagger_ui_parameters={
+            "tryItOutEnabled": True,
+            "displayRequestDuration": True,
+            "docExpansion": "full",
+        },
     )
 
     # Registered innermost-first: the *last* middleware added runs *first* on the
