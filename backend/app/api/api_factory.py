@@ -44,7 +44,7 @@ def create_app() -> FastAPI:
         swagger_ui_parameters={
             "tryItOutEnabled": True,
             "displayRequestDuration": True,
-            "docExpansion": "full",
+            "docExpansion": "list",
         },
     )
 
