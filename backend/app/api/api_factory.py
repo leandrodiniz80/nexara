@@ -60,6 +60,12 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.BACKEND_CORS_ORIGINS,
+        # Railway mints a new random subdomain for the frontend service on
+        # every deploy (b1eb, 07d1, ...), so a fixed allow_origins list keeps
+        # going stale one deploy after the next. This regex covers any
+        # "invigorating-stillness-production-*" domain Railway generates,
+        # without needing an env var update each time.
+        allow_origin_regex=r"https://invigorating-stillness-production-[a-z0-9]+\.up\.railway\.app",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
