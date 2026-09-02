@@ -157,12 +157,12 @@ export default function LeadsPage() {
         ) : isForbidden ? (
           <div className="flex flex-col items-center justify-center gap-3 p-16 text-center">
             <p className="text-sm font-medium text-foreground">
-              Your account doesn't have permission to view leads.
+              Your account doesn&apos;t have permission to view leads.
             </p>
           </div>
         ) : isLeadsError ? (
           <div className="flex flex-col items-center justify-center gap-3 p-16 text-center">
-            <p className="text-sm font-medium text-foreground">We couldn't load your leads.</p>
+            <p className="text-sm font-medium text-foreground">We couldn&apos;t load your leads.</p>
             <p className="text-xs text-muted-foreground">
               {leadsError instanceof Error ? leadsError.message : "Please try again."}
             </p>
