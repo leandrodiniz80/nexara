@@ -25,6 +25,9 @@ class Lead(Base, AuditMixin):
         # filter correctly; this composite one avoids a separate sort step
         # once an organization's lead count is large enough to matter.
         Index("ix_leads_org_id_created_at", "organization_id", "created_at"),
+        # Backs GET /leads/attention: WHERE organization_id = ... AND status
+        # IN (...) ORDER BY updated_at ASC.
+        Index("ix_leads_org_id_status_updated_at", "organization_id", "status", "updated_at"),
     )
 
     organization_id: Mapped[str] = mapped_column(

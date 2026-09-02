@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -137,6 +138,44 @@ async def get_lead_metrics(
             conversion_rate=conversion_rate,
             avg_score=round(float(avg_score), 1) if avg_score is not None else 0.0,
         ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/attention", response_model=ApiResponse[list[LeadResponse]])
+async def get_leads_needing_attention(
+    stale_after_days: int = Query(default=3, ge=1, le=90),
+    limit: int = Query(default=20, ge=1, le=100),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[LeadResponse]]:
+    """Leads still in the active pipeline (not yet converted) that haven't
+    had a status change — or any other edit, since updated_at bumps on any
+    column write — in at least stale_after_days. Ordered oldest-touched
+    first, so the most neglected lead surfaces at the top."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_after_days)
+    stmt = (
+        select(Lead)
+        .where(
+            Lead.organization_id == organization_id,
+            Lead.deleted_at.is_(None),
+            Lead.status.in_(["new", "contacted"]),
+            Lead.updated_at < cutoff,
+        )
+        .order_by(Lead.updated_at.asc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+
+    return ApiResponse(
+        success=True,
+        data=leads,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
