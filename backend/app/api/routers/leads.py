@@ -15,6 +15,7 @@ from app.models.leads.lead_status_history import LeadStatusHistory
 from app.schemas.leads.lead import (
     LeadCreate,
     LeadCreateResponse,
+    LeadListResponse,
     LeadMetricsByStatus,
     LeadMetricsResponse,
     LeadResponse,
@@ -38,20 +39,20 @@ def _require_organization(session: dict) -> str:
     return organization_id
 
 
-@router.get("", response_model=ApiResponse[list[LeadResponse]])
+@router.get("", response_model=ApiResponse[list[LeadResponse] | LeadListResponse])
 async def list_leads(
     # Optional, generous defaults — every existing caller (no query params
     # at all) gets exactly the same full list as before at today's data
-    # volumes. This only bounds the query so one organization can't pull an
-    # unbounded result set as lead counts grow; it doesn't add pagination
-    # metadata (total/has_more) to the response, so it's not a real "next
-    # page" UI yet — that's a separate, contract-changing step.
+    # volumes. limit/offset alone only bound the query; with_meta=true is
+    # what opts into the {data, total, limit, offset, has_more} shape below
+    # — default response stays the bare array, byte-for-byte as before.
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    with_meta: bool = Query(default=False),
     request_id: str = Depends(get_request_id),
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
-) -> ApiResponse[list[LeadResponse]]:
+) -> ApiResponse[list[LeadResponse] | LeadListResponse]:
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -63,11 +64,34 @@ async def list_leads(
         .offset(offset)
     )
     result = await db.execute(stmt)
-    leads = result.scalars().all()
+    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+
+    if not with_meta:
+        return ApiResponse(
+            success=True,
+            data=leads,
+            request_id=request_id,
+            execution_time=time.perf_counter() - start,
+        )
+
+    # Same WHERE as the query above (organization_id + deleted_at IS NULL),
+    # so it uses the leading column of ix_leads_org_id_created_at too — a
+    # plain COUNT doesn't need the created_at part of that index at all.
+    # Only runs when a caller actually asked for metadata.
+    total_stmt = select(func.count(Lead.id)).where(
+        Lead.organization_id == organization_id, Lead.deleted_at.is_(None)
+    )
+    total = (await db.execute(total_stmt)).scalar_one()
 
     return ApiResponse(
         success=True,
-        data=[LeadResponse.model_validate(lead) for lead in leads],
+        data=LeadListResponse(
+            data=leads,
+            total=total,
+            limit=limit,
+            offset=offset,
+            has_more=offset + len(leads) < total,
+        ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

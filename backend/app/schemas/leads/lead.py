@@ -46,6 +46,19 @@ class LeadCreateResponse(BaseModel):
     notifications: list[str] = Field(default_factory=list)
 
 
+class LeadListResponse(BaseModel):
+    """Opt-in shape for GET /leads?with_meta=true — the default (no query
+    param) response stays the plain list[LeadResponse] it's always been.
+    Structurally unambiguous from a bare list, so response_model can be a
+    plain Union with no discriminator."""
+
+    data: list[LeadResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
 class LeadMetricsByStatus(BaseModel):
     new: int
     contacted: int
