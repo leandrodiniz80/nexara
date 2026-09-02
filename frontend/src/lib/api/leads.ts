@@ -10,13 +10,21 @@ import type { ApiResponse } from "@/lib/api/types";
  */
 export type LeadStatus = "new" | "contacted" | "converted";
 
+export interface ScoreBreakdownItem {
+  reason: string;
+  impact: number;
+}
+
 export interface Lead {
   id: string;
   name: string;
   email: string;
   phone: string;
   status: LeadStatus;
+  /** Computed dynamically by the backend at read time (not a stored,
+   * manually-set value) — see scoreBreakdown for why it's whatever it is. */
   score: number;
+  scoreBreakdown: ScoreBreakdownItem[];
   notes: string | null;
   nextAction: string | null;
   nextActionDueAt: string | null;
@@ -35,6 +43,7 @@ interface LeadDto {
   phone: string;
   status: LeadStatus;
   score: number;
+  score_breakdown: ScoreBreakdownItem[];
   notes: string | null;
   next_action: string | null;
   next_action_due_at: string | null;
@@ -51,6 +60,7 @@ function toLead(dto: LeadDto): Lead {
     phone: dto.phone,
     status: dto.status,
     score: dto.score,
+    scoreBreakdown: dto.score_breakdown,
     notes: dto.notes,
     nextAction: dto.next_action,
     nextActionDueAt: dto.next_action_due_at,
@@ -300,6 +310,18 @@ export async function getLeadsActivityFeed(): Promise<LeadActivityFeedEntry[]> {
       message: entry.message,
       createdAt: entry.created_at,
     }));
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** GET /api/v1/leads/priority — "foco do dia": leads in the worst shape
+ * right now (soonest overdue/due task first, then lowest score), backend
+ * default limit. Backs the dashboard's Today's Focus card. */
+export async function getLeadsPriority(): Promise<Lead[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadDto[]>>("/leads/priority");
+    return (data.data ?? []).map(toLead);
   } catch (error) {
     throw toApiClientError(error);
   }

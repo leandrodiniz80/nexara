@@ -19,6 +19,16 @@ function getScoreVariant(score: number): "destructive" | "warning" | "success" {
   return "destructive";
 }
 
+/** Native browser tooltip (no tooltip component in this UI kit yet, and one
+ * factor list on hover doesn't warrant building one) — one line per factor,
+ * signed impact so positive/negative reads at a glance. */
+function scoreTitle(breakdown: Lead["scoreBreakdown"]): string {
+  if (breakdown.length === 0) return "No score adjustments";
+  return breakdown
+    .map((item) => `${item.reason} (${item.impact > 0 ? "+" : ""}${item.impact})`)
+    .join("\n");
+}
+
 /** Stops the event from reaching the card's own drag/details handlers —
  * used so the "⋮" menu is its own hit target, not a drag handle. */
 function stopCardGesture(event: MouseEvent) {
@@ -89,7 +99,9 @@ export function LeadCard({
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <Badge variant={getScoreVariant(lead.score)}>Score {lead.score}</Badge>
+        <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>
+          Score {lead.score}
+        </Badge>
         {lead.nextAction && <Badge variant="outline">{lead.nextAction}</Badge>}
       </div>
     </div>
