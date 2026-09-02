@@ -128,3 +128,36 @@ export async function updateLeadStatus(
     throw toApiClientError(error);
   }
 }
+
+export interface LeadTimelineEntry {
+  type: "status_changed";
+  from: string | null;
+  to: string;
+  createdAt: string;
+}
+
+/** Wire shape from GET /leads/{id}/timeline — see LeadTimelineEntry in
+ * backend/app/schemas/leads/lead.py. */
+interface LeadTimelineEntryDto {
+  type: "status_changed";
+  from: string | null;
+  to: string;
+  created_at: string;
+}
+
+/** GET /api/v1/leads/{id}/timeline */
+export async function getLeadTimeline(id: string): Promise<LeadTimelineEntry[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadTimelineEntryDto[]>>(
+      `/leads/${id}/timeline`
+    );
+    return (data.data ?? []).map((entry) => ({
+      type: entry.type,
+      from: entry.from,
+      to: entry.to,
+      createdAt: entry.created_at,
+    }));
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}

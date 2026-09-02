@@ -7,10 +7,12 @@ import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
 import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
+import { RecentActivity } from "@/components/dashboard/recent-activity";
 import { PageContainer } from "@/components/layout/page-container";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
+import { getAutomationsActivity } from "@/lib/api/automations";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
 import { getLeadMetrics } from "@/lib/api/leads";
@@ -37,6 +39,13 @@ export default function DashboardPage() {
   const { data: leadsMetrics } = useQuery({
     queryKey: ["leads-metrics"],
     queryFn: getLeadMetrics,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: automationsActivity } = useQuery({
+    queryKey: ["automations-activity"],
+    queryFn: getAutomationsActivity,
     enabled: isAuthenticated,
     retry: false,
   });
@@ -73,6 +82,7 @@ export default function DashboardPage() {
         <div className="space-y-4">
           <LeadsMetricsGrid metrics={leadsMetrics} />
           <PipelineBar metrics={leadsMetrics} />
+          {automationsActivity && <RecentActivity entries={automationsActivity} />}
         </div>
       )}
 
