@@ -1,13 +1,32 @@
 "use client";
 
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils/cn";
-import { getLeadTimeline, type Lead, type LeadStatus } from "@/lib/api/leads";
+import {
+  getLeadTimeline,
+  updateLeadDetails,
+  updateLeadOwner,
+  type Lead,
+  type LeadStatus,
+} from "@/lib/api/leads";
+import { getOrgMembers } from "@/lib/api/organizations";
 import { formatDate, formatRelativeTime } from "@/lib/utils/format";
+
+/** <input type="date"> needs a "YYYY-MM-DD" value; the wire format is a
+ * full ISO datetime. Empty string clears the field (and, on save, the due
+ * date) rather than showing "Invalid Date". */
+function toDateInputValue(value: string | null): string {
+  if (!value) return "";
+  return value.slice(0, 10);
+}
 
 const STATUS_LABEL: Record<LeadStatus, string> = {
   new: "New",
@@ -68,6 +87,124 @@ function LeadActivityTimeline({ leadId }: { leadId: string }) {
   );
 }
 
+function LeadNotesAndTasks({ lead }: { lead: Lead }) {
+  const queryClient = useQueryClient();
+  const [notes, setNotes] = useState(lead.notes ?? "");
+  const [nextAction, setNextAction] = useState(lead.nextAction ?? "");
+  const [dueDate, setDueDate] = useState(toDateInputValue(lead.nextActionDueAt));
+
+  // The lead prop is a snapshot taken when the modal opened, not a live
+  // subscription — resync local state whenever a *different* lead is shown
+  // (switching leads doesn't remount this component).
+  useEffect(() => {
+    setNotes(lead.notes ?? "");
+    setNextAction(lead.nextAction ?? "");
+    setDueDate(toDateInputValue(lead.nextActionDueAt));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lead.id]);
+
+  const saveDetails = useMutation({
+    mutationFn: (patch: { notes?: string; nextAction?: string; nextActionDueAt?: string | null }) =>
+      updateLeadDetails(lead.id, patch),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+      queryClient.invalidateQueries({ queryKey: ["leads-attention"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
+    },
+  });
+
+  return (
+    <div className="mt-5 space-y-4">
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Notes
+        </p>
+        <Textarea
+          value={notes}
+          onChange={(event) => setNotes(event.target.value)}
+          onBlur={() => {
+            if (notes !== (lead.notes ?? "")) saveDetails.mutate({ notes });
+          }}
+          placeholder="Add notes about this lead…"
+          rows={3}
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Next Action
+        </p>
+        <Input
+          value={nextAction}
+          onChange={(event) => setNextAction(event.target.value)}
+          onBlur={() => {
+            if (nextAction !== (lead.nextAction ?? "")) saveDetails.mutate({ nextAction });
+          }}
+          placeholder="e.g. Follow-up call"
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Due Date
+        </p>
+        <Input
+          type="date"
+          value={dueDate}
+          onChange={(event) => {
+            const value = event.target.value;
+            setDueDate(value);
+            saveDetails.mutate({
+              nextActionDueAt: value ? new Date(value).toISOString() : null,
+            });
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function LeadOwnerAssignment({ lead }: { lead: Lead }) {
+  const queryClient = useQueryClient();
+  const { data: members } = useQuery({
+    queryKey: ["org-members"],
+    queryFn: getOrgMembers,
+  });
+
+  const assignOwner = useMutation({
+    mutationFn: (ownerEmail: string | null) => updateLeadOwner(lead.id, ownerEmail),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+    },
+  });
+
+  return (
+    <div className="mt-5 space-y-1.5">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Owner</p>
+      <div className="flex items-center gap-2">
+        {lead.ownerEmail && <Avatar label={lead.ownerEmail} className="h-8 w-8 text-xs" />}
+        <Select
+          className="flex-1"
+          value={lead.ownerEmail ?? ""}
+          disabled={assignOwner.isPending}
+          onChange={(event) => assignOwner.mutate(event.target.value || null)}
+        >
+          <option value="">Unassigned</option>
+          {members?.map((member) => (
+            <option key={member.email} value={member.email}>
+              {member.email}
+            </option>
+          ))}
+        </Select>
+      </div>
+    </div>
+  );
+}
+
 export function LeadDetailsModal({
   lead,
   onClose,
@@ -90,7 +227,7 @@ export function LeadDetailsModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="lead-details-title"
-        className="w-full max-w-sm rounded-lg border border-border bg-card p-6 shadow-lg"
+        className="max-h-[85vh] w-full max-w-sm overflow-y-auto rounded-lg border border-border bg-card p-6 shadow-lg"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-2">
@@ -139,6 +276,8 @@ export function LeadDetailsModal({
               </div>
             </dl>
 
+            <LeadOwnerAssignment lead={lead} />
+
             <div className="mt-5 space-y-2">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 Move to
@@ -157,6 +296,8 @@ export function LeadDetailsModal({
                 ))}
               </div>
             </div>
+
+            <LeadNotesAndTasks lead={lead} />
           </>
         ) : (
           <LeadActivityTimeline leadId={lead.id} />

@@ -9,6 +9,7 @@ import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
 import { NeedsAttention } from "@/components/dashboard/needs-attention";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
 import { RecentActivity } from "@/components/dashboard/recent-activity";
+import { UpcomingTasks } from "@/components/dashboard/upcoming-tasks";
 import { PageContainer } from "@/components/layout/page-container";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getAutomationsActivity } from "@/lib/api/automations";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
-import { getLeadMetrics, getLeadsNeedingAttention } from "@/lib/api/leads";
+import { getLeadMetrics, getLeadsNeedingAttention, getLeadTasks } from "@/lib/api/leads";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -58,6 +59,13 @@ export default function DashboardPage() {
     retry: false,
   });
 
+  const { data: leadTasks } = useQuery({
+    queryKey: ["leads-tasks"],
+    queryFn: getLeadTasks,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
   const showSkeleton = useMinimumLoadingDelay(isLoading, 400);
 
   // Only a real auth failure blocks the dashboard. Any other failure
@@ -91,6 +99,7 @@ export default function DashboardPage() {
           <LeadsMetricsGrid metrics={leadsMetrics} />
           <PipelineBar metrics={leadsMetrics} />
           {leadsNeedingAttention && <NeedsAttention leads={leadsNeedingAttention} />}
+          {leadTasks && <UpcomingTasks leads={leadTasks} />}
           {automationsActivity && <RecentActivity entries={automationsActivity} />}
         </div>
       )}

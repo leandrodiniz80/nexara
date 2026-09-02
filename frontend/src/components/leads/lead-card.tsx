@@ -1,6 +1,7 @@
 import { MoreVertical } from "lucide-react";
 import type { MouseEvent } from "react";
 
+import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import type { Lead, LeadStatus } from "@/lib/api/leads";
@@ -55,10 +56,15 @@ export function LeadCard({
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <p className="truncate text-sm font-medium text-foreground">{lead.name}</p>
-          <p className="truncate text-xs text-muted-foreground">{lead.email}</p>
-          <p className="text-xs text-muted-foreground/70">{lead.phone}</p>
+        <div className="flex min-w-0 items-start gap-2">
+          {lead.ownerEmail && (
+            <Avatar label={lead.ownerEmail} className="mt-0.5 h-6 w-6 text-[10px]" />
+          )}
+          <div className="min-w-0">
+            <p className="truncate text-sm font-medium text-foreground">{lead.name}</p>
+            <p className="truncate text-xs text-muted-foreground">{lead.email}</p>
+            <p className="text-xs text-muted-foreground/70">{lead.phone}</p>
+          </div>
         </div>
 
         <div onMouseDown={stopCardGesture} onClick={stopCardGesture}>
@@ -82,9 +88,10 @@ export function LeadCard({
         </div>
       </div>
 
-      <Badge variant={getScoreVariant(lead.score)} className="mt-2">
-        Score {lead.score}
-      </Badge>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        <Badge variant={getScoreVariant(lead.score)}>Score {lead.score}</Badge>
+        {lead.nextAction && <Badge variant="outline">{lead.nextAction}</Badge>}
+      </div>
     </div>
   );
 }

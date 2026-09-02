@@ -17,6 +17,10 @@ export interface Lead {
   phone: string;
   status: LeadStatus;
   score: number;
+  notes: string | null;
+  nextAction: string | null;
+  nextActionDueAt: string | null;
+  ownerEmail: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -31,6 +35,10 @@ interface LeadDto {
   phone: string;
   status: LeadStatus;
   score: number;
+  notes: string | null;
+  next_action: string | null;
+  next_action_due_at: string | null;
+  owner_email: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -43,6 +51,10 @@ function toLead(dto: LeadDto): Lead {
     phone: dto.phone,
     status: dto.status,
     score: dto.score,
+    notes: dto.notes,
+    nextAction: dto.next_action,
+    nextActionDueAt: dto.next_action_due_at,
+    ownerEmail: dto.owner_email,
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
   };
@@ -171,6 +183,56 @@ export async function getLeadTimeline(id: string): Promise<LeadTimelineEntry[]> 
       to: entry.to,
       createdAt: entry.created_at,
     }));
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** PATCH /api/v1/leads/{id}/details — every field optional; only the ones
+ * passed are sent, so a single-field autosave never clobbers the others. */
+export async function updateLeadDetails(
+  id: string,
+  patch: { notes?: string; nextAction?: string; nextActionDueAt?: string | null }
+): Promise<Lead> {
+  try {
+    const body: Record<string, string | null> = {};
+    if (patch.notes !== undefined) body.notes = patch.notes;
+    if (patch.nextAction !== undefined) body.next_action = patch.nextAction;
+    if (patch.nextActionDueAt !== undefined) body.next_action_due_at = patch.nextActionDueAt;
+
+    const { data } = await apiClient.patch<ApiResponse<LeadDto>>(`/leads/${id}/details`, body);
+    if (!data.data) {
+      throw new Error("Lead details update succeeded but returned no data");
+    }
+    return toLead(data.data);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** GET /api/v1/leads/tasks — leads with a next_action set, soonest due
+ * first. Backs the dashboard's Upcoming Tasks card. */
+export async function getLeadTasks(): Promise<Lead[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadDto[]>>("/leads/tasks");
+    return (data.data ?? []).map(toLead);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** PATCH /api/v1/leads/{id}/owner — ownerEmail null unassigns; any other
+ * value must be an existing member of the caller's own organization (the
+ * backend 400s otherwise). */
+export async function updateLeadOwner(id: string, ownerEmail: string | null): Promise<Lead> {
+  try {
+    const { data } = await apiClient.patch<ApiResponse<LeadDto>>(`/leads/${id}/owner`, {
+      owner_email: ownerEmail,
+    });
+    if (!data.data) {
+      throw new Error("Owner update succeeded but returned no data");
+    }
+    return toLead(data.data);
   } catch (error) {
     throw toApiClientError(error);
   }
