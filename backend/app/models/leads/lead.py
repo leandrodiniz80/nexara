@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String
+from datetime import datetime
+
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -28,6 +30,10 @@ class Lead(Base, AuditMixin):
         # Backs GET /leads/attention: WHERE organization_id = ... AND status
         # IN (...) ORDER BY updated_at ASC.
         Index("ix_leads_org_id_status_updated_at", "organization_id", "status", "updated_at"),
+        # Backs GET /leads/tasks: WHERE organization_id = ... AND
+        # next_action_due_at IS NOT NULL ORDER BY next_action_due_at ASC.
+        Index("ix_leads_org_id_next_action_due_at", "organization_id", "next_action_due_at"),
+        Index("ix_leads_owner_email", "owner_email"),
     )
 
     organization_id: Mapped[str] = mapped_column(
@@ -43,3 +49,13 @@ class Lead(Base, AuditMixin):
         String(32), nullable=False, server_default="new", index=True
     )
     score: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_action_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # References platform_users.email (this codebase's real user identity —
+    # there is no users.id UUID table) rather than a bare unenforced UUID
+    # placeholder like AuditMixin's created_by/updated_by: real referential
+    # integrity now, no rework once a proper users table might exist later.
+    owner_email: Mapped[str | None] = mapped_column(
+        String(255), ForeignKey("platform_users.email", ondelete="SET NULL"), nullable=True
+    )

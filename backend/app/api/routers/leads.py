@@ -13,6 +13,8 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
 from app.models.leads.lead_status_history import LeadStatusHistory
+from app.models.platform_auth.user import PlatformUser
+from app.models.platform_auth.user_organization import PlatformUserOrganization
 from app.schemas.leads.lead import (
     LeadCreate,
     LeadCreateResponse,
@@ -23,6 +25,8 @@ from app.schemas.leads.lead import (
     LeadStatusUpdateResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
+    UpdateLeadDetailsRequest,
+    UpdateLeadOwnerRequest,
 )
 from app.services.leads.automation_engine import run_automations
 
@@ -181,6 +185,39 @@ async def get_leads_needing_attention(
     )
 
 
+@router.get("/tasks", response_model=ApiResponse[list[LeadResponse]])
+async def get_lead_tasks(
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[LeadResponse]]:
+    """Leads with a next_action set, soonest due first — backs the
+    dashboard's Upcoming Tasks card."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    stmt = (
+        select(Lead)
+        .where(
+            Lead.organization_id == organization_id,
+            Lead.deleted_at.is_(None),
+            Lead.next_action_due_at.isnot(None),
+        )
+        .order_by(Lead.next_action_due_at.asc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+
+    return ApiResponse(
+        success=True,
+        data=leads,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
 @router.post("", response_model=ApiResponse[LeadCreateResponse])
 async def create_lead(
     body: LeadCreate,
@@ -261,6 +298,89 @@ async def get_lead_timeline(
             )
             for entry in history
         ],
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.patch("/{lead_id}/details", response_model=ApiResponse[LeadResponse])
+async def update_lead_details(
+    lead_id: uuid.UUID,
+    body: UpdateLeadDetailsRequest,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadResponse]:
+    """Partial update for notes/next_action/next_action_due_at — only fields
+    actually present in the request body are touched (exclude_unset), so the
+    frontend can autosave one field on blur without clobbering the others."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(lead, field, value)
+
+    await db.commit()
+    await db.refresh(lead)
+
+    return ApiResponse(
+        success=True,
+        data=LeadResponse.model_validate(lead),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.patch("/{lead_id}/owner", response_model=ApiResponse[LeadResponse])
+async def update_lead_owner(
+    lead_id: uuid.UUID,
+    body: UpdateLeadOwnerRequest,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadResponse]:
+    """owner_email references platform_users.email (this codebase's real
+    user identity — there is no users.id UUID table). A non-null value must
+    both exist in platform_users and belong to the lead's organization
+    (checked against PlatformUser.organization_id — a user's primary org —
+    OR a PlatformUserOrganization row, since a user can belong to more than
+    one org); owner_email=null always succeeds (unassign, no user to
+    validate). updated_at bumps automatically via AuditMixin's onupdate."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    if body.owner_email is not None:
+        owner = await db.get(PlatformUser, body.owner_email)
+        if owner is None:
+            raise HTTPException(status_code=400, detail="No such user")
+
+        is_member = owner.organization_id == organization_id
+        if not is_member:
+            membership = await db.get(
+                PlatformUserOrganization, (body.owner_email, organization_id)
+            )
+            is_member = membership is not None
+
+        if not is_member:
+            raise HTTPException(
+                status_code=400, detail="User does not belong to this organization"
+            )
+
+    lead.owner_email = body.owner_email
+    await db.commit()
+    await db.refresh(lead)
+
+    return ApiResponse(
+        success=True,
+        data=LeadResponse.model_validate(lead),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

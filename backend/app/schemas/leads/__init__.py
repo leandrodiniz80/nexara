@@ -8,6 +8,8 @@ from app.schemas.leads.lead import (
     LeadStatusUpdateResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
+    UpdateLeadDetailsRequest,
+    UpdateLeadOwnerRequest,
 )
 from app.schemas.leads.lead_automation import (
     AutomationActivityEntry,
@@ -28,4 +30,6 @@ __all__ = [
     "LeadStatusUpdateResponse",
     "LeadTimelineEntry",
     "LeadUpdateStatus",
+    "UpdateLeadDetailsRequest",
+    "UpdateLeadOwnerRequest",
 ]

@@ -24,6 +24,10 @@ class LeadResponse(BaseModel):
     phone: str
     status: str
     score: int
+    notes: str | None = None
+    next_action: str | None = None
+    next_action_due_at: datetime | None = None
+    owner_email: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -70,6 +74,24 @@ class LeadMetricsResponse(BaseModel):
     by_status: LeadMetricsByStatus
     conversion_rate: float
     avg_score: float
+
+
+class UpdateLeadDetailsRequest(BaseModel):
+    """PATCH /leads/{id}/details — every field optional, applied via
+    exclude_unset so autosave-on-blur can PATCH one field (e.g. just notes)
+    without clobbering the other two."""
+
+    notes: str | None = None
+    next_action: str | None = None
+    next_action_due_at: datetime | None = None
+
+
+class UpdateLeadOwnerRequest(BaseModel):
+    """PATCH /leads/{id}/owner. owner_email is a required key but its value
+    may be null — an explicit "unassign" — the router validates membership
+    only when it's non-null."""
+
+    owner_email: str | None
 
 
 class LeadTimelineEntry(BaseModel):
