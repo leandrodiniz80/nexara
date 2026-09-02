@@ -1,6 +1,6 @@
 """Import every domain's models here so Base.metadata is fully populated for Alembic autogenerate."""
 
-from app.models.leads import Lead, LeadAutomation, LeadStatusHistory
+from app.models.leads import AutomationActivityLog, Lead, LeadAutomation, LeadStatusHistory
 from app.models.mission import Mission, MissionEvent, MissionMetrics
 from app.models.platform_auth import (
     PlatformOrganization,
@@ -21,6 +21,7 @@ from app.models.prospecting import (
 )
 
 __all__ = [
+    "AutomationActivityLog",
     "Campaign",
     "Company",
     "CompanyTag",

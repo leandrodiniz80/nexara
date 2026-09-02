@@ -20,3 +20,14 @@ class LeadAutomationResponse(BaseModel):
 
 class LeadAutomationUpdate(BaseModel):
     active: bool
+
+
+class AutomationActivityEntry(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    lead_id: uuid.UUID
+    lead_name: str
+    automation_name: str
+    action_type: str
+    message: str
+    created_at: datetime

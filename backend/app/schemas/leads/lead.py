@@ -70,3 +70,17 @@ class LeadMetricsResponse(BaseModel):
     by_status: LeadMetricsByStatus
     conversion_rate: float
     avg_score: float
+
+
+class LeadTimelineEntry(BaseModel):
+    """GET /leads/{id}/timeline entry. "from" is a Python keyword, so the
+    field is named from_ internally — populate_by_name lets callers construct
+    it as from_=... while FastAPI's response serialization (response_model_by_alias
+    defaults to True) still emits the wire key as "from"."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str
+    from_: str | None = Field(default=None, alias="from")
+    to: str
+    created_at: datetime

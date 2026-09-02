@@ -1,7 +1,7 @@
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,8 +9,13 @@ from app.api.dependencies.auth import get_current_session
 from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
+from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead_automation import LeadAutomation
-from app.schemas.leads.lead_automation import LeadAutomationResponse, LeadAutomationUpdate
+from app.schemas.leads.lead_automation import (
+    AutomationActivityEntry,
+    LeadAutomationResponse,
+    LeadAutomationUpdate,
+)
 from app.services.leads.automation_engine import seed_default_automations
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/automations", tags=["Automations"])
@@ -47,6 +52,33 @@ async def list_automations(
     return ApiResponse(
         success=True,
         data=[LeadAutomationResponse.model_validate(automation) for automation in automations],
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/activity", response_model=ApiResponse[list[AutomationActivityEntry]])
+async def get_automation_activity(
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[AutomationActivityEntry]]:
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    stmt = (
+        select(AutomationActivityLog)
+        .where(AutomationActivityLog.organization_id == organization_id)
+        .order_by(AutomationActivityLog.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    entries = result.scalars().all()
+
+    return ApiResponse(
+        success=True,
+        data=[AutomationActivityEntry.model_validate(entry) for entry in entries],
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

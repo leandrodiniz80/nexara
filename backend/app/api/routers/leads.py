@@ -20,6 +20,7 @@ from app.schemas.leads.lead import (
     LeadMetricsResponse,
     LeadResponse,
     LeadStatusUpdateResponse,
+    LeadTimelineEntry,
     LeadUpdateStatus,
 )
 from app.services.leads.automation_engine import run_automations
@@ -179,6 +180,48 @@ async def create_lead(
         data=LeadCreateResponse(
             lead=LeadResponse.model_validate(lead), notifications=notifications
         ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/{lead_id}/timeline", response_model=ApiResponse[list[LeadTimelineEntry]])
+async def get_lead_timeline(
+    lead_id: uuid.UUID,
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[LeadTimelineEntry]]:
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    # Same ownership check as update_lead_status — a guessed lead_id from
+    # another org 404s instead of returning an empty (ambiguous) timeline.
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    stmt = (
+        select(LeadStatusHistory)
+        .where(LeadStatusHistory.lead_id == lead_id, LeadStatusHistory.organization_id == organization_id)
+        .order_by(LeadStatusHistory.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    history = result.scalars().all()
+
+    return ApiResponse(
+        success=True,
+        data=[
+            LeadTimelineEntry(
+                type="status_changed",
+                from_=entry.from_status,
+                to=entry.to_status,
+                created_at=entry.created_at,
+            )
+            for entry in history
+        ],
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

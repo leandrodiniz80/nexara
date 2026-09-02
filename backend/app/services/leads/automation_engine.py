@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_automation import LeadAutomation
 
@@ -77,6 +78,11 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
     to do here. "notify" has no server-side channel to show a toast on, so
     its message is collected and returned instead; the route handler puts it
     on the HTTP response, and the frontend renders it as a toast from there.
+
+    Every firing (both action types) is also staged as an AutomationActivityLog
+    row via db.add() — not committed here, same as LeadStatusHistory below:
+    the caller's single db.commit() (create_lead / update_lead_status) covers
+    it atomically alongside the lead write.
     """
     from_status = event.get("fromStatus")
     to_status = event.get("toStatus")
@@ -97,6 +103,12 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
         if automation.trigger_to is not None and automation.trigger_to != to_status:
             continue
 
+        message = (
+            f"New lead created: {event['lead'].name}"
+            if event["type"] == "lead_created"
+            else f"Lead moved to {str(to_status).capitalize()}"
+        )
+
         if automation.action_type == "log":
             logger.info(
                 "Automation triggered: %s (lead=%s, %s -> %s)",
@@ -106,11 +118,6 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
                 to_status,
             )
         elif automation.action_type == "notify":
-            message = (
-                f"New lead created: {event['lead'].name}"
-                if event["type"] == "lead_created"
-                else f"Lead moved to {str(to_status).capitalize()}"
-            )
             notifications.append(message)
             logger.info(
                 "Automation triggered: %s (lead=%s) -> notify %r",
@@ -118,5 +125,18 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
                 event["lead"].id,
                 message,
             )
+        else:
+            continue
+
+        db.add(
+            AutomationActivityLog(
+                organization_id=event["lead"].organization_id,
+                lead_id=event["lead"].id,
+                lead_name=event["lead"].name,
+                automation_name=automation.name,
+                action_type=automation.action_type,
+                message=message,
+            )
+        )
 
     return notifications
