@@ -72,26 +72,27 @@ async def get_lead_metrics(
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
-    # Two small aggregate queries (COUNT/AVG, one GROUP BY) — no Python loop
-    # over lead rows either way.
-    status_stmt = (
-        select(Lead.status, func.count(Lead.id))
-        .where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
-        .group_by(Lead.status)
-    )
-    status_counts = dict((await db.execute(status_stmt)).all())
+    # Single round trip: one COUNT(*) FILTER (WHERE ...) per status bucket
+    # plus the overall COUNT/AVG, all in one aggregate query — was two
+    # separate queries (a GROUP BY + a totals query) before. Still zero
+    # Python-side looping over lead rows either way; this only cuts the
+    # number of DB round trips per call.
+    stmt = select(
+        func.count(Lead.id),
+        func.count(Lead.id).filter(Lead.status == "new"),
+        func.count(Lead.id).filter(Lead.status == "contacted"),
+        func.count(Lead.id).filter(Lead.status == "converted"),
+        func.avg(Lead.score),
+    ).where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
 
-    totals_stmt = select(func.count(Lead.id), func.avg(Lead.score)).where(
-        Lead.organization_id == organization_id, Lead.deleted_at.is_(None)
-    )
-    total, avg_score = (await db.execute(totals_stmt)).one()
+    total, new_count, contacted_count, converted_count, avg_score = (
+        await db.execute(stmt)
+    ).one()
 
     by_status = LeadMetricsByStatus(
-        new=status_counts.get("new", 0),
-        contacted=status_counts.get("contacted", 0),
-        converted=status_counts.get("converted", 0),
+        new=new_count, contacted=contacted_count, converted=converted_count
     )
-    conversion_rate = round(by_status.converted / total * 100, 1) if total else 0.0
+    conversion_rate = round(converted_count / total * 100, 1) if total else 0.0
 
     return ApiResponse(
         success=True,
