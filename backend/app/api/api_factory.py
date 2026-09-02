@@ -10,10 +10,12 @@ from app.api.middleware.timing import TimingMiddleware
 from app.api.middleware.tracing import TracingMiddleware
 from app.api.routers.audit import router as audit_router
 from app.api.routers.auth import router as auth_router
+from app.api.routers.automations import router as automations_router
 from app.api.routers.billing import router as billing_router
 from app.api.routers.branding import router as branding_router
 from app.api.routers.cdn import router as cdn_router
 from app.api.routers.health import router as health_router
+from app.api.routers.leads import router as leads_router
 from app.api.routers.logs import router as logs_router
 from app.api.routers.metrics import router as metrics_router
 from app.api.routers.missions import router as missions_router
@@ -90,6 +92,8 @@ def create_app() -> FastAPI:
     app.include_router(workspace_router)
     app.include_router(outreach_router)
     app.include_router(auth_router)
+    app.include_router(leads_router)
+    app.include_router(automations_router)
     app.include_router(secure_demo_router)
     app.include_router(read_models_router)
     app.include_router(organizations_router)
