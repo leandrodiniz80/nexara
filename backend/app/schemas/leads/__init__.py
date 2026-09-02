@@ -10,6 +10,7 @@ from app.schemas.leads.lead import (
     LeadTaskCompleteResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
+    ScoreBreakdownItem,
     UpdateLeadDetailsRequest,
     UpdateLeadOwnerRequest,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "LeadTaskCompleteResponse",
     "LeadTimelineEntry",
     "LeadUpdateStatus",
+    "ScoreBreakdownItem",
     "UpdateLeadDetailsRequest",
     "UpdateLeadOwnerRequest",
 ]

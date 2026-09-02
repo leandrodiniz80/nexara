@@ -14,6 +14,15 @@ class LeadUpdateStatus(BaseModel):
     status: str = Field(pattern="^(new|contacted|converted|lost)$")
 
 
+class ScoreBreakdownItem(BaseModel):
+    """One factor behind a lead's dynamically-computed score — see
+    app/services/leads/scoring.py::compute_lead_score. Positive impact
+    boosts the score, negative lowers it."""
+
+    reason: str
+    impact: int
+
+
 class LeadResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -23,7 +32,11 @@ class LeadResponse(BaseModel):
     email: str
     phone: str
     status: str
+    # Computed dynamically at read time (compute_lead_score), not read
+    # straight off the stored column — see scoring.py for why, and for what
+    # score_breakdown's entries mean. Never persisted back to the row.
     score: int
+    score_breakdown: list[ScoreBreakdownItem] = Field(default_factory=list)
     notes: str | None = None
     next_action: str | None = None
     next_action_due_at: datetime | None = None

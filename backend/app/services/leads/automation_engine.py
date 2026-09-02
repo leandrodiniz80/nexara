@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 from sqlalchemy import select
@@ -47,6 +48,19 @@ _DEFAULT_AUTOMATIONS = [
         "trigger_from": None,
         "trigger_to": None,
         "action_type": "notify",
+        "active": True,
+    },
+    {
+        # First operational (not just informative) action type: instead of
+        # only logging/notifying, this one actually schedules a follow-up on
+        # the lead itself. Fixed 1-day delay + fixed task text for now — no
+        # LeadAutomation column exists to make either configurable per-row,
+        # and none is worth adding for a single automation.
+        "name": "Auto-schedule First Contact",
+        "trigger_type": "lead_created",
+        "trigger_from": None,
+        "trigger_to": None,
+        "action_type": "create_task",
         "active": True,
     },
 ]
@@ -136,6 +150,16 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
                 automation.name,
                 event["lead"].id,
                 message,
+            )
+        elif automation.action_type == "create_task":
+            event["lead"].next_action = "Contact within 1 day"
+            event["lead"].next_action_due_at = datetime.now(timezone.utc) + timedelta(days=1)
+            logger.info(
+                "Automation triggered: %s (lead=%s) -> create_task %r due %s",
+                automation.name,
+                event["lead"].id,
+                event["lead"].next_action,
+                event["lead"].next_action_due_at,
             )
         else:
             continue

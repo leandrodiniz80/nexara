@@ -34,6 +34,7 @@ from app.schemas.leads.lead import (
     UpdateLeadOwnerRequest,
 )
 from app.services.leads.automation_engine import run_automations
+from app.services.leads.scoring import score_leads
 
 logger = logging.getLogger("app.api.routers.leads")
 
@@ -92,7 +93,7 @@ async def list_leads(
         .offset(offset)
     )
     result = await db.execute(stmt)
-    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+    leads = await score_leads(db, result.scalars().all())
 
     if not with_meta:
         return ApiResponse(
@@ -234,7 +235,7 @@ async def get_leads_needing_attention(
 
         await db.commit()
 
-    leads = [LeadResponse.model_validate(lead) for lead in stale_leads]
+    leads = await score_leads(db, stale_leads)
 
     return ApiResponse(
         success=True,
@@ -267,7 +268,59 @@ async def get_lead_tasks(
         .limit(limit)
     )
     result = await db.execute(stmt)
-    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+    leads = await score_leads(db, result.scalars().all())
+
+    return ApiResponse(
+        success=True,
+        data=leads,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/priority", response_model=ApiResponse[list[LeadResponse]])
+async def get_leads_priority(
+    limit: int = Query(default=10, ge=1, le=50),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[LeadResponse]]:
+    """"Foco do dia" — leads in the worst situation right now: soonest
+    overdue/due task first, then (among leads with no next_action at all,
+    where due date can't rank them) the lowest computed score. Score is
+    computed dynamically, not stored, so the final ranking can't be done in
+    SQL alone: fetches a generous candidate pool via the one ordering SQL
+    *can* express (next_action_due_at ASC NULLS LAST, backed by
+    ix_leads_org_id_next_action_due_at), scores that whole pool in one
+    extra query (score_leads), then re-sorts by the true composite order
+    before slicing to `limit`. 200 is comfortably above any realistic
+    per-org lead count at this product stage; revisit if that stops being
+    true."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    candidate_pool_stmt = (
+        select(Lead)
+        .where(
+            Lead.organization_id == organization_id,
+            Lead.deleted_at.is_(None),
+            Lead.status != "converted",
+        )
+        .order_by(Lead.next_action_due_at.asc().nulls_last())
+        .limit(200)
+    )
+    result = await db.execute(candidate_pool_stmt)
+    candidates = result.scalars().all()
+
+    scored = await score_leads(db, candidates)
+    scored.sort(
+        key=lambda response: (
+            response.next_action_due_at is None,
+            response.next_action_due_at,
+            response.score,
+        )
+    )
+    leads = scored[:limit]
 
     return ApiResponse(
         success=True,
@@ -395,11 +448,11 @@ async def create_lead(
 
     logger.info("Lead created: %s (org=%s)", lead.id, organization_id)
 
+    (scored_lead,) = await score_leads(db, [lead])
+
     return ApiResponse(
         success=True,
-        data=LeadCreateResponse(
-            lead=LeadResponse.model_validate(lead), notifications=notifications
-        ),
+        data=LeadCreateResponse(lead=scored_lead, notifications=notifications),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -527,9 +580,11 @@ async def update_lead_details(
     await db.commit()
     await db.refresh(lead)
 
+    (scored_lead,) = await score_leads(db, [lead])
+
     return ApiResponse(
         success=True,
-        data=LeadResponse.model_validate(lead),
+        data=scored_lead,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -589,9 +644,11 @@ async def update_lead_owner(
     await db.commit()
     await db.refresh(lead)
 
+    (scored_lead,) = await score_leads(db, [lead])
+
     return ApiResponse(
         success=True,
-        data=LeadResponse.model_validate(lead),
+        data=scored_lead,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -634,9 +691,11 @@ async def complete_lead_task(
     await db.commit()
     await db.refresh(lead)
 
+    (scored_lead,) = await score_leads(db, [lead])
+
     return ApiResponse(
         success=True,
-        data=LeadTaskCompleteResponse(lead=LeadResponse.model_validate(lead), notifications=[]),
+        data=LeadTaskCompleteResponse(lead=scored_lead, notifications=[]),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -694,11 +753,11 @@ async def update_lead_status(
         organization_id,
     )
 
+    (scored_lead,) = await score_leads(db, [lead])
+
     return ApiResponse(
         success=True,
-        data=LeadStatusUpdateResponse(
-            lead=LeadResponse.model_validate(lead), notifications=notifications
-        ),
+        data=LeadStatusUpdateResponse(lead=scored_lead, notifications=notifications),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
