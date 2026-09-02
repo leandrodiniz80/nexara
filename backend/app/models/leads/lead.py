@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, String
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -20,6 +20,11 @@ class Lead(Base, AuditMixin):
     __table_args__ = (
         CheckConstraint("status IN ('new','contacted','converted','lost')", name="ck_leads_status"),
         CheckConstraint("score >= 0 AND score <= 100", name="ck_leads_score"),
+        # Backs GET /leads: WHERE organization_id = ... ORDER BY created_at
+        # DESC. The plain ix_leads_org_id index alone still answers the
+        # filter correctly; this composite one avoids a separate sort step
+        # once an organization's lead count is large enough to matter.
+        Index("ix_leads_org_id_created_at", "organization_id", "created_at"),
     )
 
     organization_id: Mapped[str] = mapped_column(

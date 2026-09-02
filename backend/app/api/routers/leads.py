@@ -2,7 +2,7 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,14 @@ def _require_organization(session: dict) -> str:
 
 @router.get("", response_model=ApiResponse[list[LeadResponse]])
 async def list_leads(
+    # Optional, generous defaults — every existing caller (no query params
+    # at all) gets exactly the same full list as before at today's data
+    # volumes. This only bounds the query so one organization can't pull an
+    # unbounded result set as lead counts grow; it doesn't add pagination
+    # metadata (total/has_more) to the response, so it's not a real "next
+    # page" UI yet — that's a separate, contract-changing step.
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     request_id: str = Depends(get_request_id),
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
@@ -51,6 +59,8 @@ async def list_leads(
         select(Lead)
         .where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
         .order_by(Lead.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     leads = result.scalars().all()
