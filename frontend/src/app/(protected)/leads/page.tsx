@@ -59,7 +59,9 @@ export default function LeadsPage() {
   const [statusFilter, setStatusFilter] = useState<"all" | LeadStatus>("all");
   const [query, setQuery] = useState("");
   const [view, setView] = useState<"table" | "kanban">("table");
+  const [highlightedLeadId, setHighlightedLeadId] = useState<string | null>(null);
   const listTopRef = useRef<HTMLDivElement>(null);
+  const highlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const {
     data: leads = [],
@@ -83,10 +85,17 @@ export default function LeadsPage() {
 
   const createLeadMutation = useMutation({
     mutationFn: createLead,
-    onSuccess: (newLead) => {
+    onSuccess: ({ lead: newLead, notifications }) => {
       queryClient.setQueryData<Lead[]>(["leads"], (prev) => [newLead, ...(prev ?? [])]);
+      queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
       showToast("Lead created successfully");
+      notifications.forEach((message) => showToast(message));
+
       listTopRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+      setHighlightedLeadId(newLead.id);
+      highlightTimeoutRef.current = setTimeout(() => setHighlightedLeadId(null), 2000);
     },
   });
 
@@ -97,9 +106,16 @@ export default function LeadsPage() {
       queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
         (prev ?? []).map((lead) => (lead.id === result.lead.id ? result.lead : lead))
       );
+      queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
       result.notifications.forEach((message) => showToast(message));
     },
   });
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+    };
+  }, []);
 
   const filteredLeads = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -207,12 +223,13 @@ export default function LeadsPage() {
                 No leads match your filters.
               </p>
             ) : view === "table" ? (
-              <LeadsTable leads={filteredLeads} />
+              <LeadsTable leads={filteredLeads} highlightedLeadId={highlightedLeadId} />
             ) : (
               <LeadsKanban
                 leads={filteredLeads}
                 onMove={handleMoveLead}
                 onOpenDetails={setDetailsLead}
+                highlightedLeadId={highlightedLeadId}
               />
             )}
           </div>

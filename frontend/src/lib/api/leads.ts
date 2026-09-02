@@ -56,18 +56,51 @@ export async function getLeads(): Promise<Lead[]> {
   }
 }
 
-/** POST /api/v1/leads */
+export interface LeadCreateResult {
+  lead: Lead;
+  notifications: string[];
+}
+
+/** POST /api/v1/leads — can now also fire a "lead_created" notify
+ * automation, so the response carries the same {lead, notifications} shape
+ * as updateLeadStatus() below. */
 export async function createLead(body: {
   name: string;
   email: string;
   phone: string;
-}): Promise<Lead> {
+}): Promise<LeadCreateResult> {
   try {
-    const { data } = await apiClient.post<ApiResponse<LeadDto>>("/leads", body);
+    const { data } = await apiClient.post<
+      ApiResponse<{ lead: LeadDto; notifications: string[] }>
+    >("/leads", body);
     if (!data.data) {
       throw new Error("Lead creation succeeded but returned no data");
     }
-    return toLead(data.data);
+    return { lead: toLead(data.data.lead), notifications: data.data.notifications };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface LeadMetrics {
+  total: number;
+  by_status: {
+    new: number;
+    contacted: number;
+    converted: number;
+  };
+  conversion_rate: number;
+  avg_score: number;
+}
+
+/** GET /api/v1/leads/metrics */
+export async function getLeadMetrics(): Promise<LeadMetrics> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadMetrics>>("/leads/metrics");
+    if (!data.data) {
+      throw new Error("Metrics request succeeded but returned no data");
+    }
+    return data.data;
   } catch (error) {
     throw toApiClientError(error);
   }

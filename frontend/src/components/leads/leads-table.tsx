@@ -1,5 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import type { Lead, LeadStatus } from "@/lib/api/leads";
+import { cn } from "@/lib/utils/cn";
 import { formatDate } from "@/lib/utils/format";
 
 const STATUS_LABEL: Record<LeadStatus, string> = {
@@ -14,7 +15,13 @@ const STATUS_BADGE: Record<LeadStatus, "secondary" | "warning" | "success"> = {
   converted: "success",
 };
 
-export function LeadsTable({ leads }: { leads: Lead[] }) {
+export function LeadsTable({
+  leads,
+  highlightedLeadId,
+}: {
+  leads: Lead[];
+  highlightedLeadId?: string | null;
+}) {
   const sorted = [...leads].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
@@ -33,7 +40,16 @@ export function LeadsTable({ leads }: { leads: Lead[] }) {
         </thead>
         <tbody className="divide-y divide-border">
           {sorted.map((lead) => (
-            <tr key={lead.id} className="transition-colors hover:bg-accent/50">
+            <tr
+              key={lead.id}
+              style={
+                lead.id === highlightedLeadId ? { transitionDuration: "2000ms" } : undefined
+              }
+              className={cn(
+                "transition-colors duration-200 hover:bg-accent/50",
+                lead.id === highlightedLeadId && "bg-primary/20"
+              )}
+            >
               <td className="px-4 py-3 font-medium text-foreground">{lead.name}</td>
               <td className="px-4 py-3 text-muted-foreground">{lead.email}</td>
               <td className="px-4 py-3 text-muted-foreground">{lead.phone}</td>

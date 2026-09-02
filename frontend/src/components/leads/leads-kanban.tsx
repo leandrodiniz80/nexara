@@ -16,10 +16,12 @@ export function LeadsKanban({
   leads,
   onMove,
   onOpenDetails,
+  highlightedLeadId,
 }: {
   leads: Lead[];
   onMove: (leadId: string, status: LeadStatus) => void;
   onOpenDetails: (lead: Lead) => void;
+  highlightedLeadId?: string | null;
 }) {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverStatus, setDragOverStatus] = useState<LeadStatus | null>(null);
@@ -80,6 +82,7 @@ export function LeadsKanban({
                     key={lead.id}
                     lead={lead}
                     isDragging={draggingId === lead.id}
+                    isHighlighted={lead.id === highlightedLeadId}
                     onDragStart={() => setDraggingId(lead.id)}
                     onMove={(status) => onMove(lead.id, status)}
                     onOpenDetails={() => onOpenDetails(lead)}

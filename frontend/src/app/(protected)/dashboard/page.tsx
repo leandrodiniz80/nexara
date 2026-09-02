@@ -5,12 +5,15 @@ import { useQuery } from "@tanstack/react-query";
 import { BusinessIntelligence } from "@/components/dashboard/business-intelligence";
 import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
+import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
+import { PipelineBar } from "@/components/dashboard/pipeline-bar";
 import { PageContainer } from "@/components/layout/page-container";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
+import { getLeadMetrics } from "@/lib/api/leads";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -27,6 +30,13 @@ export default function DashboardPage() {
   } = useQuery({
     queryKey: ["billing-overview"],
     queryFn: getBusinessOverview,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: leadsMetrics } = useQuery({
+    queryKey: ["leads-metrics"],
+    queryFn: getLeadMetrics,
     enabled: isAuthenticated,
     retry: false,
   });
@@ -59,6 +69,13 @@ export default function DashboardPage() {
         </>
       }
     >
+      {leadsMetrics && (
+        <div className="space-y-4">
+          <LeadsMetricsGrid metrics={leadsMetrics} />
+          <PipelineBar metrics={leadsMetrics} />
+        </div>
+      )}
+
       {showSkeleton ? (
         <DashboardSkeleton />
       ) : isAuthError ? (
