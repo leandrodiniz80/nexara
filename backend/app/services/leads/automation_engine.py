@@ -38,6 +38,17 @@ _DEFAULT_AUTOMATIONS = [
         "action_type": "notify",
         "active": True,
     },
+    {
+        # No fromStatus/toStatus at all (unlike lead_status_changed) — this
+        # trigger fires from a time-based condition (no update in N days),
+        # evaluated inside GET /leads/attention, not a discrete transition.
+        "name": "Stale Contacted Lead",
+        "trigger_type": "lead_stale",
+        "trigger_from": None,
+        "trigger_to": None,
+        "action_type": "notify",
+        "active": True,
+    },
 ]
 
 
@@ -103,11 +114,12 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
         if automation.trigger_to is not None and automation.trigger_to != to_status:
             continue
 
-        message = (
-            f"New lead created: {event['lead'].name}"
-            if event["type"] == "lead_created"
-            else f"Lead moved to {str(to_status).capitalize()}"
-        )
+        if event["type"] == "lead_created":
+            message = f"New lead created: {event['lead'].name}"
+        elif event["type"] == "lead_stale":
+            message = f"{event['lead'].name} has had no activity in a while — consider following up"
+        else:
+            message = f"Lead moved to {str(to_status).capitalize()}"
 
         if automation.action_type == "log":
             logger.info(

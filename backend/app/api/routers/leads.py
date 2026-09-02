@@ -11,11 +11,15 @@ from app.api.dependencies.auth import get_current_session
 from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
+from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
+from app.models.leads.lead_activity_log import LeadActivityLog
+from app.models.leads.lead_automation import LeadAutomation
 from app.models.leads.lead_status_history import LeadStatusHistory
 from app.models.platform_auth.user import PlatformUser
 from app.models.platform_auth.user_organization import PlatformUserOrganization
 from app.schemas.leads.lead import (
+    LeadActivityFeedEntry,
     LeadCreate,
     LeadCreateResponse,
     LeadListResponse,
@@ -23,6 +27,7 @@ from app.schemas.leads.lead import (
     LeadMetricsResponse,
     LeadResponse,
     LeadStatusUpdateResponse,
+    LeadTaskCompleteResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
     UpdateLeadDetailsRequest,
@@ -33,6 +38,23 @@ from app.services.leads.automation_engine import run_automations
 logger = logging.getLogger("app.api.routers.leads")
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/leads", tags=["Leads"])
+
+
+def _describe_details_update(updates: dict) -> str:
+    """Builds a human-readable message for the LeadActivityLog row PATCH
+    /leads/{id}/details writes — the frontend autosaves one field per blur,
+    so `updates` normally has exactly one key, but this handles more than
+    one gracefully too."""
+    parts = []
+    if "notes" in updates:
+        parts.append("Notes updated")
+    if "next_action" in updates:
+        parts.append(
+            f"Next action set: {updates['next_action']}" if updates["next_action"] else "Next action cleared"
+        )
+    if "next_action_due_at" in updates:
+        parts.append("Due date updated")
+    return "; ".join(parts) if parts else "Lead details updated"
 
 
 def _require_organization(session: dict) -> str:
@@ -175,7 +197,44 @@ async def get_leads_needing_attention(
         .limit(limit)
     )
     result = await db.execute(stmt)
-    leads = [LeadResponse.model_validate(lead) for lead in result.scalars().all()]
+    stale_leads = result.scalars().all()
+
+    # Opportunistic "lead_stale" firing — no cron: piggybacks on this
+    # existing, already-computed stale-leads query, evaluated whenever a
+    # caller asks (typically the dashboard). Deduped against
+    # AutomationActivityLog so viewing this endpoint repeatedly doesn't
+    # re-notify the same lead every call: only fires again once no
+    # "Stale Contacted Lead"-type entry exists for it within the current
+    # staleness window.
+    active_stale_triggers_stmt = select(LeadAutomation.name).where(
+        LeadAutomation.organization_id == organization_id,
+        LeadAutomation.active.is_(True),
+        LeadAutomation.trigger_type == "lead_stale",
+    )
+    stale_trigger_names = (await db.execute(active_stale_triggers_stmt)).scalars().all()
+
+    if stale_trigger_names:
+        for lead in stale_leads:
+            if lead.status != "contacted":
+                continue
+
+            already_notified_stmt = (
+                select(AutomationActivityLog.id)
+                .where(
+                    AutomationActivityLog.lead_id == lead.id,
+                    AutomationActivityLog.automation_name.in_(stale_trigger_names),
+                    AutomationActivityLog.created_at >= cutoff,
+                )
+                .limit(1)
+            )
+            if (await db.execute(already_notified_stmt)).first() is not None:
+                continue
+
+            await run_automations(db, {"type": "lead_stale", "lead": lead})
+
+        await db.commit()
+
+    leads = [LeadResponse.model_validate(lead) for lead in stale_leads]
 
     return ApiResponse(
         success=True,
@@ -213,6 +272,91 @@ async def get_lead_tasks(
     return ApiResponse(
         success=True,
         data=leads,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/activity", response_model=ApiResponse[list[LeadActivityFeedEntry]])
+async def get_leads_activity_feed(
+    limit: int = Query(default=50, ge=1, le=200),
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[LeadActivityFeedEntry]]:
+    """Org-wide counterpart to GET /leads/{id}/timeline — same three
+    sources (LeadStatusHistory, AutomationActivityLog, LeadActivityLog),
+    merged across every lead in the organization instead of just one. Backs
+    the dashboard's Recent Activity card."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    status_stmt = (
+        select(LeadStatusHistory, Lead.name)
+        .join(Lead, Lead.id == LeadStatusHistory.lead_id)
+        .where(LeadStatusHistory.organization_id == organization_id)
+        .order_by(LeadStatusHistory.created_at.desc())
+        .limit(limit)
+    )
+    automation_stmt = (
+        select(AutomationActivityLog)
+        .where(AutomationActivityLog.organization_id == organization_id)
+        .order_by(AutomationActivityLog.created_at.desc())
+        .limit(limit)
+    )
+    activity_stmt = (
+        select(LeadActivityLog)
+        .where(LeadActivityLog.organization_id == organization_id)
+        .order_by(LeadActivityLog.created_at.desc())
+        .limit(limit)
+    )
+
+    status_rows = (await db.execute(status_stmt)).all()
+    automation_rows = (await db.execute(automation_stmt)).scalars().all()
+    activity_rows = (await db.execute(activity_stmt)).scalars().all()
+
+    entries = (
+        [
+            LeadActivityFeedEntry(
+                lead_id=history.lead_id,
+                lead_name=lead_name,
+                type="status_changed",
+                message=(
+                    f"Status changed from {history.from_status} to {history.to_status}"
+                    if history.from_status
+                    else f"Status set to {history.to_status}"
+                ),
+                created_at=history.created_at,
+            )
+            for history, lead_name in status_rows
+        ]
+        + [
+            LeadActivityFeedEntry(
+                lead_id=row.lead_id,
+                lead_name=row.lead_name,
+                type="automation_fired",
+                message=f"{row.automation_name} — {row.message}",
+                created_at=row.created_at,
+            )
+            for row in automation_rows
+        ]
+        + [
+            LeadActivityFeedEntry(
+                lead_id=row.lead_id,
+                lead_name=row.lead_name,
+                type=row.event_type,
+                message=row.message,
+                created_at=row.created_at,
+            )
+            for row in activity_rows
+        ]
+    )
+    entries.sort(key=lambda entry: entry.created_at, reverse=True)
+    entries = entries[:limit]
+
+    return ApiResponse(
+        success=True,
+        data=entries,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -269,6 +413,14 @@ async def get_lead_timeline(
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[LeadTimelineEntry]]:
+    """Single source of truth for everything that's happened to this lead:
+    status changes (LeadStatusHistory), automation firings
+    (AutomationActivityLog), and owner/notes/next_action/task-completion
+    events (LeadActivityLog) — merged and re-sorted by created_at DESC.
+    Fetching top-`limit` from each source before merging is sufficient for a
+    correct overall top-`limit`: any entry outside a source's own top-`limit`
+    can't be in the global top-`limit` either, since limit-1 entries from
+    that same source already outrank it."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -278,26 +430,62 @@ async def get_lead_timeline(
     if lead is None or lead.organization_id != organization_id:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    stmt = (
+    status_stmt = (
         select(LeadStatusHistory)
         .where(LeadStatusHistory.lead_id == lead_id, LeadStatusHistory.organization_id == organization_id)
         .order_by(LeadStatusHistory.created_at.desc())
         .limit(limit)
     )
-    result = await db.execute(stmt)
-    history = result.scalars().all()
+    automation_stmt = (
+        select(AutomationActivityLog)
+        .where(AutomationActivityLog.lead_id == lead_id, AutomationActivityLog.organization_id == organization_id)
+        .order_by(AutomationActivityLog.created_at.desc())
+        .limit(limit)
+    )
+    activity_stmt = (
+        select(LeadActivityLog)
+        .where(LeadActivityLog.lead_id == lead_id, LeadActivityLog.organization_id == organization_id)
+        .order_by(LeadActivityLog.created_at.desc())
+        .limit(limit)
+    )
+
+    status_rows = (await db.execute(status_stmt)).scalars().all()
+    automation_rows = (await db.execute(automation_stmt)).scalars().all()
+    activity_rows = (await db.execute(activity_stmt)).scalars().all()
+
+    entries = (
+        [
+            LeadTimelineEntry(
+                type="status_changed",
+                from_=row.from_status,
+                to=row.to_status,
+                created_at=row.created_at,
+            )
+            for row in status_rows
+        ]
+        + [
+            LeadTimelineEntry(
+                type="automation_fired",
+                message=f"{row.automation_name} — {row.message}",
+                created_at=row.created_at,
+            )
+            for row in automation_rows
+        ]
+        + [
+            LeadTimelineEntry(
+                type=row.event_type,
+                message=row.message,
+                created_at=row.created_at,
+            )
+            for row in activity_rows
+        ]
+    )
+    entries.sort(key=lambda entry: entry.created_at, reverse=True)
+    entries = entries[:limit]
 
     return ApiResponse(
         success=True,
-        data=[
-            LeadTimelineEntry(
-                type="status_changed",
-                from_=entry.from_status,
-                to=entry.to_status,
-                created_at=entry.created_at,
-            )
-            for entry in history
-        ],
+        data=entries,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -321,8 +509,20 @@ async def update_lead_details(
     if lead is None or lead.organization_id != organization_id:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    updates = body.model_dump(exclude_unset=True)
+    for field, value in updates.items():
         setattr(lead, field, value)
+
+    if updates:
+        db.add(
+            LeadActivityLog(
+                organization_id=organization_id,
+                lead_id=lead.id,
+                lead_name=lead.name,
+                event_type="details_updated",
+                message=_describe_details_update(updates),
+            )
+        )
 
     await db.commit()
     await db.refresh(lead)
@@ -375,12 +575,68 @@ async def update_lead_owner(
             )
 
     lead.owner_email = body.owner_email
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type="owner_changed",
+            message=(
+                f"Owner changed to {body.owner_email}" if body.owner_email else "Owner unassigned"
+            ),
+        )
+    )
     await db.commit()
     await db.refresh(lead)
 
     return ApiResponse(
         success=True,
         data=LeadResponse.model_validate(lead),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("/{lead_id}/complete-task", response_model=ApiResponse[LeadTaskCompleteResponse])
+async def complete_lead_task(
+    lead_id: uuid.UUID,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadTaskCompleteResponse]:
+    """Marks the lead's current next_action done: logs it to LeadActivityLog
+    (captured before clearing, so the timeline still shows what was
+    completed), then clears next_action/next_action_due_at. No automation
+    fires from this event today — notifications is always [], kept for
+    response-shape consistency with the other lead mutation endpoints."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    if lead.next_action is None:
+        raise HTTPException(status_code=400, detail="This lead has no next action to complete")
+
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type="task_completed",
+            message=f"Completed: {lead.next_action}",
+        )
+    )
+    lead.next_action = None
+    lead.next_action_due_at = None
+
+    await db.commit()
+    await db.refresh(lead)
+
+    return ApiResponse(
+        success=True,
+        data=LeadTaskCompleteResponse(lead=LeadResponse.model_validate(lead), notifications=[]),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

@@ -1,4 +1,5 @@
 from app.schemas.leads.lead import (
+    LeadActivityFeedEntry,
     LeadCreate,
     LeadCreateResponse,
     LeadListResponse,
@@ -6,6 +7,7 @@ from app.schemas.leads.lead import (
     LeadMetricsResponse,
     LeadResponse,
     LeadStatusUpdateResponse,
+    LeadTaskCompleteResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
     UpdateLeadDetailsRequest,
@@ -19,6 +21,7 @@ from app.schemas.leads.lead_automation import (
 
 __all__ = [
     "AutomationActivityEntry",
+    "LeadActivityFeedEntry",
     "LeadAutomationResponse",
     "LeadAutomationUpdate",
     "LeadCreate",
@@ -28,6 +31,7 @@ __all__ = [
     "LeadMetricsResponse",
     "LeadResponse",
     "LeadStatusUpdateResponse",
+    "LeadTaskCompleteResponse",
     "LeadTimelineEntry",
     "LeadUpdateStatus",
     "UpdateLeadDetailsRequest",
