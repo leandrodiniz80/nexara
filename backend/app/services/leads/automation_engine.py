@@ -29,25 +29,32 @@ _DEFAULT_AUTOMATIONS = [
         "action_type": "log",
         "active": True,
     },
+    {
+        "name": "Lead Created Notification",
+        "trigger_type": "lead_created",
+        "trigger_from": None,
+        "trigger_to": None,
+        "action_type": "notify",
+        "active": True,
+    },
 ]
 
 
-class LeadStatusChangedEvent(TypedDict):
+class AutomationEvent(TypedDict, total=False):
     type: str
     lead: Lead
-    fromStatus: str
-    toStatus: str
+    fromStatus: str | None
+    toStatus: str | None
 
 
 async def seed_default_automations(db: AsyncSession, organization_id: str) -> None:
-    """Inserts the two default automations for an organization if they don't
-    exist yet. Uses INSERT ... ON CONFLICT DO NOTHING against the
-    (organization_id, name) unique constraint (see the leads-domain
-    migration) rather than "check empty, then insert" — two concurrent
-    first-ever GET /automations for the same new org would otherwise both
-    observe an empty list and both insert, duplicating every row. The
-    conflict target makes a duplicate insert a no-op instead, so this is
-    safe to call every time regardless of how many requests race here.
+    """Inserts every default automation for an organization that doesn't
+    already exist, by name — safe to call unconditionally on every
+    GET /automations (not just for brand-new orgs): ON CONFLICT DO NOTHING
+    against the (organization_id, name) unique constraint makes an existing
+    row a no-op, so adding a new entry to _DEFAULT_AUTOMATIONS later (like
+    "Lead Created Notification") automatically backfills it for orgs that
+    already had the older two, without ever duplicating anything.
     """
     stmt = pg_insert(LeadAutomation).values(
         [{**automation, "organization_id": organization_id} for automation in _DEFAULT_AUTOMATIONS]
@@ -57,10 +64,11 @@ async def seed_default_automations(db: AsyncSession, organization_id: str) -> No
     await db.commit()
 
 
-async def run_automations(db: AsyncSession, event: LeadStatusChangedEvent) -> list[str]:
+async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]:
     """Matches the event against every active LeadAutomation for the lead's
     organization. Partial trigger match: an automation with trigger_from/
-    trigger_to left NULL matches any status on that side.
+    trigger_to left NULL matches any status on that side (always true for a
+    "lead_created" event, which has no from/to status at all).
 
     Unrelated to app/automation/ (that package binds Workflows to Triggers —
     a different subsystem entirely; see LeadAutomation's own docstring).
@@ -70,6 +78,9 @@ async def run_automations(db: AsyncSession, event: LeadStatusChangedEvent) -> li
     its message is collected and returned instead; the route handler puts it
     on the HTTP response, and the frontend renders it as a toast from there.
     """
+    from_status = event.get("fromStatus")
+    to_status = event.get("toStatus")
+
     stmt = select(LeadAutomation).where(
         LeadAutomation.organization_id == event["lead"].organization_id,
         LeadAutomation.active.is_(True),
@@ -81,9 +92,9 @@ async def run_automations(db: AsyncSession, event: LeadStatusChangedEvent) -> li
     notifications: list[str] = []
 
     for automation in automations:
-        if automation.trigger_from is not None and automation.trigger_from != event["fromStatus"]:
+        if automation.trigger_from is not None and automation.trigger_from != from_status:
             continue
-        if automation.trigger_to is not None and automation.trigger_to != event["toStatus"]:
+        if automation.trigger_to is not None and automation.trigger_to != to_status:
             continue
 
         if automation.action_type == "log":
@@ -91,11 +102,15 @@ async def run_automations(db: AsyncSession, event: LeadStatusChangedEvent) -> li
                 "Automation triggered: %s (lead=%s, %s -> %s)",
                 automation.name,
                 event["lead"].id,
-                event["fromStatus"],
-                event["toStatus"],
+                from_status,
+                to_status,
             )
         elif automation.action_type == "notify":
-            message = f"Lead moved to {event['toStatus'].capitalize()}"
+            message = (
+                f"New lead created: {event['lead'].name}"
+                if event["type"] == "lead_created"
+                else f"Lead moved to {str(to_status).capitalize()}"
+            )
             notifications.append(message)
             logger.info(
                 "Automation triggered: %s (lead=%s) -> notify %r",

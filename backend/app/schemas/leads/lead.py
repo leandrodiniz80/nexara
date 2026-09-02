@@ -35,3 +35,25 @@ class LeadStatusUpdateResponse(BaseModel):
 
     lead: LeadResponse
     notifications: list[str] = Field(default_factory=list)
+
+
+class LeadCreateResponse(BaseModel):
+    """Same rationale as LeadStatusUpdateResponse — POST /leads can now also
+    fire a "lead_created" automation (e.g. a notify), so its response needs
+    the same {lead, notifications} shape."""
+
+    lead: LeadResponse
+    notifications: list[str] = Field(default_factory=list)
+
+
+class LeadMetricsByStatus(BaseModel):
+    new: int
+    contacted: int
+    converted: int
+
+
+class LeadMetricsResponse(BaseModel):
+    total: int
+    by_status: LeadMetricsByStatus
+    conversion_rate: float
+    avg_score: float

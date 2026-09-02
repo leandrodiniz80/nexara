@@ -32,20 +32,17 @@ async def list_automations(
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
+    # Idempotent (ON CONFLICT DO NOTHING against organization_id+name) — safe
+    # to run on every call. This is what backfills a newly added default
+    # automation (e.g. "Lead Created Notification") for organizations that
+    # already had the older ones, not just brand-new orgs.
+    await seed_default_automations(db, organization_id)
+
     stmt = select(LeadAutomation).where(
         LeadAutomation.organization_id == organization_id, LeadAutomation.deleted_at.is_(None)
     )
     result = await db.execute(stmt)
     automations = result.scalars().all()
-
-    if not automations:
-        # First time this organization ever asks for its automations — seed
-        # the two defaults and re-query. seed_default_automations() is
-        # ON-CONFLICT-safe (see its docstring), so this never duplicates
-        # rows even if two requests race here for the same brand-new org.
-        await seed_default_automations(db, organization_id)
-        result = await db.execute(stmt)
-        automations = result.scalars().all()
 
     return ApiResponse(
         success=True,

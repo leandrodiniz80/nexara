@@ -3,7 +3,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import get_current_session
@@ -11,8 +11,12 @@ from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
+from app.models.leads.lead_status_history import LeadStatusHistory
 from app.schemas.leads.lead import (
     LeadCreate,
+    LeadCreateResponse,
+    LeadMetricsByStatus,
+    LeadMetricsResponse,
     LeadResponse,
     LeadStatusUpdateResponse,
     LeadUpdateStatus,
@@ -59,13 +63,56 @@ async def list_leads(
     )
 
 
-@router.post("", response_model=ApiResponse[LeadResponse])
+@router.get("/metrics", response_model=ApiResponse[LeadMetricsResponse])
+async def get_lead_metrics(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadMetricsResponse]:
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    # Two small aggregate queries (COUNT/AVG, one GROUP BY) — no Python loop
+    # over lead rows either way.
+    status_stmt = (
+        select(Lead.status, func.count(Lead.id))
+        .where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
+        .group_by(Lead.status)
+    )
+    status_counts = dict((await db.execute(status_stmt)).all())
+
+    totals_stmt = select(func.count(Lead.id), func.avg(Lead.score)).where(
+        Lead.organization_id == organization_id, Lead.deleted_at.is_(None)
+    )
+    total, avg_score = (await db.execute(totals_stmt)).one()
+
+    by_status = LeadMetricsByStatus(
+        new=status_counts.get("new", 0),
+        contacted=status_counts.get("contacted", 0),
+        converted=status_counts.get("converted", 0),
+    )
+    conversion_rate = round(by_status.converted / total * 100, 1) if total else 0.0
+
+    return ApiResponse(
+        success=True,
+        data=LeadMetricsResponse(
+            total=total,
+            by_status=by_status,
+            conversion_rate=conversion_rate,
+            avg_score=round(float(avg_score), 1) if avg_score is not None else 0.0,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("", response_model=ApiResponse[LeadCreateResponse])
 async def create_lead(
     body: LeadCreate,
     request_id: str = Depends(get_request_id),
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
-) -> ApiResponse[LeadResponse]:
+) -> ApiResponse[LeadCreateResponse]:
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -81,6 +128,12 @@ async def create_lead(
         score=20,
     )
     db.add(lead)
+
+    # lead.id is already set (AuditMixin generates it client-side via
+    # uuid.uuid4()), so run_automations() can read it before the commit
+    # below — same single-commit shape as update_lead_status.
+    notifications = await run_automations(db, {"type": "lead_created", "lead": lead})
+
     await db.commit()
     await db.refresh(lead)
 
@@ -88,7 +141,9 @@ async def create_lead(
 
     return ApiResponse(
         success=True,
-        data=LeadResponse.model_validate(lead),
+        data=LeadCreateResponse(
+            lead=LeadResponse.model_validate(lead), notifications=notifications
+        ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -125,6 +180,14 @@ async def update_lead_status(
                 "fromStatus": from_status,
                 "toStatus": lead.status,
             },
+        )
+        db.add(
+            LeadStatusHistory(
+                lead_id=lead.id,
+                organization_id=organization_id,
+                from_status=from_status,
+                to_status=lead.status,
+            )
         )
 
     await db.commit()
