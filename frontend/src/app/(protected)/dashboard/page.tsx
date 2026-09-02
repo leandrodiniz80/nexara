@@ -14,10 +14,14 @@ import { PageContainer } from "@/components/layout/page-container";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
-import { getAutomationsActivity } from "@/lib/api/automations";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
-import { getLeadMetrics, getLeadsNeedingAttention, getLeadTasks } from "@/lib/api/leads";
+import {
+  getLeadMetrics,
+  getLeadsActivityFeed,
+  getLeadsNeedingAttention,
+  getLeadTasks,
+} from "@/lib/api/leads";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -45,9 +49,9 @@ export default function DashboardPage() {
     retry: false,
   });
 
-  const { data: automationsActivity } = useQuery({
-    queryKey: ["automations-activity"],
-    queryFn: getAutomationsActivity,
+  const { data: activityFeed } = useQuery({
+    queryKey: ["leads-activity"],
+    queryFn: getLeadsActivityFeed,
     enabled: isAuthenticated,
     retry: false,
   });
@@ -100,7 +104,7 @@ export default function DashboardPage() {
           <PipelineBar metrics={leadsMetrics} />
           {leadsNeedingAttention && <NeedsAttention leads={leadsNeedingAttention} />}
           {leadTasks && <UpcomingTasks leads={leadTasks} />}
-          {automationsActivity && <RecentActivity entries={automationsActivity} />}
+          {activityFeed && <RecentActivity entries={activityFeed} />}
         </div>
       )}
 

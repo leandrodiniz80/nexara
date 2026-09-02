@@ -11,6 +11,7 @@ import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils/cn";
 import {
+  completeLeadTask,
   getLeadTimeline,
   updateLeadDetails,
   updateLeadOwner,
@@ -68,15 +69,19 @@ function LeadActivityTimeline({ leadId }: { leadId: string }) {
           </div>
           <div className="pb-4">
             <p className="text-sm text-foreground">
-              {entry.from ? (
-                <>
-                  Status changed from <span className="font-medium">{entry.from}</span> to{" "}
-                  <span className="font-medium">{entry.to}</span>
-                </>
+              {entry.type === "status_changed" ? (
+                entry.from ? (
+                  <>
+                    Status changed from <span className="font-medium">{entry.from}</span> to{" "}
+                    <span className="font-medium">{entry.to}</span>
+                  </>
+                ) : (
+                  <>
+                    Status set to <span className="font-medium">{entry.to}</span>
+                  </>
+                )
               ) : (
-                <>
-                  Status set to <span className="font-medium">{entry.to}</span>
-                </>
+                entry.message
               )}
             </p>
             <p className="text-xs text-muted-foreground">{formatRelativeTime(entry.createdAt)}</p>
@@ -112,6 +117,22 @@ function LeadNotesAndTasks({ lead }: { lead: Lead }) {
       );
       queryClient.invalidateQueries({ queryKey: ["leads-attention"] });
       queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+    },
+  });
+
+  const completeTask = useMutation({
+    mutationFn: () => completeLeadTask(lead.id),
+    onSuccess: ({ lead: updated }) => {
+      setNextAction("");
+      setDueDate("");
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+      queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
     },
   });
 
@@ -133,9 +154,21 @@ function LeadNotesAndTasks({ lead }: { lead: Lead }) {
       </div>
 
       <div className="space-y-1.5">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Next Action
-        </p>
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Next Action
+          </p>
+          {lead.nextAction && (
+            <button
+              type="button"
+              onClick={() => completeTask.mutate()}
+              disabled={completeTask.isPending}
+              className="text-xs font-medium text-primary hover:underline disabled:opacity-50"
+            >
+              Complete task
+            </button>
+          )}
+        </div>
         <Input
           value={nextAction}
           onChange={(event) => setNextAction(event.target.value)}
@@ -179,6 +212,8 @@ function LeadOwnerAssignment({ lead }: { lead: Lead }) {
       queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
         (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
       );
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
     },
   });
 

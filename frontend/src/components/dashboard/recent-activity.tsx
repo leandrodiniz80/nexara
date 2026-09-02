@@ -1,8 +1,8 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { AutomationActivityEntry } from "@/lib/api/automations";
+import type { LeadActivityFeedEntry } from "@/lib/api/leads";
 import { formatRelativeTime } from "@/lib/utils/format";
 
-export function RecentActivity({ entries }: { entries: AutomationActivityEntry[] }) {
+export function RecentActivity({ entries }: { entries: LeadActivityFeedEntry[] }) {
   return (
     <Card>
       <CardHeader>
@@ -10,7 +10,7 @@ export function RecentActivity({ entries }: { entries: AutomationActivityEntry[]
       </CardHeader>
       <CardContent>
         {entries.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No automations have fired yet.</p>
+          <p className="text-sm text-muted-foreground">No activity yet.</p>
         ) : (
           <ul className="space-y-3">
             {entries.map((entry, index) => (
@@ -20,7 +20,7 @@ export function RecentActivity({ entries }: { entries: AutomationActivityEntry[]
               >
                 <div>
                   <p className="text-foreground">
-                    <span className="font-medium">{entry.automationName}</span> — {entry.leadName}
+                    <span className="font-medium">{entry.leadName}</span>
                   </p>
                   <p className="text-xs text-muted-foreground">{entry.message}</p>
                 </div>

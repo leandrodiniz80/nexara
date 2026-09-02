@@ -155,19 +155,29 @@ export async function getLeadsNeedingAttention(): Promise<Lead[]> {
   }
 }
 
+export type LeadTimelineEntryType =
+  | "status_changed"
+  | "automation_fired"
+  | "owner_changed"
+  | "details_updated"
+  | "task_completed";
+
 export interface LeadTimelineEntry {
-  type: "status_changed";
+  type: LeadTimelineEntryType;
   from: string | null;
-  to: string;
+  to: string | null;
+  message: string | null;
   createdAt: string;
 }
 
 /** Wire shape from GET /leads/{id}/timeline — see LeadTimelineEntry in
- * backend/app/schemas/leads/lead.py. */
+ * backend/app/schemas/leads/lead.py. Only "status_changed" carries from/to;
+ * every other type carries message instead. */
 interface LeadTimelineEntryDto {
-  type: "status_changed";
+  type: LeadTimelineEntryType;
   from: string | null;
-  to: string;
+  to: string | null;
+  message: string | null;
   created_at: string;
 }
 
@@ -181,6 +191,7 @@ export async function getLeadTimeline(id: string): Promise<LeadTimelineEntry[]> 
       type: entry.type,
       from: entry.from,
       to: entry.to,
+      message: entry.message,
       createdAt: entry.created_at,
     }));
   } catch (error) {
@@ -233,6 +244,62 @@ export async function updateLeadOwner(id: string, ownerEmail: string | null): Pr
       throw new Error("Owner update succeeded but returned no data");
     }
     return toLead(data.data);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** POST /api/v1/leads/{id}/complete-task — marks the lead's current
+ * next_action done and clears it (+ its due date). Same {lead,
+ * notifications} shape as createLead/updateLeadStatus, though notifications
+ * is always empty today (no automation fires on this event yet). */
+export async function completeLeadTask(id: string): Promise<LeadStatusUpdateResult> {
+  try {
+    const { data } = await apiClient.post<
+      ApiResponse<{ lead: LeadDto; notifications: string[] }>
+    >(`/leads/${id}/complete-task`, {});
+    if (!data.data) {
+      throw new Error("Task completion succeeded but returned no data");
+    }
+    return { lead: toLead(data.data.lead), notifications: data.data.notifications };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface LeadActivityFeedEntry {
+  leadId: string;
+  leadName: string;
+  type: LeadTimelineEntryType;
+  message: string;
+  createdAt: string;
+}
+
+/** Wire shape from GET /leads/activity — see LeadActivityFeedEntry in
+ * backend/app/schemas/leads/lead.py. */
+interface LeadActivityFeedEntryDto {
+  lead_id: string;
+  lead_name: string;
+  type: LeadTimelineEntryType;
+  message: string;
+  created_at: string;
+}
+
+/** GET /api/v1/leads/activity — org-wide activity feed (status changes,
+ * automation firings, owner/notes/task-completion events across every
+ * lead), soonest-first. Backs the dashboard's Recent Activity card. */
+export async function getLeadsActivityFeed(): Promise<LeadActivityFeedEntry[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadActivityFeedEntryDto[]>>(
+      "/leads/activity"
+    );
+    return (data.data ?? []).map((entry) => ({
+      leadId: entry.lead_id,
+      leadName: entry.lead_name,
+      type: entry.type,
+      message: entry.message,
+      createdAt: entry.created_at,
+    }));
   } catch (error) {
     throw toApiClientError(error);
   }
