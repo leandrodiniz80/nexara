@@ -37,7 +37,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!isLoading && isAuthenticated) {
-      router.replace("/");
+      router.replace("/dashboard");
     }
   }, [isLoading, isAuthenticated, router]);
 
@@ -46,7 +46,7 @@ export default function LoginPage() {
     setIsSubmitting(true);
     try {
       await login(values.email, values.password);
-      router.replace("/");
+      router.replace("/dashboard");
     } catch (error) {
       const message =
         error instanceof ApiClientError && error.status === 401
