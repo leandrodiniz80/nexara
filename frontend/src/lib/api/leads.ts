@@ -18,6 +18,7 @@ export interface Lead {
   status: LeadStatus;
   score: number;
   createdAt: string;
+  updatedAt: string;
 }
 
 /** Wire shape from GET/POST/PATCH /leads — snake_case, matches every other
@@ -43,6 +44,7 @@ function toLead(dto: LeadDto): Lead {
     status: dto.status,
     score: dto.score,
     createdAt: dto.created_at,
+    updatedAt: dto.updated_at,
   };
 }
 
@@ -124,6 +126,18 @@ export async function updateLeadStatus(
       throw new Error("Status update succeeded but returned no data");
     }
     return { lead: toLead(data.data.lead), notifications: data.data.notifications };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** GET /api/v1/leads/attention — leads still active (not converted) with no
+ * status change (or any other edit) in at least 3 days, oldest-touched
+ * first. Backend default for stale_after_days/limit, no params needed. */
+export async function getLeadsNeedingAttention(): Promise<Lead[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<LeadDto[]>>("/leads/attention");
+    return (data.data ?? []).map(toLead);
   } catch (error) {
     throw toApiClientError(error);
   }
