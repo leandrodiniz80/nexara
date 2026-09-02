@@ -40,9 +40,6 @@ export function CreateLeadModal({
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    // No POST /leads endpoint yet — this is a UI-only stub so the form
-    // shape is already right when that endpoint exists.
-    console.log("New lead:", form);
     onCreate?.(form);
     onClose();
   }
@@ -62,9 +59,7 @@ export function CreateLeadModal({
         <h2 id="create-lead-title" className="text-base font-semibold text-foreground">
           New Lead
         </h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Add a lead manually. Not wired to the backend yet.
-        </p>
+        <p className="mt-1 text-sm text-muted-foreground">Add a lead manually.</p>
 
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
           <div className="space-y-2">
