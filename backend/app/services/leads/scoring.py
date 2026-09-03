@@ -5,15 +5,62 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.schemas.leads.lead import LeadResponse, ScoreBreakdownItem
-from app.services.leads.enrichment import HIGH_VALUE_INDUSTRIES, LARGE_COMPANY_SIZES
+from app.services.leads.enrichment import (
+    HIGH_VALUE_INDUSTRIES,
+    LARGE_COMPANY_SIZES,
+    generate_first_contact_message,
+)
 
 # "Recent" for the automation-activity boost — same window LeadResponse's
 # other "recent" concepts (e.g. GET /leads/attention's default
 # stale_after_days) use in this codebase.
 _RECENT_AUTOMATION_DAYS = 3
+
+# Portuguese labels for next_best_action's enrichment context fragment (e.g.
+# "Fazer follow-up urgente com empresa de tecnologia de médio porte") — keyed
+# on enrichment.py's own _INDUSTRIES/_COMPANY_SIZES values, so an unrecognized
+# value (there shouldn't be one) just omits the context instead of raising.
+_INDUSTRY_PT = {
+    "Technology": "tecnologia",
+    "Finance": "finanças",
+    "Healthcare": "saúde",
+    "Retail": "varejo",
+    "Manufacturing": "indústria",
+    "Education": "educação",
+    "Real Estate": "imóveis",
+    "Hospitality": "hospitalidade",
+}
+_COMPANY_SIZE_PT = {
+    "1-10": "pequeno porte",
+    "11-50": "pequeno porte",
+    "51-200": "médio porte",
+    "201-500": "médio porte",
+    "500+": "grande porte",
+}
+
+
+def compute_next_best_action(lead: Lead, *, is_overdue: bool) -> str | None:
+    """"What should I do about this lead right now" — a plain rule table on
+    status (+ overdue), no ML/LLM involved. Converted (and any other status
+    outside new/contacted, e.g. lost) has nothing left to act on."""
+    if lead.status == "new":
+        action = "Fazer primeiro contato"
+    elif lead.status == "contacted":
+        action = "Fazer follow-up urgente" if is_overdue else "Acompanhar lead"
+    else:
+        return None
+
+    if lead.enrichment_data:
+        industry = _INDUSTRY_PT.get(lead.enrichment_data.get("industry", ""))
+        size = _COMPANY_SIZE_PT.get(lead.enrichment_data.get("company_size", ""))
+        if industry and size:
+            action += f" com empresa de {industry} de {size}"
+
+    return action
 
 
 def compute_lead_score(
@@ -137,6 +184,14 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         )
         is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
         days_overdue = (now - lead.next_action_due_at).days if is_overdue else None
+
+        next_best_action = compute_next_best_action(lead, is_overdue=is_overdue)
+        suggested_message = (
+            generate_first_contact_message(lead, lead.owner_email or "the team")
+            if next_best_action is not None and settings.AI_ENABLED
+            else None
+        )
+
         response = LeadResponse.model_validate(lead)
         responses.append(
             response.model_copy(
@@ -145,6 +200,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "score_breakdown": breakdown,
                     "is_overdue": is_overdue,
                     "days_overdue": days_overdue,
+                    "next_best_action": next_best_action,
+                    "suggested_message": suggested_message,
                 }
             )
         )

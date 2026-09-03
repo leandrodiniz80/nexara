@@ -65,6 +65,13 @@ class LeadResponse(BaseModel):
     # migrate. days_overdue is None whenever is_overdue is False.
     is_overdue: bool = False
     days_overdue: int | None = None
+    # Rule-based (no LLM) — see compute_next_best_action() in scoring.py.
+    # None for converted/lost leads, where there's nothing left to act on.
+    next_best_action: str | None = None
+    # Only populated when next_best_action is set AND AI_ENABLED — reuses
+    # generate_first_contact_message(), the same template POST
+    # /leads/{id}/generate-message calls; no extra LLM/API call of its own.
+    suggested_message: str | None = None
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
