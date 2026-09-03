@@ -29,13 +29,17 @@ export interface Lead {
   nextAction: string | null;
   nextActionDueAt: string | null;
   ownerEmail: string | null;
+  /** Workday mode's execution lock — true while this lead is someone's
+   * (not necessarily the current user's) active focus session. */
+  inFocus: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
 /** Wire shape from GET/POST/PATCH /leads — snake_case, matches every other
- * response in this API (see LeadResponse in backend/app/schemas/leads/lead.py). */
-interface LeadDto {
+ * response in this API (see LeadResponse in backend/app/schemas/leads/lead.py).
+ * Exported for lib/api/workday.ts, which returns this same shape. */
+export interface LeadDto {
   id: string;
   organization_id: string;
   name: string;
@@ -48,11 +52,12 @@ interface LeadDto {
   next_action: string | null;
   next_action_due_at: string | null;
   owner_email: string | null;
+  in_focus: boolean;
   created_at: string;
   updated_at: string;
 }
 
-function toLead(dto: LeadDto): Lead {
+export function toLead(dto: LeadDto): Lead {
   return {
     id: dto.id,
     name: dto.name,
@@ -65,6 +70,7 @@ function toLead(dto: LeadDto): Lead {
     nextAction: dto.next_action,
     nextActionDueAt: dto.next_action_due_at,
     ownerEmail: dto.owner_email,
+    inFocus: dto.in_focus,
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
   };

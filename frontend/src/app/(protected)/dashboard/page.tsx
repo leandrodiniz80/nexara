@@ -30,6 +30,7 @@ import {
   type Lead,
   type LeadStatus,
 } from "@/lib/api/leads";
+import { getWorkdayNext } from "@/lib/api/workday";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -38,6 +39,11 @@ export default function DashboardPage() {
   const { showToast } = useToast();
   const queryClient = useQueryClient();
   const [detailsLead, setDetailsLead] = useState<Lead | null>(null);
+  const [isWorkdayMode, setIsWorkdayMode] = useState(false);
+  const [workdayStats, setWorkdayStats] = useState<{
+    tasksCompletedToday: number;
+    streakDays: number;
+  } | null>(null);
 
   const {
     data: overview,
@@ -94,6 +100,30 @@ export default function DashboardPage() {
     refetchInterval: 45000,
   });
 
+  // "Começar meu dia": fetches the one lead to work on right now, marks it
+  // in_focus server-side, and opens its modal. Completing that lead's task
+  // (see the modal's onTaskCompleted below) calls this again automatically
+  // — the continuous "finish one, get the next" flow — until the queue is
+  // empty. isWorkdayMode gates that auto-continue: opening a lead any other
+  // way (e.g. Today's Focus card's own View button) never chains into it.
+  const workdayNextMutation = useMutation({
+    mutationFn: getWorkdayNext,
+    onSuccess: (result) => {
+      setWorkdayStats({
+        tasksCompletedToday: result.tasksCompletedToday,
+        streakDays: result.streakDays,
+      });
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
+      if (result.lead) {
+        setIsWorkdayMode(true);
+        setDetailsLead(result.lead);
+      } else {
+        setIsWorkdayMode(false);
+        showToast("You're all caught up — nothing left to work on right now.");
+      }
+    },
+  });
+
   const updateStatusMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
       updateLeadStatus(id, status),
@@ -138,8 +168,40 @@ export default function DashboardPage() {
       >
         {leadsMetrics && (
           <div className="space-y-4">
+            <div className="flex flex-col items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-foreground">Ready to focus?</p>
+                <p className="text-xs text-muted-foreground">
+                  We&apos;ll line up one lead at a time — worst-off first.
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                {workdayStats && (
+                  <span className="text-xs text-muted-foreground">
+                    {workdayStats.tasksCompletedToday} resolved today
+                    {workdayStats.streakDays > 1 ? ` · ${workdayStats.streakDays}-day streak` : ""}
+                  </span>
+                )}
+                <Button
+                  size="lg"
+                  onClick={() => workdayNextMutation.mutate()}
+                  disabled={workdayNextMutation.isPending}
+                >
+                  {workdayNextMutation.isPending ? "Finding your next lead…" : "Começar meu dia"}
+                </Button>
+              </div>
+            </div>
+
             {priorityLeads && (
-              <TodaysFocus leads={priorityLeads} onOpenDetails={setDetailsLead} />
+              <TodaysFocus
+                leads={priorityLeads}
+                onOpenDetails={(lead) => {
+                  // Opened via the card's own View button, not the workday
+                  // flow — never chains into an auto-continue on completion.
+                  setIsWorkdayMode(false);
+                  setDetailsLead(lead);
+                }}
+              />
             )}
             <LeadsMetricsGrid metrics={leadsMetrics} />
             <PipelineBar metrics={leadsMetrics} />
@@ -165,13 +227,19 @@ export default function DashboardPage() {
 
       <LeadDetailsModal
         lead={detailsLead}
-        onClose={() => setDetailsLead(null)}
+        onClose={() => {
+          setDetailsLead(null);
+          setIsWorkdayMode(false);
+        }}
         onMove={(status) => {
           if (detailsLead && detailsLead.status !== status) {
             updateStatusMutation.mutate({ id: detailsLead.id, status });
           }
           setDetailsLead(null);
+          setIsWorkdayMode(false);
         }}
+        onTaskCompleted={isWorkdayMode ? () => workdayNextMutation.mutate() : undefined}
+        workdayStats={isWorkdayMode ? (workdayStats ?? undefined) : undefined}
       />
     </>
   );

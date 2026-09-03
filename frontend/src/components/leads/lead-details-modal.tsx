@@ -92,7 +92,13 @@ function LeadActivityTimeline({ leadId }: { leadId: string }) {
   );
 }
 
-function LeadNotesAndTasks({ lead }: { lead: Lead }) {
+function LeadNotesAndTasks({
+  lead,
+  onTaskCompleted,
+}: {
+  lead: Lead;
+  onTaskCompleted?: () => void;
+}) {
   const queryClient = useQueryClient();
   const [notes, setNotes] = useState(lead.notes ?? "");
   const [nextAction, setNextAction] = useState(lead.nextAction ?? "");
@@ -131,8 +137,10 @@ function LeadNotesAndTasks({ lead }: { lead: Lead }) {
         (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
       );
       queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      onTaskCompleted?.();
     },
   });
 
@@ -244,10 +252,17 @@ export function LeadDetailsModal({
   lead,
   onClose,
   onMove,
+  onTaskCompleted,
+  workdayStats,
 }: {
   lead: Lead | null;
   onClose: () => void;
   onMove: (status: LeadStatus) => void;
+  /** Set only when this modal is being driven by workday mode ("Começar meu
+   * dia") — completing this lead's task calls back into the dashboard to
+   * fetch and open the next one, instead of just refreshing in place. */
+  onTaskCompleted?: () => void;
+  workdayStats?: { tasksCompletedToday: number; streakDays: number };
 }) {
   const [tab, setTab] = useState<ModalTab>("details");
 
@@ -271,6 +286,13 @@ export function LeadDetailsModal({
           </h2>
           <Badge variant={STATUS_BADGE[lead.status]}>{STATUS_LABEL[lead.status]}</Badge>
         </div>
+
+        {workdayStats && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            {workdayStats.tasksCompletedToday} leads resolved today
+            {workdayStats.streakDays > 1 ? ` · ${workdayStats.streakDays}-day streak` : ""}
+          </p>
+        )}
 
         <div className="mt-4 flex gap-4 border-b border-border text-sm">
           {(["details", "activity"] as ModalTab[]).map((value) => (
@@ -332,7 +354,7 @@ export function LeadDetailsModal({
               </div>
             </div>
 
-            <LeadNotesAndTasks lead={lead} />
+            <LeadNotesAndTasks lead={lead} onTaskCompleted={onTaskCompleted} />
           </>
         ) : (
           <LeadActivityTimeline leadId={lead.id} />
