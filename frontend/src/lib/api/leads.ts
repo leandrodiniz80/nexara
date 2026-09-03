@@ -213,22 +213,35 @@ export type LeadTimelineEntryType =
   | "enriched"
   | "message_generated";
 
+/** Coarse bucket for `type`, additive alongside it — lets the UI pick an
+ * icon without a case per exact fine-grained type. See TimelineCategory in
+ * backend/app/schemas/leads/lead.py. */
+export type LeadTimelineCategory = "status_change" | "automation" | "activity";
+
 export interface LeadTimelineEntry {
+  id: string;
   type: LeadTimelineEntryType;
+  category: LeadTimelineCategory;
   from: string | null;
   to: string | null;
-  message: string | null;
+  /** Always a ready-to-render sentence — built by the backend, never
+   * assembled here. */
+  message: string;
+  metadata: Record<string, unknown> | null;
   createdAt: string;
 }
 
 /** Wire shape from GET /leads/{id}/timeline — see LeadTimelineEntry in
  * backend/app/schemas/leads/lead.py. Only "status_changed" carries from/to;
- * every other type carries message instead. */
+ * every type carries a backend-generated message. */
 interface LeadTimelineEntryDto {
+  id: string;
   type: LeadTimelineEntryType;
+  category: LeadTimelineCategory;
   from: string | null;
   to: string | null;
-  message: string | null;
+  message: string;
+  metadata: Record<string, unknown> | null;
   created_at: string;
 }
 
@@ -239,10 +252,13 @@ export async function getLeadTimeline(id: string): Promise<LeadTimelineEntry[]> 
       `/leads/${id}/timeline`
     );
     return (data.data ?? []).map((entry) => ({
+      id: entry.id,
       type: entry.type,
+      category: entry.category,
       from: entry.from,
       to: entry.to,
       message: entry.message,
+      metadata: entry.metadata,
       createdAt: entry.created_at,
     }));
   } catch (error) {
@@ -319,36 +335,46 @@ export async function completeLeadTask(id: string): Promise<LeadStatusUpdateResu
 }
 
 export interface LeadActivityFeedEntry {
+  id: string;
   leadId: string;
   leadName: string;
   type: LeadTimelineEntryType;
+  category: LeadTimelineCategory;
   message: string;
+  metadata: Record<string, unknown> | null;
   createdAt: string;
 }
 
 /** Wire shape from GET /leads/activity — see LeadActivityFeedEntry in
  * backend/app/schemas/leads/lead.py. */
 interface LeadActivityFeedEntryDto {
+  id: string;
   lead_id: string;
   lead_name: string;
   type: LeadTimelineEntryType;
+  category: LeadTimelineCategory;
   message: string;
+  metadata: Record<string, unknown> | null;
   created_at: string;
 }
 
 /** GET /api/v1/leads/activity — org-wide activity feed (status changes,
  * automation firings, owner/notes/task-completion events across every
- * lead), soonest-first. Backs the dashboard's Recent Activity card. */
+ * lead), soonest-first. Backend default limit is 20; the dashboard's Recent
+ * Activity card slices to the 10 it actually displays. */
 export async function getLeadsActivityFeed(): Promise<LeadActivityFeedEntry[]> {
   try {
     const { data } = await apiClient.get<ApiResponse<LeadActivityFeedEntryDto[]>>(
       "/leads/activity"
     );
     return (data.data ?? []).map((entry) => ({
+      id: entry.id,
       leadId: entry.lead_id,
       leadName: entry.lead_name,
       type: entry.type,
+      category: entry.category,
       message: entry.message,
+      metadata: entry.metadata,
       createdAt: entry.created_at,
     }));
   } catch (error) {

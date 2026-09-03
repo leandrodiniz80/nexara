@@ -205,7 +205,15 @@ export default function DashboardPage() {
             )}
             <LeadsMetricsGrid metrics={leadsMetrics} />
             <PipelineBar metrics={leadsMetrics} />
-            {leadsNeedingAttention && <NeedsAttention leads={leadsNeedingAttention} />}
+            {leadsNeedingAttention && (
+              <NeedsAttention
+                leads={leadsNeedingAttention}
+                onOpenDetails={(lead) => {
+                  setIsWorkdayMode(false);
+                  setDetailsLead(lead);
+                }}
+              />
+            )}
             {leadTasks && <UpcomingTasks leads={leadTasks} />}
             {activityFeed && <RecentActivity entries={activityFeed} />}
           </div>

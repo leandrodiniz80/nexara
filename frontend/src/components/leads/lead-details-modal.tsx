@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowRightLeft, Sparkles, Zap, type LucideIcon } from "lucide-react";
 
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -47,6 +48,12 @@ const STATUS_OPTIONS: LeadStatus[] = ["new", "contacted", "converted"];
 
 type ModalTab = "details" | "activity";
 
+const CATEGORY_ICON: Record<"status_change" | "automation" | "activity", LucideIcon> = {
+  status_change: ArrowRightLeft,
+  automation: Zap,
+  activity: Sparkles,
+};
+
 function LeadActivityTimeline({ leadId }: { leadId: string }) {
   const { data: entries, isLoading } = useQuery({
     queryKey: ["lead-timeline", leadId],
@@ -63,33 +70,23 @@ function LeadActivityTimeline({ leadId }: { leadId: string }) {
 
   return (
     <ol className="mt-4 space-y-4">
-      {entries.map((entry, index) => (
-        <li key={`${entry.createdAt}-${index}`} className="relative flex gap-3 pl-1">
-          <div className="flex flex-col items-center">
-            <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" />
-            {index < entries.length - 1 && <span className="w-px flex-1 bg-border" />}
-          </div>
-          <div className="pb-4">
-            <p className="text-sm text-foreground">
-              {entry.type === "status_changed" ? (
-                entry.from ? (
-                  <>
-                    Status changed from <span className="font-medium">{entry.from}</span> to{" "}
-                    <span className="font-medium">{entry.to}</span>
-                  </>
-                ) : (
-                  <>
-                    Status set to <span className="font-medium">{entry.to}</span>
-                  </>
-                )
-              ) : (
-                entry.message
-              )}
-            </p>
-            <p className="text-xs text-muted-foreground">{formatRelativeTime(entry.createdAt)}</p>
-          </div>
-        </li>
-      ))}
+      {entries.map((entry, index) => {
+        const Icon = CATEGORY_ICON[entry.category];
+        return (
+          <li key={entry.id} className="relative flex gap-3 pl-1">
+            <div className="flex flex-col items-center">
+              <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                <Icon className="h-3.5 w-3.5" />
+              </span>
+              {index < entries.length - 1 && <span className="w-px flex-1 bg-border" />}
+            </div>
+            <div className="pb-4">
+              <p className="text-sm text-foreground">{entry.message}</p>
+              <p className="text-xs text-muted-foreground">{formatRelativeTime(entry.createdAt)}</p>
+            </div>
+          </li>
+        );
+      })}
     </ol>
   );
 }
