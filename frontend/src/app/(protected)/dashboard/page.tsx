@@ -65,6 +65,9 @@ export default function DashboardPage() {
     queryFn: getLeadsActivityFeed,
     enabled: isAuthenticated,
     retry: false,
+    // No websocket yet — a light 45s poll keeps "what just happened" from
+    // going stale while someone's sitting on the dashboard.
+    refetchInterval: 45000,
   });
 
   const { data: leadsNeedingAttention } = useQuery({
@@ -86,6 +89,9 @@ export default function DashboardPage() {
     queryFn: getLeadsPriority,
     enabled: isAuthenticated,
     retry: false,
+    // Same rationale as leads-activity above: "who needs me today" drifts
+    // out of date the longer this stays open without a refresh.
+    refetchInterval: 45000,
   });
 
   const updateStatusMutation = useMutation({

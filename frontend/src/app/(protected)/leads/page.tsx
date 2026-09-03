@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Users } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { PageContainer } from "@/components/layout/page-container";
@@ -50,6 +50,7 @@ function LeadsSkeleton() {
 
 export default function LeadsPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { logout } = useAuth();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
@@ -116,6 +117,20 @@ export default function LeadsPage() {
       if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
     };
   }, []);
+
+  // Deep link from a notification ("clicar → abre lead"): ?lead=<id>, once
+  // the list has loaded. router.replace strips the param right after so
+  // this doesn't re-fire on the next unrelated re-render/refetch.
+  useEffect(() => {
+    const leadId = searchParams.get("lead");
+    if (!leadId || leads.length === 0) return;
+
+    const match = leads.find((lead) => lead.id === leadId);
+    if (match) {
+      setDetailsLead(match);
+      router.replace("/leads");
+    }
+  }, [searchParams, leads, router]);
 
   const filteredLeads = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();

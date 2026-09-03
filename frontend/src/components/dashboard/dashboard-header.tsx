@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+import { NotificationBell } from "@/components/dashboard/notification-bell";
 import { Avatar } from "@/components/ui/avatar";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/lib/auth/auth-context";
@@ -22,7 +23,8 @@ export function DashboardHeader() {
   }
 
   return (
-    <header className="flex h-16 items-center justify-end border-b border-border px-6">
+    <header className="flex h-16 items-center justify-end gap-3 border-b border-border px-6">
+      {user && <NotificationBell />}
       {user && (
         <DropdownMenu
           trigger={

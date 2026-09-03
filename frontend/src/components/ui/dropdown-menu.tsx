@@ -14,10 +14,14 @@ export function DropdownMenu({
   trigger,
   children,
   align = "end",
+  panelClassName,
 }: {
   trigger: React.ReactNode;
   children: React.ReactNode;
   align?: "start" | "end";
+  /** Overrides the panel's default w-48 — e.g. a notification list needs
+   * more room than a short action menu. */
+  panelClassName?: string;
 }) {
   const [open, setOpen] = React.useState(false);
   const containerRef = React.useRef<HTMLDivElement>(null);
@@ -66,7 +70,8 @@ export function DropdownMenu({
           onClick={close}
           className={cn(
             "absolute top-full z-50 mt-2 w-48 rounded-md border border-border bg-card p-1 shadow-md",
-            align === "end" ? "right-0" : "left-0"
+            align === "end" ? "right-0" : "left-0",
+            panelClassName
           )}
         >
           {children}
