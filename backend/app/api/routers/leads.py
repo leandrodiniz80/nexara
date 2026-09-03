@@ -42,6 +42,16 @@ logger = logging.getLogger("app.api.routers.leads")
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/leads", tags=["Leads"])
 
 
+def _category_for_type(entry_type: str) -> str:
+    """Coarse bucket for a fine-grained LeadTimelineEntry/LeadActivityFeedEntry
+    `type` — lets the frontend pick an icon without a case per exact type."""
+    if entry_type == "status_changed":
+        return "status_change"
+    if entry_type == "automation_fired":
+        return "automation"
+    return "activity"
+
+
 def _describe_details_update(updates: dict) -> str:
     """Builds a human-readable message for the LeadActivityLog row PATCH
     /leads/{id}/details writes — the frontend autosaves one field per blur,
@@ -179,10 +189,15 @@ async def get_leads_needing_attention(
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[LeadResponse]]:
-    """Leads still in the active pipeline (not yet converted) that haven't
-    had a status change — or any other edit, since updated_at bumps on any
-    column write — in at least stale_after_days. Ordered oldest-touched
-    first, so the most neglected lead surfaces at the top."""
+    """Leads specifically in "contacted" that haven't had a status change —
+    or any other edit, since updated_at bumps on any column write — in at
+    least stale_after_days. Narrowed from "new or contacted" to just
+    "contacted": that's the only status the lead_stale automation itself
+    ever matches (see fire_stale_lead_automations()), so a "new" lead
+    showing up here previously was attention nothing could act on. Ordered
+    oldest-touched first, so the most neglected lead surfaces at the top —
+    backed by ix_leads_org_id_status_updated_at (organization_id, status,
+    updated_at), an exact match for this WHERE + ORDER BY shape."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -192,7 +207,7 @@ async def get_leads_needing_attention(
         .where(
             Lead.organization_id == organization_id,
             Lead.deleted_at.is_(None),
-            Lead.status.in_(["new", "contacted"]),
+            Lead.status == "contacted",
             Lead.updated_at < cutoff,
         )
         .order_by(Lead.updated_at.asc())
@@ -306,7 +321,7 @@ async def get_leads_priority(
 
 @router.get("/activity", response_model=ApiResponse[list[LeadActivityFeedEntry]])
 async def get_leads_activity_feed(
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=20, ge=1, le=200),
     request_id: str = Depends(get_request_id),
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
@@ -314,7 +329,11 @@ async def get_leads_activity_feed(
     """Org-wide counterpart to GET /leads/{id}/timeline — same three
     sources (LeadStatusHistory, AutomationActivityLog, LeadActivityLog),
     merged across every lead in the organization instead of just one. Backs
-    the dashboard's Recent Activity card."""
+    the dashboard's Recent Activity card. Top-`limit` fetched from each
+    table (no UNION, no N+1 — three flat SELECTs), merged and re-sorted in
+    memory, then sliced to `limit`: correct for the same reason
+    GET /leads/{id}/timeline's own docstring gives — an entry outside a
+    source's own top-`limit` can't be in the global top-`limit` either."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -345,33 +364,41 @@ async def get_leads_activity_feed(
     entries = (
         [
             LeadActivityFeedEntry(
+                id=history.id,
                 lead_id=history.lead_id,
                 lead_name=lead_name,
                 type="status_changed",
+                category=_category_for_type("status_changed"),
                 message=(
-                    f"Status changed from {history.from_status} to {history.to_status}"
+                    f"Status changed from {history.from_status.capitalize()} to {history.to_status.capitalize()}"
                     if history.from_status
-                    else f"Status set to {history.to_status}"
+                    else f"Status set to {history.to_status.capitalize()}"
                 ),
+                metadata={"from_status": history.from_status, "to_status": history.to_status},
                 created_at=history.created_at,
             )
             for history, lead_name in status_rows
         ]
         + [
             LeadActivityFeedEntry(
+                id=row.id,
                 lead_id=row.lead_id,
                 lead_name=row.lead_name,
                 type="automation_fired",
-                message=f"{row.automation_name} — {row.message}",
+                category=_category_for_type("automation_fired"),
+                message=f"Automation triggered: {row.message}",
+                metadata={"automation_name": row.automation_name, "action_type": row.action_type},
                 created_at=row.created_at,
             )
             for row in automation_rows
         ]
         + [
             LeadActivityFeedEntry(
+                id=row.id,
                 lead_id=row.lead_id,
                 lead_name=row.lead_name,
                 type=row.event_type,
+                category=_category_for_type(row.event_type),
                 message=row.message,
                 created_at=row.created_at,
             )
@@ -483,24 +510,37 @@ async def get_lead_timeline(
     entries = (
         [
             LeadTimelineEntry(
+                id=row.id,
                 type="status_changed",
+                category=_category_for_type("status_changed"),
                 from_=row.from_status,
                 to=row.to_status,
+                message=(
+                    f"Status changed from {row.from_status.capitalize()} to {row.to_status.capitalize()}"
+                    if row.from_status
+                    else f"Status set to {row.to_status.capitalize()}"
+                ),
+                metadata={"from_status": row.from_status, "to_status": row.to_status},
                 created_at=row.created_at,
             )
             for row in status_rows
         ]
         + [
             LeadTimelineEntry(
+                id=row.id,
                 type="automation_fired",
-                message=f"{row.automation_name} — {row.message}",
+                category=_category_for_type("automation_fired"),
+                message=f"Automation triggered: {row.message}",
+                metadata={"automation_name": row.automation_name, "action_type": row.action_type},
                 created_at=row.created_at,
             )
             for row in automation_rows
         ]
         + [
             LeadTimelineEntry(
+                id=row.id,
                 type=row.event_type,
+                category=_category_for_type(row.event_type),
                 message=row.message,
                 created_at=row.created_at,
             )
@@ -612,7 +652,7 @@ async def update_lead_owner(
             lead_name=lead.name,
             event_type="owner_changed",
             message=(
-                f"Owner changed to {body.owner_email}" if body.owner_email else "Owner unassigned"
+                f"Owner assigned to {body.owner_email}" if body.owner_email else "Owner unassigned"
             ),
             user_email=session.get("email"),
         )
@@ -673,7 +713,7 @@ async def complete_lead_task(
             lead_id=lead.id,
             lead_name=lead.name,
             event_type="task_completed",
-            message=f"Completed: {lead.next_action}",
+            message=f"Task completed: {lead.next_action}",
             user_email=user_email,
             duration_seconds=duration_seconds,
         )

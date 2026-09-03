@@ -1,7 +1,14 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Coarse categorization for the unified timeline/feed — lets the frontend
+# pick an icon (or otherwise branch) without hardcoding every fine-grained
+# `type` value. Additive alongside `type`, not a replacement: `type` keeps
+# its existing, more specific values unchanged.
+TimelineCategory = Literal["status_change", "automation", "activity"]
 
 
 class LeadCreate(BaseModel):
@@ -125,22 +132,30 @@ class UpdateLeadOwnerRequest(BaseModel):
 
 class LeadTimelineEntry(BaseModel):
     """GET /leads/{id}/timeline entry — unified across LeadStatusHistory
-    (type="status_changed", from/to populated), AutomationActivityLog
-    (type="automation_fired", message populated), and LeadActivityLog
-    (type="owner_changed"/"details_updated"/"task_completed", message
-    populated). from_/to stay status_changed-only (unchanged shape from
-    before this round); message is the new, additive field every other
-    type uses. "from" is a Python keyword, so the field is named from_
-    internally — populate_by_name lets callers construct it as from_=...
-    while FastAPI's response serialization (response_model_by_alias
+    (type="status_changed"), AutomationActivityLog (type="automation_fired"),
+    and LeadActivityLog (type="owner_changed"/"details_updated"/
+    "task_completed"/"enriched"/"message_generated"). `id` is the
+    originating row's own id (unique across all three source tables, so
+    it's a stable React key / click target on its own). `message` is always
+    a ready-to-render sentence — the backend builds it, never the frontend
+    — including for status_changed, where from_/to (unchanged shape from
+    before this round, kept for whoever already reads them) are also still
+    populated. `metadata` carries whatever structured extra a given `type`
+    has (from_status/to_status, action_type, automation_name); None where
+    nothing extra applies. "from" is a Python keyword, so the field is
+    named from_ internally — populate_by_name lets callers construct it as
+    from_=... while FastAPI's response serialization (response_model_by_alias
     defaults to True) still emits the wire key as "from"."""
 
     model_config = ConfigDict(populate_by_name=True)
 
+    id: uuid.UUID
     type: str
+    category: TimelineCategory
     from_: str | None = Field(default=None, alias="from")
     to: str | None = None
-    message: str | None = None
+    message: str
+    metadata: dict | None = None
     created_at: datetime
 
 
@@ -167,10 +182,14 @@ class LeadActivityFeedEntry(BaseModel):
     LeadTimelineEntry, merging the same three sources across every lead in
     the organization (not just one). Always a synthesized message (even for
     status changes), since there's no per-entry from/to distinction worth
-    keeping at this broader granularity."""
+    keeping at this broader granularity. Same id/category/metadata shape as
+    LeadTimelineEntry — see that model's own docstring."""
 
+    id: uuid.UUID
     lead_id: uuid.UUID
     lead_name: str
     type: str
+    category: TimelineCategory
     message: str
+    metadata: dict | None = None
     created_at: datetime
