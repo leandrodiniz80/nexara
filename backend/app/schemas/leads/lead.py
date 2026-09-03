@@ -23,6 +23,18 @@ class ScoreBreakdownItem(BaseModel):
     impact: int
 
 
+class EnrichmentData(BaseModel):
+    """The lead "mini-dossier" — see app/services/leads/enrichment.py for
+    how it's populated (simulated for now; the shape is meant to match
+    whatever a real data-provider integration returns later)."""
+
+    industry: str
+    company_size: str
+    city: str
+    description: str
+    enriched_at: datetime
+
+
 class LeadResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -42,6 +54,9 @@ class LeadResponse(BaseModel):
     next_action_due_at: datetime | None = None
     owner_email: str | None = None
     in_focus: bool = False
+    company_name: str | None = None
+    website: str | None = None
+    enrichment_data: EnrichmentData | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -138,6 +153,13 @@ class LeadTaskCompleteResponse(BaseModel):
 
     lead: LeadResponse
     notifications: list[str] = Field(default_factory=list)
+
+
+class GenerateMessageResponse(BaseModel):
+    """POST /leads/{id}/generate-message — template-based today (no LLM),
+    see generate_first_contact_message() in enrichment.py."""
+
+    message: str
 
 
 class LeadActivityFeedEntry(BaseModel):

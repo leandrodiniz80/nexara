@@ -18,6 +18,7 @@ from app.models.leads.lead_status_history import LeadStatusHistory
 from app.models.platform_auth.user import PlatformUser
 from app.models.platform_auth.user_organization import PlatformUserOrganization
 from app.schemas.leads.lead import (
+    GenerateMessageResponse,
     LeadActivityFeedEntry,
     LeadCreate,
     LeadCreateResponse,
@@ -33,6 +34,7 @@ from app.schemas.leads.lead import (
     UpdateLeadOwnerRequest,
 )
 from app.services.leads.automation_engine import fire_stale_lead_automations, run_automations
+from app.services.leads.enrichment import generate_first_contact_message, simulate_enrichment
 from app.services.leads.scoring import score_leads
 
 logger = logging.getLogger("app.api.routers.leads")
@@ -758,6 +760,99 @@ async def update_lead_status(
     return ApiResponse(
         success=True,
         data=LeadStatusUpdateResponse(lead=scored_lead, notifications=notifications),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("/{lead_id}/enrich", response_model=ApiResponse[LeadResponse])
+async def enrich_lead(
+    lead_id: uuid.UUID,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadResponse]:
+    """"Atualizar dados" — (re-)runs the simulated enrichment pass a new
+    lead already gets automatically (Auto-enrich New Lead), so a lead
+    created before this feature existed, or one whose simulated profile
+    someone wants refreshed, can get one on demand. Deterministic per lead
+    (see simulate_enrichment()), so calling this twice in a row doesn't
+    produce a different-looking profile."""
+    if not settings.ENRICHMENT_ENABLED:
+        raise HTTPException(status_code=403, detail="Lead enrichment is not enabled for your plan")
+
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    simulate_enrichment(lead)
+
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type="enriched",
+            message="Lead data enriched",
+            user_email=session.get("email"),
+        )
+    )
+
+    await db.commit()
+    await db.refresh(lead)
+
+    (scored_lead,) = await score_leads(db, [lead])
+
+    return ApiResponse(
+        success=True,
+        data=scored_lead,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("/{lead_id}/generate-message", response_model=ApiResponse[GenerateMessageResponse])
+async def generate_lead_message(
+    lead_id: uuid.UUID,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[GenerateMessageResponse]:
+    """Template-based first-contact message — no LLM yet, see
+    generate_first_contact_message(). Doesn't require the lead to already
+    be enriched (falls back to a generic opener), so this works before and
+    after Enrich."""
+    if not settings.AI_ENABLED:
+        raise HTTPException(status_code=403, detail="AI features are not enabled for your plan")
+
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+    user_email = session.get("email")
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    message = generate_first_contact_message(lead, user_email or "the team")
+
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type="message_generated",
+            message="Generated a first-contact message",
+            user_email=user_email,
+        )
+    )
+    await db.commit()
+
+    return ApiResponse(
+        success=True,
+        data=GenerateMessageResponse(message=message),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

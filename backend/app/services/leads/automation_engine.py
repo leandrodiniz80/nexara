@@ -12,6 +12,7 @@ from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_automation import LeadAutomation
 from app.models.notifications.user_notification import UserNotification
+from app.services.leads.enrichment import simulate_enrichment
 
 logger = logging.getLogger("app.services.leads.automation_engine")
 
@@ -62,6 +63,17 @@ _DEFAULT_AUTOMATIONS = [
         "trigger_from": None,
         "trigger_to": None,
         "action_type": "create_task",
+        "active": True,
+    },
+    {
+        # Same architecture as create_task — a lead starts building its
+        # "mini-dossier" the moment it exists, no one has to remember to
+        # click Enrich manually.
+        "name": "Auto-enrich New Lead",
+        "trigger_type": "lead_created",
+        "trigger_from": None,
+        "trigger_to": None,
+        "action_type": "enrich",
         "active": True,
     },
 ]
@@ -176,6 +188,13 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
                 event["lead"].id,
                 event["lead"].next_action,
                 event["lead"].next_action_due_at,
+            )
+        elif automation.action_type == "enrich":
+            simulate_enrichment(event["lead"])
+            logger.info(
+                "Automation triggered: %s (lead=%s) -> enrich",
+                automation.name,
+                event["lead"].id,
             )
         else:
             continue

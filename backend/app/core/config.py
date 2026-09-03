@@ -38,5 +38,12 @@ class Settings(BaseSettings):
     # other Stripe URL here.
     STRIPE_PORTAL_RETURN_URL: str = "http://localhost:3000/billing"
 
+    # Monetization prep: hardcoded on for every org today. The seam is here
+    # (checked in the enrich/generate-message endpoints) so gating these by
+    # an organization's actual plan later is a billing-lookup swap, not a
+    # new code path.
+    ENRICHMENT_ENABLED: bool = True
+    AI_ENABLED: bool = True
+
 
 settings = Settings()

@@ -1,4 +1,6 @@
 from app.schemas.leads.lead import (
+    EnrichmentData,
+    GenerateMessageResponse,
     LeadActivityFeedEntry,
     LeadCreate,
     LeadCreateResponse,
@@ -22,6 +24,8 @@ from app.schemas.leads.lead_automation import (
 
 __all__ = [
     "AutomationActivityEntry",
+    "EnrichmentData",
+    "GenerateMessageResponse",
     "LeadActivityFeedEntry",
     "LeadAutomationResponse",
     "LeadAutomationUpdate",

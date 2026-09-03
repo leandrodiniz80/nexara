@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.schemas.leads.lead import LeadResponse, ScoreBreakdownItem
+from app.services.leads.enrichment import HIGH_VALUE_INDUSTRIES, LARGE_COMPANY_SIZES
 
 # "Recent" for the automation-activity boost — same window LeadResponse's
 # other "recent" concepts (e.g. GET /leads/attention's default
@@ -77,6 +78,31 @@ def compute_lead_score(
             ScoreBreakdownItem(reason="Recent automation activity", impact=automation_impact)
         )
         total += automation_impact
+
+    if lead.enrichment_data:
+        industry = lead.enrichment_data.get("industry")
+        if industry in HIGH_VALUE_INDUSTRIES:
+            industry_impact = 10
+            breakdown.append(
+                ScoreBreakdownItem(reason=f"High-value sector: {industry}", impact=industry_impact)
+            )
+            total += industry_impact
+
+        company_size = lead.enrichment_data.get("company_size")
+        if company_size in LARGE_COMPANY_SIZES:
+            size_impact = 10
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason=f"Larger company: {company_size} employees", impact=size_impact
+                )
+            )
+            total += size_impact
+    else:
+        unenriched_impact = -5
+        breakdown.append(
+            ScoreBreakdownItem(reason="Lead not yet enriched", impact=unenriched_impact)
+        )
+        total += unenriched_impact
 
     return max(0, min(100, total)), breakdown
 

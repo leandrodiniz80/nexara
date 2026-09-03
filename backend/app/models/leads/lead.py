@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -72,3 +73,11 @@ class Lead(Base, AuditMixin):
     focused_by_email: Mapped[str | None] = mapped_column(
         String(255), ForeignKey("platform_users.email", ondelete="SET NULL"), nullable=True
     )
+    # The "mini-dossier": company_name/website are plain columns (simple,
+    # directly filterable/displayable); enrichment_data is JSONB since its
+    # shape is a stand-in for whatever a real data-provider integration
+    # returns later, not a fixed set of columns worth normalizing yet — see
+    # app/services/leads/enrichment.py for what it actually contains.
+    company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    website: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    enrichment_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
