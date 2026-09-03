@@ -68,9 +68,10 @@ class LeadResponse(BaseModel):
     # Rule-based (no LLM) — see compute_next_best_action() in scoring.py.
     # None for converted/lost leads, where there's nothing left to act on.
     next_best_action: str | None = None
-    # Only populated when next_best_action is set AND AI_ENABLED — reuses
-    # generate_first_contact_message(), the same template POST
-    # /leads/{id}/generate-message calls; no extra LLM/API call of its own.
+    # Only populated when next_best_action is set AND AI_ENABLED — one
+    # template per next_best_action case (generate_lead_message_by_action()
+    # in enrichment.py), not the single first-contact-only template POST
+    # /leads/{id}/generate-message uses; no extra LLM/API call either way.
     suggested_message: str | None = None
     in_focus: bool = False
     company_name: str | None = None

@@ -10,9 +10,14 @@ from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.schemas.leads.lead import LeadResponse, ScoreBreakdownItem
 from app.services.leads.enrichment import (
+    ACTION_FIRST_CONTACT,
+    ACTION_FOLLOW_UP,
+    ACTION_URGENT_FOLLOW_UP,
+    COMPANY_SIZE_PT,
     HIGH_VALUE_INDUSTRIES,
+    INDUSTRY_PT,
     LARGE_COMPANY_SIZES,
-    generate_first_contact_message,
+    generate_lead_message_by_action,
 )
 
 # "Recent" for the automation-activity boost — same window LeadResponse's
@@ -20,43 +25,25 @@ from app.services.leads.enrichment import (
 # stale_after_days) use in this codebase.
 _RECENT_AUTOMATION_DAYS = 3
 
-# Portuguese labels for next_best_action's enrichment context fragment (e.g.
-# "Fazer follow-up urgente com empresa de tecnologia de médio porte") — keyed
-# on enrichment.py's own _INDUSTRIES/_COMPANY_SIZES values, so an unrecognized
-# value (there shouldn't be one) just omits the context instead of raising.
-_INDUSTRY_PT = {
-    "Technology": "tecnologia",
-    "Finance": "finanças",
-    "Healthcare": "saúde",
-    "Retail": "varejo",
-    "Manufacturing": "indústria",
-    "Education": "educação",
-    "Real Estate": "imóveis",
-    "Hospitality": "hospitalidade",
-}
-_COMPANY_SIZE_PT = {
-    "1-10": "pequeno porte",
-    "11-50": "pequeno porte",
-    "51-200": "médio porte",
-    "201-500": "médio porte",
-    "500+": "grande porte",
-}
-
 
 def compute_next_best_action(lead: Lead, *, is_overdue: bool) -> str | None:
     """"What should I do about this lead right now" — a plain rule table on
     status (+ overdue), no ML/LLM involved. Converted (and any other status
-    outside new/contacted, e.g. lost) has nothing left to act on."""
+    outside new/contacted, e.g. lost) has nothing left to act on. Builds on
+    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP
+    (enrichment.py) rather than its own string literals, since
+    generate_lead_message_by_action() matches on those same prefixes to
+    pick a message tone for suggested_message."""
     if lead.status == "new":
-        action = "Fazer primeiro contato"
+        action = ACTION_FIRST_CONTACT
     elif lead.status == "contacted":
-        action = "Fazer follow-up urgente" if is_overdue else "Acompanhar lead"
+        action = ACTION_URGENT_FOLLOW_UP if is_overdue else ACTION_FOLLOW_UP
     else:
         return None
 
     if lead.enrichment_data:
-        industry = _INDUSTRY_PT.get(lead.enrichment_data.get("industry", ""))
-        size = _COMPANY_SIZE_PT.get(lead.enrichment_data.get("company_size", ""))
+        industry = INDUSTRY_PT.get(lead.enrichment_data.get("industry", ""))
+        size = COMPANY_SIZE_PT.get(lead.enrichment_data.get("company_size", ""))
         if industry and size:
             action += f" com empresa de {industry} de {size}"
 
@@ -187,7 +174,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
 
         next_best_action = compute_next_best_action(lead, is_overdue=is_overdue)
         suggested_message = (
-            generate_first_contact_message(lead, lead.owner_email or "the team")
+            generate_lead_message_by_action(lead, next_best_action, lead.owner_email or "the team")
             if next_best_action is not None and settings.AI_ENABLED
             else None
         )

@@ -36,6 +36,38 @@ _CITIES = [
 HIGH_VALUE_INDUSTRIES = {"Technology", "Finance"}
 LARGE_COMPANY_SIZES = {"201-500", "500+"}
 
+# Portuguese labels for the enrichment context mentioned in next_best_action
+# and the message templates below (e.g. "vi que vocês são do setor de
+# tecnologia") — keyed on this file's own _INDUSTRIES/_COMPANY_SIZES, so an
+# unrecognized value (there shouldn't be one) just omits the context instead
+# of raising. compute_next_best_action() (scoring.py) reads these too.
+INDUSTRY_PT = {
+    "Technology": "tecnologia",
+    "Finance": "finanças",
+    "Healthcare": "saúde",
+    "Retail": "varejo",
+    "Manufacturing": "indústria",
+    "Education": "educação",
+    "Real Estate": "imóveis",
+    "Hospitality": "hospitalidade",
+}
+COMPANY_SIZE_PT = {
+    "1-10": "pequeno porte",
+    "11-50": "pequeno porte",
+    "51-200": "médio porte",
+    "201-500": "médio porte",
+    "500+": "grande porte",
+}
+
+# The three next_best_action base labels compute_next_best_action() (scoring.py)
+# builds on top of (before appending its own enrichment-context suffix) —
+# generate_lead_message_by_action() below matches on these same prefixes to
+# pick a message tone, so the two stay in lockstep by construction rather
+# than by duplicated string literals.
+ACTION_FIRST_CONTACT = "Fazer primeiro contato"
+ACTION_URGENT_FOLLOW_UP = "Fazer follow-up urgente"
+ACTION_FOLLOW_UP = "Acompanhar lead"
+
 
 def _seeded_choice(seed: str, salt: str, options: list[str]) -> str:
     """Deterministic pick keyed on the lead's own id — the same lead always
@@ -99,3 +131,57 @@ def generate_first_contact_message(lead: Lead, sender_email: str) -> str:
         "Você teria alguns minutos essa semana para uma conversa rápida?\n\n"
         f"Atenciosamente,\n{sender_email}"
     )
+
+
+def _enrichment_context_sentence(lead: Lead) -> str:
+    """Renders as ' Vi que vocês são do setor de X.' (leading space, so it
+    drops straight into a paragraph) — empty string when there's no
+    enrichment data or the industry isn't one of INDUSTRY_PT's known
+    values."""
+    if not lead.enrichment_data:
+        return ""
+    industry_label = INDUSTRY_PT.get(lead.enrichment_data.get("industry", ""))
+    if not industry_label:
+        return ""
+    return f" Vi que vocês são do setor de {industry_label}."
+
+
+def generate_lead_message_by_action(
+    lead: Lead, action: str | None, sender_email: str
+) -> str | None:
+    """One template per next_best_action case instead of always writing as
+    if this were the first time reaching out — a follow-up that reads like
+    an introduction breaks trust. `action` is next_best_action's own value
+    (compute_next_best_action(), scoring.py); matched by prefix since that
+    function appends its own enrichment-context suffix on top of one of
+    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP. None
+    (converted/lost — nothing left to act on) returns None, same as
+    next_best_action itself."""
+    if action is None:
+        return None
+
+    company = lead.company_name or "sua empresa"
+    context = _enrichment_context_sentence(lead)
+
+    if action.startswith(ACTION_FIRST_CONTACT):
+        body = (
+            f"Gostaria de me apresentar: ajudamos empresas como a {company} a crescer."
+            f"{context}\n\n"
+            "Você teria alguns minutos essa semana para uma conversa rápida?"
+        )
+    elif action.startswith(ACTION_URGENT_FOLLOW_UP):
+        body = (
+            "Queria retomar nosso contato — sei que a rotina é corrida, mas não queria "
+            f"deixar essa conversa parada.{context}\n\n"
+            "Ainda faz sentido para vocês? Consigo me adaptar ao seu horário essa semana."
+        )
+    elif action.startswith(ACTION_FOLLOW_UP):
+        body = (
+            f"Passando para ver se faz sentido continuarmos a conversa sobre como ajudar "
+            f"a {company}.{context}\n\n"
+            "Sem pressa nenhuma — qualquer retorno é bem-vindo quando for conveniente para você."
+        )
+    else:
+        return None
+
+    return f"Olá {lead.name},\n\n{body}\n\nAtenciosamente,\n{sender_email}"
