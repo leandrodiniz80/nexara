@@ -29,6 +29,19 @@ function scoreTitle(breakdown: Lead["scoreBreakdown"]): string {
     .join("\n");
 }
 
+/** Urgency badge for the next-action deadline. Overdue comes straight from
+ * the backend's isOverdue (score_leads), so it always agrees with how
+ * Today's Focus/Needs Attention are ranked; "due today" has no backend
+ * field of its own, so it's the one thing derived from nextActionDueAt
+ * here, against the browser's own clock. */
+function nextActionVariant(lead: Lead): "destructive" | "warning" | "outline" {
+  if (lead.isOverdue) return "destructive";
+  if (lead.nextActionDueAt && new Date(lead.nextActionDueAt).toDateString() === new Date().toDateString()) {
+    return "warning";
+  }
+  return "outline";
+}
+
 /** Stops the event from reaching the card's own drag/details handlers —
  * used so the "⋮" menu is its own hit target, not a drag handle. */
 function stopCardGesture(event: MouseEvent) {
@@ -102,7 +115,13 @@ export function LeadCard({
         <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>
           Score {lead.score}
         </Badge>
-        {lead.nextAction && <Badge variant="outline">{lead.nextAction}</Badge>}
+        {lead.nextAction && (
+          <Badge variant={nextActionVariant(lead)}>
+            {lead.isOverdue && lead.daysOverdue
+              ? `${lead.nextAction} (${lead.daysOverdue}d overdue)`
+              : lead.nextAction}
+          </Badge>
+        )}
       </div>
     </div>
   );

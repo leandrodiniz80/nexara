@@ -37,6 +37,12 @@ export interface Lead {
   nextAction: string | null;
   nextActionDueAt: string | null;
   ownerEmail: string | null;
+  /** Derived from nextActionDueAt at read time by the backend (score_leads)
+   * — never compute "overdue" from nextActionDueAt on the client, since the
+   * backend's `now` is the source of truth here. daysOverdue is null
+   * whenever isOverdue is false. */
+  isOverdue: boolean;
+  daysOverdue: number | null;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -71,6 +77,8 @@ export interface LeadDto {
   next_action: string | null;
   next_action_due_at: string | null;
   owner_email: string | null;
+  is_overdue: boolean;
+  days_overdue: number | null;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -92,6 +100,8 @@ export function toLead(dto: LeadDto): Lead {
     nextAction: dto.next_action,
     nextActionDueAt: dto.next_action_due_at,
     ownerEmail: dto.owner_email,
+    isOverdue: dto.is_overdue,
+    daysOverdue: dto.days_overdue,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,

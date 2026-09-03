@@ -21,6 +21,7 @@ import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
 import {
+  completeLeadTask,
   getLeadMetrics,
   getLeadsActivityFeed,
   getLeadsNeedingAttention,
@@ -124,6 +125,25 @@ export default function DashboardPage() {
     },
   });
 
+  // Direct "Marcar como feito" from the dashboard cards (Today's Focus,
+  // Needs Attention) — no modal round-trip. Strips the completed lead out
+  // of the priority/attention/tasks caches immediately (no full-page
+  // reload, no waiting on the next poll), then invalidates the other lists
+  // it can affect (score/updated_at changed) in the background.
+  const completeTaskMutation = useMutation({
+    mutationFn: (id: string) => completeLeadTask(id),
+    onSuccess: (_result, id) => {
+      const withoutLead = (leads: Lead[] | undefined) => leads?.filter((lead) => lead.id !== id);
+      queryClient.setQueryData<Lead[]>(["leads-priority"], withoutLead);
+      queryClient.setQueryData<Lead[]>(["leads-attention"], withoutLead);
+      queryClient.setQueryData<Lead[]>(["leads-tasks"], withoutLead);
+      queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      queryClient.invalidateQueries({ queryKey: ["leads"] });
+      showToast("Task completed");
+    },
+  });
+
   const updateStatusMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
       updateLeadStatus(id, status),
@@ -201,6 +221,8 @@ export default function DashboardPage() {
                   setIsWorkdayMode(false);
                   setDetailsLead(lead);
                 }}
+                onCompleteTask={(lead) => completeTaskMutation.mutate(lead.id)}
+                completingLeadId={completeTaskMutation.variables}
               />
             )}
             <LeadsMetricsGrid metrics={leadsMetrics} />
@@ -212,6 +234,8 @@ export default function DashboardPage() {
                   setIsWorkdayMode(false);
                   setDetailsLead(lead);
                 }}
+                onCompleteTask={(lead) => completeTaskMutation.mutate(lead.id)}
+                completingLeadId={completeTaskMutation.variables}
               />
             )}
             {leadTasks && <UpcomingTasks leads={leadTasks} />}

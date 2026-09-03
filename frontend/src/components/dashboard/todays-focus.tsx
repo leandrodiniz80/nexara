@@ -6,9 +6,13 @@ import type { Lead } from "@/lib/api/leads";
 export function TodaysFocus({
   leads,
   onOpenDetails,
+  onCompleteTask,
+  completingLeadId,
 }: {
   leads: Lead[];
   onOpenDetails: (lead: Lead) => void;
+  onCompleteTask?: (lead: Lead) => void;
+  completingLeadId?: string;
 }) {
   const focusLeads = leads.slice(0, 5);
 
@@ -31,9 +35,19 @@ export function TodaysFocus({
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <Badge variant={lead.score < 31 ? "destructive" : "warning"}>
-                    Score {lead.score}
+                  <Badge variant={lead.isOverdue ? "destructive" : lead.score < 31 ? "destructive" : "warning"}>
+                    {lead.isOverdue ? `Overdue ${lead.daysOverdue}d` : `Score ${lead.score}`}
                   </Badge>
+                  {lead.nextAction && onCompleteTask && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={completingLeadId === lead.id}
+                      onClick={() => onCompleteTask(lead)}
+                    >
+                      Marcar como feito
+                    </Button>
+                  )}
                   <Button size="sm" variant="outline" onClick={() => onOpenDetails(lead)}>
                     View
                   </Button>
