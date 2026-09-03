@@ -135,6 +135,17 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         score, breakdown = compute_lead_score(
             lead, has_recent_automation=lead.id in recent_lead_ids, now=now
         )
+        is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
+        days_overdue = (now - lead.next_action_due_at).days if is_overdue else None
         response = LeadResponse.model_validate(lead)
-        responses.append(response.model_copy(update={"score": score, "score_breakdown": breakdown}))
+        responses.append(
+            response.model_copy(
+                update={
+                    "score": score,
+                    "score_breakdown": breakdown,
+                    "is_overdue": is_overdue,
+                    "days_overdue": days_overdue,
+                }
+            )
+        )
     return responses

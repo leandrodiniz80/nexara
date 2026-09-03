@@ -274,17 +274,17 @@ async def get_leads_priority(
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[LeadResponse]]:
-    """"Foco do dia" — leads in the worst situation right now: soonest
-    overdue/due task first, then (among leads with no next_action at all,
-    where due date can't rank them) the lowest computed score. Score is
-    computed dynamically, not stored, so the final ranking can't be done in
-    SQL alone: fetches a generous candidate pool via the one ordering SQL
-    *can* express (next_action_due_at ASC NULLS LAST, backed by
-    ix_leads_org_id_next_action_due_at), scores that whole pool in one
-    extra query (score_leads), then re-sorts by the true composite order
-    before slicing to `limit`. 200 is comfortably above any realistic
-    per-org lead count at this product stage; revisit if that stops being
-    true."""
+    """"Foco do dia" — leads in the worst situation right now: overdue
+    tasks first, then tasks due today, then future-dated tasks, then (last)
+    leads with no next_action at all — score DESC within each of those
+    buckets. Score is computed dynamically, not stored, so the final
+    ranking can't be done in SQL alone: fetches a generous candidate pool
+    via the one ordering SQL *can* express (next_action_due_at ASC NULLS
+    LAST, backed by ix_leads_org_id_next_action_due_at), scores that whole
+    pool in one extra query (score_leads), then re-sorts by the true
+    composite order before slicing to `limit`. 200 is comfortably above any
+    realistic per-org lead count at this product stage; revisit if that
+    stops being true."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -302,13 +302,17 @@ async def get_leads_priority(
     candidates = result.scalars().all()
 
     scored = await score_leads(db, candidates)
-    scored.sort(
-        key=lambda response: (
-            response.next_action_due_at is None,
-            response.next_action_due_at,
-            response.score,
-        )
-    )
+    now = datetime.now(timezone.utc)
+
+    def bucket(response: LeadResponse) -> int:
+        due = response.next_action_due_at
+        if due is None:
+            return 3
+        if response.is_overdue:
+            return 0
+        return 1 if due.date() == now.date() else 2
+
+    scored.sort(key=lambda response: (bucket(response), -response.score))
     leads = scored[:limit]
 
     return ApiResponse(

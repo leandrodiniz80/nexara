@@ -60,6 +60,11 @@ class LeadResponse(BaseModel):
     next_action: str | None = None
     next_action_due_at: datetime | None = None
     owner_email: str | None = None
+    # Derived from next_action_due_at at read time (score_leads), same
+    # pattern as score/score_breakdown — never stored, so nothing to
+    # migrate. days_overdue is None whenever is_overdue is False.
+    is_overdue: bool = False
+    days_overdue: int | None = None
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
