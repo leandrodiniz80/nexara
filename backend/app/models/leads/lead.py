@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -34,6 +34,9 @@ class Lead(Base, AuditMixin):
         # next_action_due_at IS NOT NULL ORDER BY next_action_due_at ASC.
         Index("ix_leads_org_id_next_action_due_at", "organization_id", "next_action_due_at"),
         Index("ix_leads_owner_email", "owner_email"),
+        # Backs GET /workday/next's "does this user already have a lead in
+        # focus" check: WHERE organization_id = ... AND focused_by_email = ...
+        Index("ix_leads_org_id_focused_by_email", "organization_id", "focused_by_email"),
     )
 
     organization_id: Mapped[str] = mapped_column(
@@ -57,5 +60,15 @@ class Lead(Base, AuditMixin):
     # placeholder like AuditMixin's created_by/updated_by: real referential
     # integrity now, no rework once a proper users table might exist later.
     owner_email: Mapped[str | None] = mapped_column(
+        String(255), ForeignKey("platform_users.email", ondelete="SET NULL"), nullable=True
+    )
+    # Workday mode's execution lock — "only one lead in focus per user" is
+    # enforced in the router (GET /workday/next), not by a DB constraint;
+    # focused_by_email is who currently holds it (distinct from owner_email:
+    # any user working their queue can bring an unowned or someone-else's
+    # lead into focus, not just its owner).
+    in_focus: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    focused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    focused_by_email: Mapped[str | None] = mapped_column(
         String(255), ForeignKey("platform_users.email", ondelete="SET NULL"), nullable=True
     )

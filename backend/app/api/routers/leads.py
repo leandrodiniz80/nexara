@@ -546,6 +546,7 @@ async def update_lead_details(
                 lead_name=lead.name,
                 event_type="details_updated",
                 message=_describe_details_update(updates),
+                user_email=session.get("email"),
             )
         )
 
@@ -611,6 +612,7 @@ async def update_lead_owner(
             message=(
                 f"Owner changed to {body.owner_email}" if body.owner_email else "Owner unassigned"
             ),
+            user_email=session.get("email"),
         )
     )
     await db.commit()
@@ -637,9 +639,17 @@ async def complete_lead_task(
     (captured before clearing, so the timeline still shows what was
     completed), then clears next_action/next_action_due_at. No automation
     fires from this event today — notifications is always [], kept for
-    response-shape consistency with the other lead mutation endpoints."""
+    response-shape consistency with the other lead mutation endpoints.
+
+    Workday mode: if the caller is the one who currently has this lead in
+    focus, this is also what ends that focus session — in_focus/focused_at/
+    focused_by_email clear, and the elapsed time since focused_at is
+    recorded on the activity log entry as duration_seconds. Completing a
+    lead nobody has in focus (the normal, non-workday path) behaves exactly
+    as before: duration_seconds stays null."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
+    user_email = session.get("email")
 
     lead = await db.get(Lead, lead_id)
     if lead is None or lead.organization_id != organization_id:
@@ -648,6 +658,13 @@ async def complete_lead_task(
     if lead.next_action is None:
         raise HTTPException(status_code=400, detail="This lead has no next action to complete")
 
+    duration_seconds = None
+    if lead.in_focus and lead.focused_by_email == user_email and lead.focused_at is not None:
+        duration_seconds = int((datetime.now(timezone.utc) - lead.focused_at).total_seconds())
+        lead.in_focus = False
+        lead.focused_at = None
+        lead.focused_by_email = None
+
     db.add(
         LeadActivityLog(
             organization_id=organization_id,
@@ -655,6 +672,8 @@ async def complete_lead_task(
             lead_name=lead.name,
             event_type="task_completed",
             message=f"Completed: {lead.next_action}",
+            user_email=user_email,
+            duration_seconds=duration_seconds,
         )
     )
     lead.next_action = None
@@ -713,6 +732,15 @@ async def update_lead_status(
                 to_status=lead.status,
             )
         )
+
+    # A converted lead can't stay anyone's workday focus — GET /workday/next
+    # already treats "converted" as resolved and would clear this lazily on
+    # its own next call, but clearing it here too means the lock frees up
+    # immediately rather than sitting stale until someone happens to ask.
+    if lead.status == "converted" and lead.in_focus:
+        lead.in_focus = False
+        lead.focused_at = None
+        lead.focused_by_email = None
 
     await db.commit()
     await db.refresh(lead)

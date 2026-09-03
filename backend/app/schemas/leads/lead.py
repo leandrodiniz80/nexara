@@ -41,6 +41,7 @@ class LeadResponse(BaseModel):
     next_action: str | None = None
     next_action_due_at: datetime | None = None
     owner_email: str | None = None
+    in_focus: bool = False
     created_at: datetime
     updated_at: datetime
 

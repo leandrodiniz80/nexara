@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -42,6 +42,17 @@ class LeadActivityLog(Base):
     lead_name: Mapped[str] = mapped_column(String(255), nullable=False)
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    # Both added for workday mode: user_email attributes an entry to whoever
+    # was in the session when it happened (only populated where a caller
+    # session actually exists — automation-driven entries have none, so it
+    # stays null there); duration_seconds is set only for a task_completed
+    # entry that ended an active focus session. Structured (not folded into
+    # `message`) since these are meant as a real base for future
+    # productivity/analytics, not just human-readable text.
+    user_email: Mapped[str | None] = mapped_column(
+        String(255), ForeignKey("platform_users.email", ondelete="SET NULL"), nullable=True
+    )
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
