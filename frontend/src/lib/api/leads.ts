@@ -43,6 +43,12 @@ export interface Lead {
    * whenever isOverdue is false. */
   isOverdue: boolean;
   daysOverdue: number | null;
+  /** Rule-based (no LLM), backend-computed — see compute_next_best_action()
+   * in scoring.py. Null for converted/lost leads. */
+  nextBestAction: string | null;
+  /** Only set when nextBestAction is set AND the backend's AI feature flag
+   * is on — same template POST /leads/{id}/generate-message uses. */
+  suggestedMessage: string | null;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -79,6 +85,8 @@ export interface LeadDto {
   owner_email: string | null;
   is_overdue: boolean;
   days_overdue: number | null;
+  next_best_action: string | null;
+  suggested_message: string | null;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -102,6 +110,8 @@ export function toLead(dto: LeadDto): Lead {
     ownerEmail: dto.owner_email,
     isOverdue: dto.is_overdue,
     daysOverdue: dto.days_overdue,
+    nextBestAction: dto.next_best_action,
+    suggestedMessage: dto.suggested_message,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,

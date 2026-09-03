@@ -1,11 +1,16 @@
+"use client";
+
 import { MoreVertical } from "lucide-react";
 import type { MouseEvent } from "react";
 
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { useToast } from "@/components/ui/toast";
 import type { Lead, LeadStatus } from "@/lib/api/leads";
 import { cn } from "@/lib/utils/cn";
+import { copyToClipboard } from "@/lib/utils/clipboard";
 
 const STATUS_OPTIONS: { label: string; value: LeadStatus }[] = [
   { label: "Move to New", value: "new" },
@@ -63,6 +68,15 @@ export function LeadCard({
   onMove: (status: LeadStatus) => void;
   onOpenDetails: () => void;
 }) {
+  const { showToast } = useToast();
+
+  async function handleCopyMessage() {
+    if (!lead.suggestedMessage) return;
+    if (await copyToClipboard(lead.suggestedMessage)) {
+      showToast("Mensagem copiada");
+    }
+  }
+
   return (
     <div
       onMouseDown={onDragStart}
@@ -87,6 +101,11 @@ export function LeadCard({
             <p className="truncate text-sm font-medium text-foreground">{lead.name}</p>
             <p className="truncate text-xs text-muted-foreground">{lead.email}</p>
             <p className="text-xs text-muted-foreground/70">{lead.phone}</p>
+            {lead.nextBestAction && (
+              <p className="mt-1 truncate text-xs font-medium text-primary">
+                👉 {lead.nextBestAction}
+              </p>
+            )}
           </div>
         </div>
 
@@ -121,6 +140,19 @@ export function LeadCard({
               ? `${lead.nextAction} (${lead.daysOverdue}d overdue)`
               : lead.nextAction}
           </Badge>
+        )}
+        {lead.suggestedMessage && (
+          <Button
+            size="sm"
+            variant="outline"
+            onMouseDown={stopCardGesture}
+            onClick={(event) => {
+              stopCardGesture(event);
+              handleCopyMessage();
+            }}
+          >
+            Copiar mensagem
+          </Button>
         )}
       </div>
     </div>
