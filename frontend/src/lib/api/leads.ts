@@ -15,6 +15,14 @@ export interface ScoreBreakdownItem {
   impact: number;
 }
 
+export interface EnrichmentData {
+  industry: string;
+  companySize: string;
+  city: string;
+  description: string;
+  enrichedAt: string;
+}
+
 export interface Lead {
   id: string;
   name: string;
@@ -32,8 +40,19 @@ export interface Lead {
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
+  companyName: string | null;
+  website: string | null;
+  enrichmentData: EnrichmentData | null;
   createdAt: string;
   updatedAt: string;
+}
+
+interface EnrichmentDataDto {
+  industry: string;
+  company_size: string;
+  city: string;
+  description: string;
+  enriched_at: string;
 }
 
 /** Wire shape from GET/POST/PATCH /leads — snake_case, matches every other
@@ -53,6 +72,9 @@ export interface LeadDto {
   next_action_due_at: string | null;
   owner_email: string | null;
   in_focus: boolean;
+  company_name: string | null;
+  website: string | null;
+  enrichment_data: EnrichmentDataDto | null;
   created_at: string;
   updated_at: string;
 }
@@ -71,6 +93,17 @@ export function toLead(dto: LeadDto): Lead {
     nextActionDueAt: dto.next_action_due_at,
     ownerEmail: dto.owner_email,
     inFocus: dto.in_focus,
+    companyName: dto.company_name,
+    website: dto.website,
+    enrichmentData: dto.enrichment_data
+      ? {
+          industry: dto.enrichment_data.industry,
+          companySize: dto.enrichment_data.company_size,
+          city: dto.enrichment_data.city,
+          description: dto.enrichment_data.description,
+          enrichedAt: dto.enrichment_data.enriched_at,
+        }
+      : null,
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
   };
@@ -176,7 +209,9 @@ export type LeadTimelineEntryType =
   | "automation_fired"
   | "owner_changed"
   | "details_updated"
-  | "task_completed";
+  | "task_completed"
+  | "enriched"
+  | "message_generated";
 
 export interface LeadTimelineEntry {
   type: LeadTimelineEntryType;
@@ -328,6 +363,38 @@ export async function getLeadsPriority(): Promise<Lead[]> {
   try {
     const { data } = await apiClient.get<ApiResponse<LeadDto[]>>("/leads/priority");
     return (data.data ?? []).map(toLead);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** POST /api/v1/leads/{id}/enrich — "Atualizar dados": (re-)runs the
+ * simulated enrichment pass, deterministic per lead (same profile every
+ * time, not a different random one on each click). */
+export async function enrichLead(id: string): Promise<Lead> {
+  try {
+    const { data } = await apiClient.post<ApiResponse<LeadDto>>(`/leads/${id}/enrich`, {});
+    if (!data.data) {
+      throw new Error("Enrichment succeeded but returned no data");
+    }
+    return toLead(data.data);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** POST /api/v1/leads/{id}/generate-message — template-based first-contact
+ * message (no LLM yet). Works whether or not the lead has been enriched. */
+export async function generateLeadMessage(id: string): Promise<string> {
+  try {
+    const { data } = await apiClient.post<ApiResponse<{ message: string }>>(
+      `/leads/${id}/generate-message`,
+      {}
+    );
+    if (!data.data) {
+      throw new Error("Message generation succeeded but returned no data");
+    }
+    return data.data.message;
   } catch (error) {
     throw toApiClientError(error);
   }

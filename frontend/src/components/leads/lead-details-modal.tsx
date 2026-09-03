@@ -12,6 +12,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils/cn";
 import {
   completeLeadTask,
+  enrichLead,
+  generateLeadMessage,
   getLeadTimeline,
   updateLeadDetails,
   updateLeadOwner,
@@ -207,6 +209,118 @@ function LeadNotesAndTasks({
   );
 }
 
+function LeadIntelligence({ lead }: { lead: Lead }) {
+  const queryClient = useQueryClient();
+  const [generatedMessage, setGeneratedMessage] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Same rationale as LeadNotesAndTasks — a generated message belongs to
+  // whichever lead was showing when it was generated, not whatever lead
+  // this component happens to be re-rendered with next.
+  useEffect(() => {
+    setGeneratedMessage(null);
+    setCopied(false);
+  }, [lead.id]);
+
+  const enrich = useMutation({
+    mutationFn: () => enrichLead(lead.id),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+    },
+  });
+
+  const generateMessage = useMutation({
+    mutationFn: () => generateLeadMessage(lead.id),
+    onSuccess: (message) => {
+      setGeneratedMessage(message);
+      setCopied(false);
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+    },
+  });
+
+  async function handleCopy() {
+    if (!generatedMessage) return;
+    try {
+      await navigator.clipboard.writeText(generatedMessage);
+      setCopied(true);
+    } catch {
+      // Clipboard API can be unavailable (permissions, non-HTTPS context) —
+      // the text is still right there in the textarea to copy by hand.
+    }
+  }
+
+  return (
+    <div className="mt-5 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Lead Intelligence
+        </p>
+        <button
+          type="button"
+          onClick={() => enrich.mutate()}
+          disabled={enrich.isPending}
+          className="text-xs font-medium text-primary hover:underline disabled:opacity-50"
+        >
+          {enrich.isPending ? "Updating…" : "Atualizar dados"}
+        </button>
+      </div>
+
+      {lead.enrichmentData ? (
+        <dl className="space-y-1.5 rounded-md border border-border bg-muted/30 p-3 text-sm">
+          {lead.companyName && (
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted-foreground">Company</dt>
+              <dd className="text-foreground">{lead.companyName}</dd>
+            </div>
+          )}
+          <div className="flex justify-between gap-4">
+            <dt className="text-muted-foreground">Sector</dt>
+            <dd className="text-foreground">{lead.enrichmentData.industry}</dd>
+          </div>
+          <div className="flex justify-between gap-4">
+            <dt className="text-muted-foreground">Size</dt>
+            <dd className="text-foreground">{lead.enrichmentData.companySize} employees</dd>
+          </div>
+          <div className="flex justify-between gap-4">
+            <dt className="text-muted-foreground">Location</dt>
+            <dd className="text-foreground">{lead.enrichmentData.city}</dd>
+          </div>
+          <p className="pt-1 text-xs text-muted-foreground">{lead.enrichmentData.description}</p>
+        </dl>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          No profile yet — click &quot;Atualizar dados&quot; to build one.
+        </p>
+      )}
+
+      <div className="space-y-1.5">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => generateMessage.mutate()}
+          disabled={generateMessage.isPending}
+        >
+          {generateMessage.isPending ? "Gerando…" : "Gerar Mensagem"}
+        </Button>
+
+        {generatedMessage && (
+          <div className="space-y-1.5">
+            <Textarea value={generatedMessage} readOnly rows={6} className="text-xs" />
+            <Button size="sm" variant="outline" onClick={handleCopy}>
+              {copied ? "Copiado!" : "Copiar"}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function LeadOwnerAssignment({ lead }: { lead: Lead }) {
   const queryClient = useQueryClient();
   const { data: members } = useQuery({
@@ -355,6 +469,8 @@ export function LeadDetailsModal({
             </div>
 
             <LeadNotesAndTasks lead={lead} onTaskCompleted={onTaskCompleted} />
+
+            <LeadIntelligence lead={lead} />
           </>
         ) : (
           <LeadActivityTimeline leadId={lead.id} />
