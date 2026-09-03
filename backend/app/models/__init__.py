@@ -8,6 +8,7 @@ from app.models.leads import (
     LeadStatusHistory,
 )
 from app.models.mission import Mission, MissionEvent, MissionMetrics
+from app.models.notifications import UserNotification
 from app.models.platform_auth import (
     PlatformOrganization,
     PlatformSession,
@@ -48,4 +49,5 @@ __all__ = [
     "PlatformUserOrganization",
     "Prospect",
     "Tag",
+    "UserNotification",
 ]

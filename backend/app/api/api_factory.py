@@ -15,10 +15,12 @@ from app.api.routers.billing import router as billing_router
 from app.api.routers.branding import router as branding_router
 from app.api.routers.cdn import router as cdn_router
 from app.api.routers.health import router as health_router
+from app.api.routers.internal_jobs import router as internal_jobs_router
 from app.api.routers.leads import router as leads_router
 from app.api.routers.logs import router as logs_router
 from app.api.routers.metrics import router as metrics_router
 from app.api.routers.missions import router as missions_router
+from app.api.routers.notifications import router as notifications_router
 from app.api.routers.organizations import router as organizations_router
 from app.api.routers.outreach import router as outreach_router
 from app.api.routers.prospects import router as prospects_router
@@ -104,5 +106,7 @@ def create_app() -> FastAPI:
     app.include_router(branding_router)
     app.include_router(cdn_router)
     app.include_router(tenants_router)
+    app.include_router(notifications_router)
+    app.include_router(internal_jobs_router)
 
     return app

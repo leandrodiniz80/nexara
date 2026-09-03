@@ -34,6 +34,13 @@ def compute_lead_score(
     breakdown: list[ScoreBreakdownItem] = []
     total = lead.score
 
+    if (now - lead.created_at).total_seconds() < 3600:
+        fresh_impact = 15
+        breakdown.append(
+            ScoreBreakdownItem(reason="New lead — fresh opportunity", impact=fresh_impact)
+        )
+        total += fresh_impact
+
     days_idle = (now - lead.updated_at).days
     if days_idle >= 14:
         recency_impact = -30

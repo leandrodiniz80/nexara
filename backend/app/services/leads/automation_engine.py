@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_automation import LeadAutomation
+from app.models.notifications.user_notification import UserNotification
 
 logger = logging.getLogger("app.services.leads.automation_engine")
 
@@ -151,6 +152,21 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
                 event["lead"].id,
                 message,
             )
+            # Persistent counterpart to the toast above — only when the lead
+            # has an owner: that's the one clear recipient this codebase can
+            # derive without a "who triggered this" concept (lead_stale in
+            # particular fires from a background sweep, no request/session
+            # at all). An unowned lead still gets the toast, just no row
+            # here — there's nobody specific to notify persistently.
+            if event["lead"].owner_email:
+                db.add(
+                    UserNotification(
+                        organization_id=event["lead"].organization_id,
+                        user_email=event["lead"].owner_email,
+                        lead_id=event["lead"].id,
+                        message=message,
+                    )
+                )
         elif automation.action_type == "create_task":
             event["lead"].next_action = "Contact within 1 day"
             event["lead"].next_action_due_at = datetime.now(timezone.utc) + timedelta(days=1)
@@ -176,3 +192,56 @@ async def run_automations(db: AsyncSession, event: AutomationEvent) -> list[str]
         )
 
     return notifications
+
+
+async def fire_stale_lead_automations(
+    db: AsyncSession, leads: list[Lead], cutoff: datetime
+) -> int:
+    """Fires "lead_stale" for every contacted lead in `leads` whose
+    organization has an active lead_stale automation, deduped against
+    AutomationActivityLog so calling this again inside the same staleness
+    window (`cutoff`) never re-notifies the same lead. Shared by
+    GET /leads/attention (opportunistic, one org at a time — whichever org
+    the caller belongs to) and POST /internal/jobs/check-stale-leads (a
+    cross-org sweep — the same logic, minus a single organization_id
+    filter): identical semantics, one place, so the manual job endpoint
+    today needs no rewrite once it becomes a real scheduled job later.
+    Caller commits; this only stages writes via run_automations()'s own
+    db.add() calls.
+    """
+    contacted = [lead for lead in leads if lead.status == "contacted"]
+    if not contacted:
+        return 0
+
+    org_ids = {lead.organization_id for lead in contacted}
+    triggers_stmt = select(LeadAutomation.organization_id, LeadAutomation.name).where(
+        LeadAutomation.organization_id.in_(org_ids),
+        LeadAutomation.active.is_(True),
+        LeadAutomation.trigger_type == "lead_stale",
+    )
+    trigger_names_by_org: dict[str, list[str]] = {}
+    for organization_id, name in (await db.execute(triggers_stmt)).all():
+        trigger_names_by_org.setdefault(organization_id, []).append(name)
+
+    fired = 0
+    for lead in contacted:
+        trigger_names = trigger_names_by_org.get(lead.organization_id)
+        if not trigger_names:
+            continue
+
+        already_notified_stmt = (
+            select(AutomationActivityLog.id)
+            .where(
+                AutomationActivityLog.lead_id == lead.id,
+                AutomationActivityLog.automation_name.in_(trigger_names),
+                AutomationActivityLog.created_at >= cutoff,
+            )
+            .limit(1)
+        )
+        if (await db.execute(already_notified_stmt)).first() is not None:
+            continue
+
+        await run_automations(db, {"type": "lead_stale", "lead": lead})
+        fired += 1
+
+    return fired

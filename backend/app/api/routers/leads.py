@@ -14,7 +14,6 @@ from app.core.config import settings
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
-from app.models.leads.lead_automation import LeadAutomation
 from app.models.leads.lead_status_history import LeadStatusHistory
 from app.models.platform_auth.user import PlatformUser
 from app.models.platform_auth.user_organization import PlatformUserOrganization
@@ -33,7 +32,7 @@ from app.schemas.leads.lead import (
     UpdateLeadDetailsRequest,
     UpdateLeadOwnerRequest,
 )
-from app.services.leads.automation_engine import run_automations
+from app.services.leads.automation_engine import fire_stale_lead_automations, run_automations
 from app.services.leads.scoring import score_leads
 
 logger = logging.getLogger("app.api.routers.leads")
@@ -202,37 +201,10 @@ async def get_leads_needing_attention(
 
     # Opportunistic "lead_stale" firing — no cron: piggybacks on this
     # existing, already-computed stale-leads query, evaluated whenever a
-    # caller asks (typically the dashboard). Deduped against
-    # AutomationActivityLog so viewing this endpoint repeatedly doesn't
-    # re-notify the same lead every call: only fires again once no
-    # "Stale Contacted Lead"-type entry exists for it within the current
-    # staleness window.
-    active_stale_triggers_stmt = select(LeadAutomation.name).where(
-        LeadAutomation.organization_id == organization_id,
-        LeadAutomation.active.is_(True),
-        LeadAutomation.trigger_type == "lead_stale",
-    )
-    stale_trigger_names = (await db.execute(active_stale_triggers_stmt)).scalars().all()
-
-    if stale_trigger_names:
-        for lead in stale_leads:
-            if lead.status != "contacted":
-                continue
-
-            already_notified_stmt = (
-                select(AutomationActivityLog.id)
-                .where(
-                    AutomationActivityLog.lead_id == lead.id,
-                    AutomationActivityLog.automation_name.in_(stale_trigger_names),
-                    AutomationActivityLog.created_at >= cutoff,
-                )
-                .limit(1)
-            )
-            if (await db.execute(already_notified_stmt)).first() is not None:
-                continue
-
-            await run_automations(db, {"type": "lead_stale", "lead": lead})
-
+    # caller asks (typically the dashboard). Same dedup/firing logic
+    # POST /internal/jobs/check-stale-leads uses for its cross-org sweep —
+    # see fire_stale_lead_automations()'s own docstring.
+    if await fire_stale_lead_automations(db, stale_leads, cutoff):
         await db.commit()
 
     leads = await score_leads(db, stale_leads)
