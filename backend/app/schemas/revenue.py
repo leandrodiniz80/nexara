@@ -26,6 +26,28 @@ class RevenueSummaryResponse(BaseModel):
     )
 
 
+class RevenueForecastResponse(BaseModel):
+    """GET /revenue/forecast — Autonomous-sales-OS round. Distinct from
+    RevenueSummaryResponse.expected_pipeline_revenue above: that one is a
+    plain sum of score_leads()'s own win_probability-weighted expected_value
+    over new+contacted leads; this one additionally applies a forecasting-
+    specific decay (compute_forecast_value(), scoring.py — overdue *0.6,
+    idle >3 days *0.7, otherwise unchanged) on top, since a stalling deal's
+    plain expected_value overstates how much of that money will actually
+    land this period. today_expected sums the decayed value over leads due
+    today or already overdue; week_expected/month_expected are both the
+    same decayed total across every active lead — week_expected discounted
+    by 0.8 (the prompt's own factor: a week captures less of the full
+    pipeline's eventual close than a month does), month_expected the full
+    total. confidence is the mean win_probability (0-1) across those same
+    active leads — 0.0 with none."""
+
+    today_expected: float = 0.0
+    week_expected: float = 0.0
+    month_expected: float = 0.0
+    confidence: float = 0.0
+
+
 class RevenueTrendDay(BaseModel):
     """One day of GET /revenue/performance-trend. converted/lost are the
     estimated value of leads whose status changed to that value on this

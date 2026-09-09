@@ -16,6 +16,7 @@ from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import (
     ActionQueueItem,
+    EnforcementStateResponse,
     WorkdayCompleteAndNextRequest,
     WorkdayCompleteAndNextResponse,
     WorkdayNextResponse,
@@ -24,7 +25,11 @@ from app.schemas.workday import (
     WorkdayTargetResponse,
 )
 from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
-from app.services.leads.execution_engine import AUTO_EXECUTION_NOTIFICATION_PREFIX, maybe_auto_execute
+from app.services.leads.execution_engine import (
+    AUTO_EXECUTED_NOTIFICATION_PREFIX,
+    AUTO_EXECUTION_NOTIFICATION_PREFIX,
+    auto_execute_engine,
+)
 from app.services.leads.scoring import (
     compute_response_metrics,
     compute_revenue_attribution,
@@ -63,6 +68,13 @@ _AT_RISK_POOL_SIZE = 500
 _HIGH_PRIORITY_TOP_N = 5
 # GET /workday/target's fixed default — no per-user/org customization yet.
 _DEFAULT_DAILY_TARGET = 5
+# GET /workday/target's revenue-based target (Autonomous-sales-OS round) —
+# the window _compute_daily_target_revenue() averages over, same 7-day
+# span this codebase's other "steady, not noisy" windows already use
+# (compute_response_metrics's own _RESPONSE_METRICS_WINDOW_DAYS uses 30 for
+# a rarer signal; a week is enough here since conversions are the much
+# more frequent event being averaged).
+_DAILY_TARGET_REVENUE_WINDOW_DAYS = 7
 
 # Below this computed score, a lead is "low enough" to qualify for the
 # workday queue even with no next_action set — roughly the midpoint of the
@@ -379,16 +391,50 @@ async def _compute_money_saved_today(db: AsyncSession, organization_id: str, tod
     )
 
 
+async def _compute_daily_target_revenue(db: AsyncSession, organization_id: str, cutoff: dt) -> float:
+    """GET /workday/target's revenue-based target (Autonomous-sales-OS
+    round) — average converted revenue per day over the last
+    _DAILY_TARGET_REVENUE_WINDOW_DAYS: sums estimated_value for every lead
+    with a "lead_won" LeadActivityLog entry (the same precise conversion-
+    moment marker compute_revenue_summary()'s own revenue_generated_today
+    reads, scoring.py) since `cutoff`, divided by the window length. 0.0
+    with no conversions in the window — a real "nothing to average yet"
+    answer, not a misleading default. Two queries: distinct lead_won
+    lead_ids in the window, then those leads' rows for enrichment_data."""
+    won_ids_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type == "lead_won",
+            LeadActivityLog.created_at >= cutoff,
+        )
+    )
+    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
+    if not won_ids:
+        return 0.0
+
+    won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
+    won_leads = (await db.execute(won_leads_stmt)).scalars().all()
+    total = sum(get_lead_estimated_value(lead) for lead in won_leads)
+    return total / _DAILY_TARGET_REVENUE_WINDOW_DAYS
+
+
 async def _count_auto_actions_today(db: AsyncSession, organization_id: str, today_start: dt) -> int:
-    """Execution-assistance round. Counts maybe_auto_execute()'s own
-    UserNotification rows (see execution_engine.py's AUTO_EXECUTION_NOTIFICATION_PREFIX
-    docstring for why a message-prefix match, not a dedicated column) created
-    today — deliberately not LeadActivityLog's "message_sent" entries, which
-    also include manual "Enviar agora" clicks this field excludes on
-    purpose."""
+    """Execution-assistance round, widened by the Autonomous-sales-OS
+    round's auto_execute_engine(). Counts UserNotification rows matching
+    either that engine's own AUTO_EXECUTED_NOTIFICATION_PREFIX or the
+    original AUTO_EXECUTION_NOTIFICATION_PREFIX it replaced (kept only so
+    historical rows written before this round still count — see that
+    constant's own updated docstring, execution_engine.py) created today —
+    deliberately not LeadActivityLog's "message_sent" entries, which also
+    include manual "Enviar agora" clicks this field excludes on purpose."""
     stmt = select(func.count(UserNotification.id)).where(
         UserNotification.organization_id == organization_id,
-        UserNotification.message.startswith(AUTO_EXECUTION_NOTIFICATION_PREFIX),
+        or_(
+            UserNotification.message.startswith(AUTO_EXECUTED_NOTIFICATION_PREFIX),
+            UserNotification.message.startswith(AUTO_EXECUTION_NOTIFICATION_PREFIX),
+        ),
         UserNotification.created_at >= today_start,
     )
     return (await db.execute(stmt)).scalar_one()
@@ -482,37 +528,6 @@ def _compute_response_and_pipeline_pressure(
     return pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value
 
 
-async def _maybe_auto_execute_critical_deals(
-    db: AsyncSession, organization_id: str, ranked: list[LeadResponse]
-) -> int:
-    """Execution-assistance round — runs maybe_auto_execute() (execution_engine.py)
-    over whichever already-scored leads in `ranked` qualify (deal_risk_level
-    == "critical" and auto_action_available), reusing that list rather than
-    a fresh candidate query. A no-op entirely while settings.AUTO_MODE_ENABLED
-    is off (the default): the one extra query below (fetching the raw Lead
-    rows to mutate) only runs when there's at least one real candidate.
-    Caller commits; returns how many were actually auto-executed."""
-    if not settings.AUTO_MODE_ENABLED:
-        return 0
-
-    candidates = {
-        response.id: response
-        for response in ranked
-        if response.deal_risk_level == "critical" and response.auto_action_available
-    }
-    if not candidates:
-        return 0
-
-    leads_stmt = select(Lead).where(Lead.id.in_(candidates.keys()))
-    leads = (await db.execute(leads_stmt)).scalars().all()
-
-    executed = 0
-    for lead in leads:
-        if await maybe_auto_execute(db, lead, candidates[lead.id]):
-            executed += 1
-    return executed
-
-
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -528,8 +543,8 @@ async def get_workday_summary(
     check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()/
     maybe_notify_ignored_leads()/maybe_notify_pipeline_risk()/
     maybe_notify_high_revenue_opportunity(), one Lead row-fetch for
-    _maybe_auto_execute_critical_deals() — all six only when there's an
-    actual candidate/threshold breach, and the last only when
+    auto_execute_engine() (execution_engine.py) — all six only when there's
+    an actual candidate/threshold breach, and the last only when
     settings.AUTO_MODE_ENABLED is even on, which it isn't by default):
     pending_responses_count/high_value_at_risk_count/pipeline_expected_value
     (_compute_response_and_pipeline_pressure) also reuse `ranked`, zero
@@ -608,10 +623,10 @@ async def get_workday_summary(
     notified_count += await maybe_notify_critical_deals(
         db, organization_id=organization_id, leads=ranked, now=now
     )
-    # Execution-assistance round — a no-op while settings.AUTO_MODE_ENABLED
-    # is off (the default); see _maybe_auto_execute_critical_deals's own
-    # docstring.
-    auto_executed_count = await _maybe_auto_execute_critical_deals(db, organization_id, ranked)
+    # Autonomous-sales-OS round — a no-op while settings.AUTO_MODE_ENABLED
+    # is off (the default); see auto_execute_engine()'s own docstring
+    # (execution_engine.py) for its two auto-execution rules and daily cap.
+    auto_executed_count = await auto_execute_engine(db, organization_id, ranked)
     # Sales-operating-system round — two more org-wide nudges, both no-ops
     # most of the time (gated behind their own thresholds) and both reusing
     # data already computed above (pending_responses_count, revenue_at_risk)
@@ -677,6 +692,69 @@ async def get_workday_summary(
             top_revenue_action=top_revenue_action,
             top_revenue_industry=top_revenue_industry,
             top_revenue_company_size=top_revenue_company_size,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/enforcement-state", response_model=ApiResponse[EnforcementStateResponse])
+async def get_workday_enforcement_state(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[EnforcementStateResponse]:
+    """Autonomous-sales-OS round's hard-enforcement gate: reuses the exact
+    same rank_leads_by_priority() -> build_action_queue() ->
+    get_next_mandatory_lead() pipeline GET /workday/summary's own
+    next_mandatory_lead_id already computes, exposed here as its own
+    endpoint with enough lead detail (name/company/phone/expected_value)
+    for the frontend to render a fullscreen blocking overlay without a
+    second fetch, plus a human reason and a guaranteed-executable
+    required_action (see EnforcementStateResponse's own docstring for the
+    "monitor" fallback). A fresh rank_leads_by_priority() call — same one
+    query cost GET /workday/action-queue already pays independently."""
+    start = time.perf_counter()
+    organization_id, _user_email = _require_caller(session)
+
+    ranked = await rank_leads_by_priority(db, organization_id)
+    queue = build_action_queue(ranked)
+    mandatory_lead = get_next_mandatory_lead(queue)
+
+    if mandatory_lead is None:
+        return ApiResponse(
+            success=True,
+            data=EnforcementStateResponse(blocked=False),
+            request_id=request_id,
+            execution_time=time.perf_counter() - start,
+        )
+
+    # Mirrors get_next_mandatory_lead()'s own OR condition, checked in the
+    # same order (critical first) so the reason always names whichever
+    # condition actually applied.
+    if mandatory_lead.deal_risk_level == "critical":
+        reason = "Você tem um lead crítico que precisa de ação imediata"
+    elif mandatory_lead.response_delay_minutes is not None and mandatory_lead.response_delay_minutes > 60:
+        reason = "Um lead está aguardando resposta há mais de 60 minutos"
+    else:
+        reason = "Ação necessária agora"
+
+    required_action = mandatory_lead.next_best_action_type
+    if required_action not in ("send_message", "call_now", "schedule_meeting"):
+        required_action = "send_message"
+
+    return ApiResponse(
+        success=True,
+        data=EnforcementStateResponse(
+            blocked=True,
+            lead_id=mandatory_lead.id,
+            name=mandatory_lead.name,
+            company_name=mandatory_lead.company_name,
+            phone=mandatory_lead.phone,
+            expected_value=mandatory_lead.expected_value,
+            required_action=required_action,
+            next_best_action=mandatory_lead.next_best_action,
+            reason=reason,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -922,8 +1000,17 @@ async def get_workday_target(
     """Daily gamification target — a fixed default (_DEFAULT_DAILY_TARGET,
     no per-user/org customization yet) matched against the same
     tasks_completed_today _workday_stats() already computes for GET
-    /workday/next and .../performance. Two queries (both inside
-    _workday_stats), no new table."""
+    /workday/next and .../performance.
+
+    Autonomous-sales-OS round adds a second, revenue-based target
+    alongside the task-count one above (additive — see
+    WorkdayTargetResponse's own docstring for why this doesn't replace the
+    original fields the prompt's literal wording asked for). Four queries
+    total: two inside _workday_stats, two inside
+    _compute_daily_target_revenue, plus rank_leads_by_priority()'s own
+    (reused for current_expected via _sum_today_potential_revenue, the
+    same figure WorkdaySummaryResponse.today_potential_revenue already
+    computes — no new aggregation logic)."""
     start = time.perf_counter()
     organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -934,6 +1021,12 @@ async def get_workday_target(
         min(completed_today / _DEFAULT_DAILY_TARGET, 1.0) if _DEFAULT_DAILY_TARGET > 0 else 1.0
     )
 
+    revenue_cutoff = now - timedelta(days=_DAILY_TARGET_REVENUE_WINDOW_DAYS)
+    daily_target_revenue = await _compute_daily_target_revenue(db, organization_id, revenue_cutoff)
+    ranked = await rank_leads_by_priority(db, organization_id)
+    current_expected = _sum_today_potential_revenue(ranked, now=now)
+    gap = daily_target_revenue - current_expected
+
     return ApiResponse(
         success=True,
         data=WorkdayTargetResponse(
@@ -941,6 +1034,9 @@ async def get_workday_target(
             completed_today=completed_today,
             remaining=remaining,
             progress=progress,
+            daily_target_revenue=daily_target_revenue,
+            current_expected=current_expected,
+            gap=gap,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

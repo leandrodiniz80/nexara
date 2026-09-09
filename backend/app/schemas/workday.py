@@ -56,8 +56,9 @@ class WorkdaySummaryResponse(BaseModel):
     money_in_play_today: int = 0
     money_at_risk_today: int = 0
     critical_deals_count: int = 0
-    # Execution-assistance round — how many leads maybe_auto_execute()
-    # (execution_engine.py) auto-sent a message for today, gated behind
+    # Execution-assistance round, widened by the Autonomous-sales-OS
+    # round's auto_execute_engine() (execution_engine.py) — how many leads
+    # were auto-sent a message or auto-booked a meeting today, gated behind
     # settings.AUTO_MODE_ENABLED (always 0 while that's off, which is the
     # default). Counted via its own distinct UserNotification message
     # prefix, not LeadActivityLog's "message_sent" entries — those also
@@ -106,6 +107,35 @@ class WorkdaySummaryResponse(BaseModel):
     top_revenue_action: str | None = None
     top_revenue_industry: str | None = None
     top_revenue_company_size: str | None = None
+
+
+class EnforcementStateResponse(BaseModel):
+    """GET /workday/enforcement-state — Autonomous-sales-OS round's hard
+    block: when blocked=true, the frontend shows a fullscreen overlay the
+    user cannot dismiss except by executing required_action on lead_id.
+    Reuses get_next_mandatory_lead() (workday_engine.py) — the exact same
+    lead WorkdaySummaryResponse.next_mandatory_lead_id already points at,
+    exposed here as an actual gate (with enough lead detail to render
+    without a second fetch) rather than a dismissible Command Center card.
+
+    required_action is always one of send_message/call_now/schedule_meeting
+    — the three POST /leads/{id}/execute-action already accepts — even
+    when the mandatory lead's own next_best_action_type is "monitor" (its
+    only other possible value here, since get_next_mandatory_lead() never
+    selects a converted/lost lead): that only happens when the trigger was
+    a pending response on an otherwise low-risk lead, in which case this
+    falls back to send_message — a message still awaiting reply is,
+    definitionally, something to respond to."""
+
+    blocked: bool
+    lead_id: uuid.UUID | None = None
+    name: str | None = None
+    company_name: str | None = None
+    phone: str | None = None
+    expected_value: int | None = None
+    required_action: str | None = None
+    next_best_action: str | None = None
+    reason: str | None = None
 
 
 class ActionQueueItem(BaseModel):
@@ -211,9 +241,27 @@ class WorkdayTargetResponse(BaseModel):
     """GET /workday/target — the daily gamification target. daily_target is
     a fixed default for now (no per-user/org customization yet); completed_
     today reuses the same tasks_completed_today _workday_stats() already
-    computes for GET /workday/next and .../performance."""
+    computes for GET /workday/next and .../performance.
+
+    Autonomous-sales-OS round adds a second, revenue-based target
+    alongside the original task-count one above — additive, not a
+    replacement (the prompt's own literal ask was to "replace" the logic,
+    but this endpoint already ships and nothing else in this codebase
+    reads task-based daily_target/remaining/progress as dead weight, so
+    dropping them would violate this same round's own "never break
+    existing endpoints" rule; the three new fields below are the actual
+    revenue-based target, additive on top). daily_target_revenue is the
+    average converted revenue over the last 7 days (0.0/None-safe — see
+    get_workday_target()'s own docstring for the exact query);
+    current_expected reuses the same expected_value-summed-over-today's-
+    actionable-leads figure WorkdaySummaryResponse.today_potential_revenue
+    already computes; gap is simply the difference, positive when behind
+    target."""
 
     daily_target: int
     completed_today: int
     remaining: int
     progress: float
+    daily_target_revenue: float = 0.0
+    current_expected: int = 0
+    gap: float = 0.0

@@ -211,6 +211,30 @@ ACTION_TYPE_TO_REVENUE_LABEL = {
     "schedule_meeting": "meeting",
 }
 
+# Autonomous-sales-OS round — compute_lead_score()'s "intelligent pipeline
+# pruning" bar: all three conditions must hold (a lead that's merely low-
+# probability but still big, or small but idle only briefly, isn't pruned)
+# before a lead is flagged as having no real revenue potential left.
+_PRUNE_WIN_PROBABILITY_THRESHOLD = 20
+_PRUNE_EXPECTED_VALUE_THRESHOLD = 1000
+_PRUNE_IDLE_DAYS_THRESHOLD = 7
+# Deliberately the harshest single penalty in this function — pruning is
+# meant to sink a dead lead's score well below anything a real, still-
+# winnable deal could reach from its other penalties alone.
+_PRUNE_SCORE_PENALTY = -50
+
+# compute_forecast_value()'s own decay multipliers (Revenue Forecast
+# Engine, Autonomous-sales-OS round) — a forecasting-specific haircut on
+# top of score_leads()'s own win_probability-weighted expected_value,
+# since a stalling deal's plain expected_value overstates how much of that
+# money will actually land within the forecast period. Checked overdue
+# first (a harsher signal than merely idle — same "worse condition wins"
+# precedent compute_deal_risk's own ordering already sets), idle second,
+# fresh (1.0, i.e. unchanged) otherwise.
+_FORECAST_OVERDUE_DECAY = 0.6
+_FORECAST_IDLE_DECAY = 0.7
+_FORECAST_IDLE_DECAY_DAYS = 3
+
 
 def compute_win_probability(
     lead: Lead, *, has_recent_manual_activity: bool, task_completed_recently: bool, now: datetime
@@ -368,6 +392,7 @@ def compute_lead_score(
     call_success_rate: float | None,
     message_success_rate: float | None,
     top_revenue_action: str | None,
+    is_low_potential: bool,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -716,6 +741,23 @@ def compute_lead_score(
             )
         )
         total += _REVENUE_LEARNING_BONUS
+
+    # Autonomous-sales-OS round — intelligent pipeline pruning: a lead
+    # this unlikely to close (win_probability), this small even if it did
+    # (expected_value), and this neglected (days_since_last_activity) has
+    # no real revenue potential left. The harshest single penalty in this
+    # function, deliberately — see _PRUNE_SCORE_PENALTY's own comment.
+    # is_low_potential is computed once by score_leads() (it also drives
+    # that function's own deal_risk_level/next_best_action_type override
+    # and build_priority_reason()'s extra clause), not re-derived here.
+    if is_low_potential:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="Lead sem potencial de receita — recomendado descarte",
+                impact=_PRUNE_SCORE_PENALTY,
+            )
+        )
+        total += _PRUNE_SCORE_PENALTY
 
     return max(0, min(100, total)), breakdown
 
@@ -1157,16 +1199,25 @@ def build_priority_reason(
     win_probability: int,
     days_idle: int,
     is_overdue: bool,
+    is_low_potential: bool = False,
 ) -> str:
     """"Why this lead?" (feedback-loop round) — one ready-to-render
     sentence explaining the same signals score_leads() already computed for
     this lead, composed from whichever of them are actually notable rather
     than always listing every factor. Pure/no DB access, same reasoning
-    style as compute_next_best_action()."""
+    style as compute_next_best_action().
+
+    is_low_potential (Autonomous-sales-OS round's pruning flag, threaded
+    through from score_leads() — same criteria as compute_lead_score()'s
+    own pruning penalty) always wins the sentence outright when true: a
+    lead with no real revenue potential left doesn't need its other,
+    now-moot signals (value/probability/idle) listed alongside it."""
     if lead.status == "converted":
         return "Lead convertido — nada a fazer."
     if lead.status == "lost":
         return "Lead perdido — nada a fazer."
+    if is_low_potential:
+        return "Lead sem potencial de receita — recomendado descarte."
 
     clauses: list[str] = []
     if estimated_value >= HIGH_VALUE_LEAD_THRESHOLD:
@@ -1443,6 +1494,22 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             (now - last_activity_at).days if last_activity_at is not None else days_idle
         )
 
+        # Autonomous-sales-OS round — intelligent pipeline pruning. Computed
+        # once, up front, since it drives three separate downstream things
+        # below: compute_lead_score()'s own penalty, an override of
+        # deal_risk_level/action_type after they're computed, and
+        # build_priority_reason()'s extra clause. Never true for a
+        # converted lead (win_probability is forced to 100) or, in
+        # practice, a lost one (expected_value is always 0 there, but
+        # deal_risk_level/action_type are already "low"/"drop_lead" for
+        # lost leads regardless, so the override below is a no-op either
+        # way).
+        is_low_potential = (
+            win_probability < _PRUNE_WIN_PROBABILITY_THRESHOLD
+            and expected_value < _PRUNE_EXPECTED_VALUE_THRESHOLD
+            and days_since_last_activity > _PRUNE_IDLE_DAYS_THRESHOLD
+        )
+
         # Moved ahead of compute_lead_score()/compute_next_best_action()
         # (execution-engine round): both now need deal_risk_level (the
         # force-priority rule) and/or action_type (the action-learning
@@ -1460,6 +1527,11 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             expected_value=expected_value,
             top_revenue_action=top_revenue_action,
         )
+        if is_low_potential:
+            deal_risk_level = "low"
+            deal_risk_reason = "Lead sem potencial de receita — recomendado descarte."
+            action_type = "drop_lead"
+            action_urgency = "low"
 
         score, breakdown = compute_lead_score(
             lead,
@@ -1480,6 +1552,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             call_success_rate=action_effectiveness.call_success_rate,
             message_success_rate=action_effectiveness.message_success_rate,
             top_revenue_action=top_revenue_action,
+            is_low_potential=is_low_potential,
             now=now,
         )
 
@@ -1504,6 +1577,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             win_probability=win_probability,
             days_idle=days_idle,
             is_overdue=is_overdue,
+            is_low_potential=is_low_potential,
         )
 
         # Execution-assistance round — "ready to just do it" gate. Not its
@@ -1596,3 +1670,24 @@ async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list
         )
     )
     return scored
+
+
+def compute_forecast_value(response: LeadResponse) -> float:
+    """GET /revenue/forecast's own per-lead figure (Revenue Forecast
+    Engine, Autonomous-sales-OS round) — response.expected_value (already
+    win_probability-weighted by score_leads()) further discounted by how
+    stale this lead looks, since a stalling deal's plain expected_value
+    overstates how much of that money will actually land within the
+    forecast period. Overdue is checked before idle (a harsher signal —
+    same "worse condition wins," not "conditions stack," precedent
+    compute_deal_risk's own severity ordering already sets): idle uses
+    days_since_last_activity (LeadActivityLog-derived — see that field's
+    own docstring for why it's the sharper "idle" signal, distinct from
+    the updated_at-derived days_idle several compute_lead_score() lines
+    use instead) rather than updated_at, since this is itself a read-time
+    aggregate over an already-scored LeadResponse, not a fresh Lead row."""
+    if response.is_overdue:
+        return response.expected_value * _FORECAST_OVERDUE_DECAY
+    if response.days_since_last_activity > _FORECAST_IDLE_DECAY_DAYS:
+        return response.expected_value * _FORECAST_IDLE_DECAY
+    return response.expected_value * 1.0

@@ -11,9 +11,14 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
 from app.models.leads.lead_status_history import LeadStatusHistory
-from app.schemas.revenue import RevenueSummaryResponse, RevenueTrendDay
+from app.schemas.revenue import RevenueForecastResponse, RevenueSummaryResponse, RevenueTrendDay
 from app.services.leads.enrichment import get_lead_estimated_value
-from app.services.leads.scoring import compute_revenue_attribution, score_leads
+from app.services.leads.scoring import (
+    compute_forecast_value,
+    compute_revenue_attribution,
+    rank_leads_by_priority,
+    score_leads,
+)
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/revenue", tags=["Revenue"])
 
@@ -23,6 +28,11 @@ router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/revenue", tags=["Revenue"])
 # independent read endpoints, and this round's mandate is zero regression
 # on the ones that already ship.
 _AT_RISK_STALE_AFTER_DAYS = 3
+# GET /revenue/forecast's own week/month split (Autonomous-sales-OS
+# round) — the prompt's own factor: a week captures less of the full
+# pipeline's eventual close than a month does, so week_expected is the
+# same all-active-leads total as month_expected, just discounted.
+_WEEK_FORECAST_DISCOUNT = 0.8
 # Sanity cap on the all-leads row fetch (needed for per-lead enrichment_data,
 # not just a count) — same rationale as every other capped candidate pool in
 # this codebase: comfortably above any realistic per-org lead count at this
@@ -125,6 +135,63 @@ async def get_revenue_summary(
             conversion_rate=conversion_rate,
             expected_pipeline_revenue=expected_pipeline_revenue,
             revenue_by_action=revenue_attribution.revenue_by_action,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/forecast", response_model=ApiResponse[RevenueForecastResponse])
+async def get_revenue_forecast(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[RevenueForecastResponse]:
+    """Revenue Forecast Engine (Autonomous-sales-OS round) — how much of
+    the open pipeline is actually likely to land today, this week, this
+    month. Every active (non-converted, non-lost) lead's own expected_value
+    (score_leads()'s win_probability-weighted figure) is further discounted
+    by compute_forecast_value() for staleness (scoring.py — overdue *0.6,
+    idle >3 days *0.7, otherwise unchanged) before being aggregated:
+    today_expected sums that decayed value over leads due today or already
+    overdue; week_expected/month_expected are both the same decayed total
+    across every active lead, week_expected discounted by
+    _WEEK_FORECAST_DISCOUNT on top. confidence is the mean win_probability
+    (0-1) across those same active leads.
+
+    One query (rank_leads_by_priority(), same cost GET /leads/priority and
+    /workday/summary each already pay independently) — its own candidate
+    pool already excludes "converted"; "lost" is filtered out here too,
+    same "active means neither" convention build_action_queue()
+    (workday_engine.py) already established."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+    now = datetime.now(timezone.utc)
+    today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    ranked = await rank_leads_by_priority(db, organization_id)
+    active_leads = [response for response in ranked if response.status != "lost"]
+
+    today_expected = sum(
+        compute_forecast_value(response)
+        for response in active_leads
+        if response.next_action_due_at is not None and response.next_action_due_at < today_end
+    )
+    month_expected = sum(compute_forecast_value(response) for response in active_leads)
+    week_expected = month_expected * _WEEK_FORECAST_DISCOUNT
+    confidence = (
+        sum(response.win_probability for response in active_leads) / len(active_leads) / 100
+        if active_leads
+        else 0.0
+    )
+
+    return ApiResponse(
+        success=True,
+        data=RevenueForecastResponse(
+            today_expected=today_expected,
+            week_expected=week_expected,
+            month_expected=month_expected,
+            confidence=confidence,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
