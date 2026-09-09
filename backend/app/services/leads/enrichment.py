@@ -59,6 +59,19 @@ COMPANY_SIZE_PT = {
     "500+": "grande porte",
 }
 
+# Simulated deal-size-at-risk per company-size bucket — GET /workday/summary's
+# estimated_revenue_at_risk. Same small/médio/grande grouping as
+# COMPANY_SIZE_PT above, just in R$ instead of a label. A placeholder for a
+# real deal-value field/integration later, same spirit as simulate_enrichment
+# itself.
+COMPANY_SIZE_REVENUE_ESTIMATE = {
+    "1-10": 1000.0,
+    "11-50": 1000.0,
+    "51-200": 5000.0,
+    "201-500": 5000.0,
+    "500+": 20000.0,
+}
+
 # The three next_best_action base labels compute_next_best_action() (scoring.py)
 # builds on top of (before appending its own enrichment-context suffix) —
 # generate_lead_message_by_action() below matches on these same prefixes to
