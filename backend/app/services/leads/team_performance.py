@@ -156,6 +156,7 @@ async def compute_user_performance(
     for owner_email in sorted(leads_by_owner):
         owned = leads_by_owner[owner_email]
         leads_handled = len(owned)
+        deals_closed = sum(1 for response in owned if response.status == "converted")
         revenue_converted = sum(
             response.estimated_value for response in owned if response.status == "converted"
         )
@@ -187,6 +188,7 @@ async def compute_user_performance(
                 user_id=owner_email,
                 name=owner_email,
                 leads_handled=leads_handled,
+                deals_closed=deals_closed,
                 revenue_converted=revenue_converted,
                 revenue_at_risk=revenue_at_risk,
                 response_rate=response_rate,

@@ -30,11 +30,17 @@ class UserPerformanceResponse(BaseModel):
     revenue_converted. streak_days is consecutive days (ending today, or
     yesterday if today has none yet — same "doesn't drop at midnight"
     rule GET /workday/target's own streak already follows) with at least
-    one "lead_won" entry this user logged."""
+    one "lead_won" entry this user logged.
+
+    deals_closed (Ultimate-Sales-OS round, Task 11) is the count of this
+    user's own converted leads — distinct from leads_handled, which counts
+    every lead they own regardless of status. revenue_converted is the sum
+    of value across the same set deals_closed counts."""
 
     user_id: str
     name: str
     leads_handled: int = 0
+    deals_closed: int = 0
     revenue_converted: float = 0.0
     revenue_at_risk: int = 0
     response_rate: float = 0.0
@@ -49,7 +55,9 @@ class LeaderboardEntry(BaseModel):
     """GET /performance/leaderboard's own per-row shape — the prompt's own
     literal field list (user_id/name/revenue_converted/response_rate/
     avg_response_time/position), plus commission_estimate/badges additive
-    on top (Tasks 3/4's own "expose in leaderboard" instruction)."""
+    on top (Tasks 3/4's own "expose in leaderboard" instruction) and
+    deals_closed additive on top of that (Ultimate-Sales-OS round, Task
+    11)."""
 
     user_id: str
     name: str
@@ -59,6 +67,7 @@ class LeaderboardEntry(BaseModel):
     position: int
     commission_estimate: float = 0.0
     badges: list[str] = Field(default_factory=list)
+    deals_closed: int = 0
 
 
 class TeamSummaryResponse(BaseModel):

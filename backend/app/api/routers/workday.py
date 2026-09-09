@@ -79,9 +79,10 @@ _DAILY_TARGET_REVENUE_WINDOW_DAYS = 7
 # Revenue Acceleration Mode's own trigger (Task 3, revenue-maximization
 # round) — this endpoint's own precise `gap > 5000` check, computed
 # directly from the accurate gap just above. Kept as its own local
-# constant, same value as scoring.py's compute_acceleration_mode() own
-# _ACCELERATION_MODE_GAP_THRESHOLD, rather than importing it — that one is
-# a cheap approximation feeding a different consumer (score_leads()); see
+# constant, deliberately independent of scoring.py's own
+# compute_acceleration_mode() (Ultimate-Sales-OS round switched that one to
+# a ratio-based check, current_expected < target * 0.7) — that one is a
+# cheap approximation feeding a different consumer (score_leads()); see
 # WorkdayTargetResponse's own docstring for why the two can't share one
 # computation.
 _ACCELERATION_MODE_GAP_THRESHOLD = 5000.0

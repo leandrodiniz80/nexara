@@ -152,6 +152,15 @@ _AUTO_EXECUTE_MEETING_WIN_PROBABILITY = 80
 # codebase's own "safe, bounded automation" precedent every other auto-
 # execution rule already follows.
 _ACCELERATION_MEETING_OVERDUE_GRACE_DAYS = 1
+# Ultimate-Sales-OS round (Task 6) — a second, higher bar that drops the
+# grace-window bound entirely: a deal this likely to close (>= 85, above
+# the plain _AUTO_EXECUTE_MEETING_WIN_PROBABILITY bar of 80) is safe to
+# auto-book a meeting for no matter how overdue it's gotten, while
+# acceleration mode is active. Still excludes "critical" risk the same way
+# the grace-window rule above does (see auto_execute_engine()'s own
+# candidate loop) — an emergency escalation still outranks a quietly
+# auto-scheduled meeting.
+_ACCELERATION_MEETING_HIGH_PROBABILITY = 85
 
 # auto_execute_engine()'s own event-type vocabulary — an ADDITIONAL marker
 # on top of (not a replacement for) whatever execute_lead_action() below
@@ -202,7 +211,13 @@ async def auto_execute_engine(
          response.acceleration_mode is true — LeadResponse's own global
          flag (see that field's own docstring, schemas/leads/lead.py),
          read straight from the already-scored `leads` list rather than a
-         second DB round-trip.
+         second DB round-trip. Ultimate-Sales-OS round (Task 6) adds a
+         further relaxation on top: whenever acceleration_mode is true AND
+         win_probability >= _ACCELERATION_MEETING_HIGH_PROBABILITY (85),
+         the overdue check is skipped entirely (no grace-window bound at
+         all) — a deal this close to closing gets its meeting booked
+         regardless of how overdue it's become, while the org is behind
+         target.
 
     call_now is never auto-executed — no rule above ever produces it.
 
@@ -247,10 +262,17 @@ async def auto_execute_engine(
         if response.id in already_executed_lead_ids:
             continue
 
-        is_within_overdue_grace = not response.is_overdue or (
-            response.acceleration_mode
-            and response.days_overdue is not None
-            and response.days_overdue <= _ACCELERATION_MEETING_OVERDUE_GRACE_DAYS
+        is_within_overdue_grace = (
+            not response.is_overdue
+            or (
+                response.acceleration_mode
+                and response.days_overdue is not None
+                and response.days_overdue <= _ACCELERATION_MEETING_OVERDUE_GRACE_DAYS
+            )
+            or (
+                response.acceleration_mode
+                and response.win_probability >= _ACCELERATION_MEETING_HIGH_PROBABILITY
+            )
         )
 
         if response.ready_to_send_message is not None:

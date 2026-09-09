@@ -241,8 +241,24 @@ _FORECAST_IDLE_DECAY_DAYS = 3
 # this backend), so this reuses has_recent_manual_activity — already
 # computed per lead for other bonuses above — as the closest available
 # proxy; see score_leads()'s own comment where it's applied.
-_OPPORTUNITY_COST_THRESHOLD = 5000
+#
+# Ultimate-Sales-OS round tightened this from 5000 (>) to 3000 (>=) — the
+# prompt's own literal bar — so opportunity cost fires as a signal sooner,
+# before a big gap has fully formed.
+_OPPORTUNITY_COST_THRESHOLD = 3000
 _OPPORTUNITY_COST_PENALTY = -40
+
+# Ultimate-Sales-OS round — "PRESSÃO POR RISCO" (Task 1): deal_risk_level
+# itself now earns its own direct score bonus, on top of (not instead of)
+# every other risk-adjacent penalty above (overdue, stale, high-value-at-
+# risk, ...) and on top of compute_deal_risk()'s own separate effect on
+# next_best_action_type/urgency. A critical or high-risk deal is exactly
+# the kind of thing this system should be pushing the seller toward, so it
+# gets rewarded here even though risk_level itself already drove other
+# penalties/urgency elsewhere — those measure neglect, this measures "this
+# deal needs pressure right now."
+_RISK_PRESSURE_CRITICAL_BONUS = 35
+_RISK_PRESSURE_HIGH_BONUS = 20
 
 # Dynamic Deal Reallocation's own risk-tier ordering (Task 2,
 # rank_leads_by_priority()) — a local copy of workday_engine.py's own
@@ -259,11 +275,11 @@ _REALLOCATION_FORCE_TOP_VALUE = 10000
 _REALLOCATION_FORCE_TOP_WIN_PROBABILITY = 70
 _REALLOCATION_FORCE_TOP_SLOTS = 3
 
-# Revenue Acceleration Mode's own trigger (Task 3) — see
-# compute_acceleration_mode()'s own docstring for why this is a cheap
-# approximation of the same "gap > 5000" check GET /workday/target
-# computes precisely (workday.py).
-_ACCELERATION_MODE_GAP_THRESHOLD = 5000.0
+# Revenue Acceleration Mode's own trigger (Task 3; ratio formula per the
+# Ultimate-Sales-OS round's Task 5) — see compute_acceleration_mode()'s own
+# docstring for why this is a cheap approximation, not the same precise
+# figure GET /workday/target computes (workday.py).
+_ACCELERATION_MODE_RATIO_THRESHOLD = 0.7
 _ACCELERATION_MODE_TARGET_WINDOW_DAYS = 7
 # compute_lead_score()'s acceleration-mode bonuses — the prompt's own +20
 # for both signals; both stack independently (a lead can be high-value AND
@@ -440,6 +456,7 @@ def compute_lead_score(
     is_high_opportunity_cost: bool,
     acceleration_mode: bool,
     top_combination: str | None,
+    deal_risk_level: str,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -806,6 +823,20 @@ def compute_lead_score(
             )
         )
         total += _OPPORTUNITY_COST_PENALTY
+
+    # Ultimate-Sales-OS round — "PRESSÃO POR RISCO" (Task 1): deal_risk_level
+    # is computed once by score_leads() (compute_deal_risk(), earlier in its
+    # per-lead loop) and passed straight through here.
+    if deal_risk_level == "critical":
+        breakdown.append(
+            ScoreBreakdownItem(reason="Risco crítico de perda do negócio", impact=_RISK_PRESSURE_CRITICAL_BONUS)
+        )
+        total += _RISK_PRESSURE_CRITICAL_BONUS
+    elif deal_risk_level == "high":
+        breakdown.append(
+            ScoreBreakdownItem(reason="Risco elevado de perda do negócio", impact=_RISK_PRESSURE_HIGH_BONUS)
+        )
+        total += _RISK_PRESSURE_HIGH_BONUS
 
     # Revenue Acceleration Mode (Task 3) — when the org is meaningfully
     # behind its daily revenue target (compute_acceleration_mode()), every
@@ -1323,9 +1354,13 @@ async def compute_revenue_summary(
 
 async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> bool:
     """Revenue Acceleration Mode's own trigger (Task 3, revenue-
-    maximization round) — true whenever the org looks more than
-    _ACCELERATION_MODE_GAP_THRESHOLD behind its daily revenue target.
-    Deliberately a cheap, independent approximation, NOT the same precise
+    maximization round; formula tightened in the Ultimate-Sales-OS round,
+    Task 5) — true whenever current_expected sits below
+    _ACCELERATION_MODE_RATIO_THRESHOLD (70%) of daily_target_revenue, i.e.
+    the org is on pace for meaningfully less than its target rather than
+    merely some fixed dollar amount short of it (the round's own literal
+    ask: `current_expected < target * 0.7`, replacing the previous
+    absolute-gap check). Deliberately a cheap, independent approximation, NOT the same precise
     gap GET /workday/target reports (see that endpoint's own
     daily_target_revenue/current_expected, workday.py, for the
     authoritative figure driving the frontend's banner): computing the
@@ -1385,8 +1420,9 @@ async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> b
         )
         current_expected += round(get_lead_estimated_value(lead) * win_probability / 100)
 
-    gap = daily_target_revenue - current_expected
-    return gap > _ACCELERATION_MODE_GAP_THRESHOLD
+    if daily_target_revenue <= 0:
+        return False
+    return current_expected < daily_target_revenue * _ACCELERATION_MODE_RATIO_THRESHOLD
 
 
 def build_priority_reason(
@@ -1506,6 +1542,7 @@ def compute_action_type_and_urgency(
     expected_value: int = 0,
     top_revenue_action: str | None = None,
     acceleration_mode: bool = False,
+    win_probability: int = 0,
 ) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
@@ -1537,7 +1574,10 @@ def compute_action_type_and_urgency(
     Revenue Acceleration Mode (Task 3, revenue-maximization round): once
     compute_acceleration_mode() reports the org is meaningfully behind its
     daily revenue target, every remaining non-critical, non-terminal lead
-    is forced to call_now at "high" urgency — checked right after the
+    that's ALSO already likely to close (win_probability >=
+    _HIGH_WIN_PROBABILITY_THRESHOLD — Ultimate-Sales-OS round's own gate,
+    Task 2: "close it now" only makes sense for a deal that's actually
+    close) is forced to call_now at "high" urgency — checked right after the
     "critical" tier's own call_now above (still absolute: an emergency
     escalation outranks a blanket policy) but before the revenue-
     attribution strategy shift, since "call everything now, we're behind"
@@ -1548,7 +1588,7 @@ def compute_action_type_and_urgency(
         return None, None
     if risk_level == "critical":
         return "call_now", "immediate"
-    if acceleration_mode:
+    if acceleration_mode and win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
         return "call_now", "high"
 
     urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
@@ -1754,7 +1794,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         # condition.
         opportunity_cost = highest_expected_value - expected_value
         is_high_opportunity_cost = (
-            opportunity_cost > _OPPORTUNITY_COST_THRESHOLD
+            opportunity_cost >= _OPPORTUNITY_COST_THRESHOLD
             and lead.id in recent_manual_activity_ids
         )
 
@@ -1775,6 +1815,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             expected_value=expected_value,
             top_revenue_action=top_revenue_action,
             acceleration_mode=acceleration_mode,
+            win_probability=win_probability,
         )
         if is_low_potential:
             deal_risk_level = "low"
@@ -1806,6 +1847,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             is_high_opportunity_cost=is_high_opportunity_cost,
             acceleration_mode=acceleration_mode,
             top_combination=top_combination,
+            deal_risk_level=deal_risk_level,
             now=now,
         )
 
