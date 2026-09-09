@@ -15,6 +15,15 @@ export interface LeaderboardEntry {
   commissionEstimate: number;
   badges: string[];
   dealsClosed: number;
+  /** Elite round (Task 5) — same estimated_value sum as revenueConverted
+   * (all-time), windowed to conversions whose own "lead_won" activity
+   * landed today/within the last 7 days. revenueThisWeek always >=
+   * revenueToday. */
+  revenueToday: number;
+  revenueThisWeek: number;
+  /** This user's own open (not converted/lost) leads' expectedValue
+   * summed — the probability-weighted forecast still in their pipeline. */
+  pipelineValue: number;
 }
 
 interface LeaderboardEntryDto {
@@ -27,6 +36,9 @@ interface LeaderboardEntryDto {
   commission_estimate: number;
   badges: string[];
   deals_closed: number;
+  revenue_today: number;
+  revenue_this_week: number;
+  pipeline_value: number;
 }
 
 /** GET /api/v1/performance/leaderboard — Multi-user revenue-war round's
@@ -48,6 +60,9 @@ export async function getLeaderboard(): Promise<LeaderboardEntry[]> {
       commissionEstimate: entry.commission_estimate,
       badges: entry.badges,
       dealsClosed: entry.deals_closed,
+      revenueToday: entry.revenue_today,
+      revenueThisWeek: entry.revenue_this_week,
+      pipelineValue: entry.pipeline_value,
     }));
   } catch (error) {
     throw toApiClientError(error);

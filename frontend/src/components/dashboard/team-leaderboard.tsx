@@ -128,6 +128,13 @@ export function TeamLeaderboard({
                   <p className="text-xs text-muted-foreground">
                     comissão R$ {formatBRL(entry.commissionEstimate)}
                   </p>
+                  {/* Revenue Per User real-time (Elite round, Task 5) */}
+                  <p className="text-[11px] text-muted-foreground">
+                    hoje R$ {formatBRL(entry.revenueToday)} · semana R$ {formatBRL(entry.revenueThisWeek)}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    pipeline R$ {formatBRL(entry.pipelineValue)}
+                  </p>
                 </div>
               </li>
             ))}
