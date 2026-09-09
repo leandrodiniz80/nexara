@@ -116,16 +116,28 @@ def generate_accountability_message(
     """The Performance Panel's (and Command Center's) headline sentence for
     the caller's current failure_state — built here, not the frontend, same
     "backend writes the sentence" rule the timeline/activity feed and
-    _build_focus_message already follow."""
+    _build_focus_message already follow. Leads with the financial framing
+    (leads_ignored_yesterday and estimated_revenue_lost both > 0 — a lead
+    only contributes revenue once it's been enriched, see
+    get_lead_estimated_value()) whenever there's a real number to show;
+    falls back to a plain activity-count message otherwise, in both
+    failing and at_risk."""
+    has_revenue_impact = leads_ignored_yesterday > 0 and estimated_revenue_lost > 0
+
     if failure_state == "failing":
-        if leads_ignored_yesterday > 0 and estimated_revenue_lost > 0:
+        if has_revenue_impact:
             return (
-                f"Você está deixando dinheiro na mesa. {leads_ignored_yesterday} leads "
-                f"ignorados podem representar R$ {format_brl(estimated_revenue_lost)} perdidos."
+                f"Você ignorou {leads_ignored_yesterday} leads que podem gerar "
+                f"R$ {format_brl(estimated_revenue_lost)}. Aja agora antes que vire prejuízo real."
             )
         return f"Você está atrasado em {overdue_tasks} leads. Aja agora antes que piore."
     if failure_state == "at_risk":
         focus_count = max(tasks_remaining_today, 1)
+        if has_revenue_impact:
+            return (
+                f"Você ainda pode recuperar seu dia. Foque nos próximos {focus_count} leads "
+                f"antes de perder R$ {format_brl(estimated_revenue_lost)}."
+            )
         return f"Você ainda pode recuperar seu dia. Foque nos próximos {focus_count} leads."
     return "Bom ritmo. Continue assim para fechar mais negócios hoje."
 

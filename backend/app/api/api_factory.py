@@ -25,6 +25,7 @@ from app.api.routers.organizations import router as organizations_router
 from app.api.routers.outreach import router as outreach_router
 from app.api.routers.prospects import router as prospects_router
 from app.api.routers.read_models import router as read_models_router
+from app.api.routers.revenue import router as revenue_router
 from app.api.routers.secure_demo import router as secure_demo_router
 from app.api.routers.tenants import router as tenants_router
 from app.api.routers.workday import router as workday_router
@@ -110,5 +111,6 @@ def create_app() -> FastAPI:
     app.include_router(notifications_router)
     app.include_router(internal_jobs_router)
     app.include_router(workday_router)
+    app.include_router(revenue_router)
 
     return app

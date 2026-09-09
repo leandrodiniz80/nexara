@@ -19,7 +19,7 @@ from app.schemas.workday import (
     WorkdayPerformanceResponse,
     WorkdaySummaryResponse,
 )
-from app.services.leads.enrichment import COMPANY_SIZE_REVENUE_ESTIMATE
+from app.services.leads.enrichment import get_lead_estimated_value
 from app.services.leads.scoring import rank_leads_by_priority, score_leads
 from app.services.leads.workday_engine import (
     complete_lead_task,
@@ -330,11 +330,7 @@ async def get_workday_summary(
     )
     at_risk_leads = (await db.execute(at_risk_stmt)).scalars().all()
     leads_at_risk = len(at_risk_leads)
-    estimated_revenue_at_risk = sum(
-        COMPANY_SIZE_REVENUE_ESTIMATE.get(lead.enrichment_data.get("company_size", ""), 0.0)
-        for lead in at_risk_leads
-        if lead.enrichment_data
-    )
+    estimated_revenue_at_risk = sum(get_lead_estimated_value(lead) for lead in at_risk_leads)
 
     ranked = await rank_leads_by_priority(db, organization_id)
     high_priority_leads = len(ranked[:_HIGH_PRIORITY_TOP_N])
@@ -474,11 +470,7 @@ async def get_workday_performance(
     )
     ignored_leads = (await db.execute(ignored_stmt)).scalars().all()
     leads_ignored_yesterday = len(ignored_leads)
-    estimated_revenue_lost = sum(
-        COMPANY_SIZE_REVENUE_ESTIMATE.get(lead.enrichment_data.get("company_size", ""), 0.0)
-        for lead in ignored_leads
-        if lead.enrichment_data
-    )
+    estimated_revenue_lost = sum(get_lead_estimated_value(lead) for lead in ignored_leads)
 
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks

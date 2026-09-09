@@ -72,6 +72,17 @@ COMPANY_SIZE_REVENUE_ESTIMATE = {
     "500+": 20000.0,
 }
 
+# compute_lead_score()'s "High revenue potential" breakdown line — same
+# small/médio/grande grouping as COMPANY_SIZE_REVENUE_ESTIMATE above, just a
+# score delta instead of an R$ estimate.
+COMPANY_SIZE_SCORE_IMPACT = {
+    "1-10": 2,
+    "11-50": 2,
+    "51-200": 8,
+    "201-500": 8,
+    "500+": 15,
+}
+
 # The three next_best_action base labels compute_next_best_action() (scoring.py)
 # builds on top of (before appending its own enrichment-context suffix) —
 # generate_lead_message_by_action() below matches on these same prefixes to
@@ -118,6 +129,20 @@ def simulate_enrichment(lead: Lead) -> None:
         ),
         "enriched_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def get_lead_estimated_value(lead: Lead) -> float:
+    """Simulated deal size for a single lead, from enrichment_data's
+    company_size (COMPANY_SIZE_REVENUE_ESTIMATE) — 0.0 when the lead isn't
+    enriched yet, or its company_size isn't one of the known buckets. No
+    new column: computed at read time, same spirit as compute_lead_score's
+    dynamic score. Single source of truth for "what is this lead worth"
+    wherever that's needed (GET /revenue/summary, /revenue/performance-trend,
+    GET /workday/summary's at-risk estimate, the accountability layer's
+    revenue-lost estimate)."""
+    if not lead.enrichment_data:
+        return 0.0
+    return COMPANY_SIZE_REVENUE_ESTIMATE.get(lead.enrichment_data.get("company_size", ""), 0.0)
 
 
 def generate_first_contact_message(lead: Lead, sender_email: str) -> str:

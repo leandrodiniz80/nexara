@@ -15,6 +15,7 @@ from app.services.leads.enrichment import (
     ACTION_FOLLOW_UP,
     ACTION_URGENT_FOLLOW_UP,
     COMPANY_SIZE_PT,
+    COMPANY_SIZE_SCORE_IMPACT,
     HIGH_VALUE_INDUSTRIES,
     INDUSTRY_PT,
     LARGE_COMPANY_SIZES,
@@ -180,6 +181,13 @@ def compute_lead_score(
                 )
             )
             total += size_impact
+
+        revenue_impact = COMPANY_SIZE_SCORE_IMPACT.get(company_size, 0)
+        if revenue_impact:
+            breakdown.append(
+                ScoreBreakdownItem(reason="High revenue potential", impact=revenue_impact)
+            )
+            total += revenue_impact
     else:
         unenriched_impact = -5
         breakdown.append(
