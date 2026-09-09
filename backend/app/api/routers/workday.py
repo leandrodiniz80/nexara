@@ -12,6 +12,7 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
+from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import (
     WorkdayCompleteAndNextRequest,
@@ -22,6 +23,7 @@ from app.schemas.workday import (
     WorkdayTargetResponse,
 )
 from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
+from app.services.leads.execution_engine import AUTO_EXECUTION_NOTIFICATION_PREFIX, maybe_auto_execute
 from app.services.leads.scoring import rank_leads_by_priority, score_leads
 from app.services.leads.workday_engine import (
     complete_lead_task,
@@ -364,6 +366,52 @@ async def _compute_money_saved_today(db: AsyncSession, organization_id: str, tod
     )
 
 
+async def _count_auto_actions_today(db: AsyncSession, organization_id: str, today_start: dt) -> int:
+    """Execution-assistance round. Counts maybe_auto_execute()'s own
+    UserNotification rows (see execution_engine.py's AUTO_EXECUTION_NOTIFICATION_PREFIX
+    docstring for why a message-prefix match, not a dedicated column) created
+    today — deliberately not LeadActivityLog's "message_sent" entries, which
+    also include manual "Enviar agora" clicks this field excludes on
+    purpose."""
+    stmt = select(func.count(UserNotification.id)).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.message.startswith(AUTO_EXECUTION_NOTIFICATION_PREFIX),
+        UserNotification.created_at >= today_start,
+    )
+    return (await db.execute(stmt)).scalar_one()
+
+
+async def _maybe_auto_execute_critical_deals(
+    db: AsyncSession, organization_id: str, ranked: list[LeadResponse]
+) -> int:
+    """Execution-assistance round — runs maybe_auto_execute() (execution_engine.py)
+    over whichever already-scored leads in `ranked` qualify (deal_risk_level
+    == "critical" and auto_action_available), reusing that list rather than
+    a fresh candidate query. A no-op entirely while settings.AUTO_MODE_ENABLED
+    is off (the default): the one extra query below (fetching the raw Lead
+    rows to mutate) only runs when there's at least one real candidate.
+    Caller commits; returns how many were actually auto-executed."""
+    if not settings.AUTO_MODE_ENABLED:
+        return 0
+
+    candidates = {
+        response.id: response
+        for response in ranked
+        if response.deal_risk_level == "critical" and response.auto_action_available
+    }
+    if not candidates:
+        return 0
+
+    leads_stmt = select(Lead).where(Lead.id.in_(candidates.keys()))
+    leads = (await db.execute(leads_stmt)).scalars().all()
+
+    executed = 0
+    for lead in leads:
+        if await maybe_auto_execute(db, lead, candidates[lead.id]):
+            executed += 1
+    return executed
+
+
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -375,18 +423,21 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Six queries total, none per-row (up to 2 more, conditional, only when a
-    new high-value or critical-deal alert is actually staged): today/overdue
-    are plain COUNTs (backed by ix_leads_org_id_next_action_due_at, same
-    index GET /leads/tasks uses); leads-at-risk is the same WHERE shape as
-    GET /leads/attention (ix_leads_org_id_status_updated_at), fetched as
+    Seven queries total, none per-row (up to 3 more, conditional: one dedup
+    check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals(),
+    one Lead row-fetch for _maybe_auto_execute_critical_deals() — all three
+    only when there's an actual candidate, and the last only when
+    settings.AUTO_MODE_ENABLED is even on, which it isn't by default):
+    today/overdue are plain COUNTs (backed by ix_leads_org_id_next_action_due_at,
+    same index GET /leads/tasks uses); leads-at-risk is the same WHERE shape
+    as GET /leads/attention (ix_leads_org_id_status_updated_at), fetched as
     rows (not just a count) since estimated_revenue_at_risk needs each
     one's enrichment_data; high_priority_leads/revenue_at_risk/
     today_potential_revenue/money_at_risk_today/critical_deals_count all
     reuse the one rank_leads_by_priority() call (candidate query +
     score_leads' own one extra query) — the same cost GET /leads/priority
-    already pays elsewhere on this same dashboard — plus one dedup check
-    each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()."""
+    already pays elsewhere on this same dashboard; the 7th, unconditional,
+    is auto_actions_executed_today's own count (_count_auto_actions_today)."""
     start = time.perf_counter()
     organization_id, _user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -445,8 +496,14 @@ async def get_workday_summary(
     notified_count += await maybe_notify_critical_deals(
         db, organization_id=organization_id, leads=ranked, now=now
     )
-    if notified_count:
+    # Execution-assistance round — a no-op while settings.AUTO_MODE_ENABLED
+    # is off (the default); see _maybe_auto_execute_critical_deals's own
+    # docstring.
+    auto_executed_count = await _maybe_auto_execute_critical_deals(db, organization_id, ranked)
+    if notified_count or auto_executed_count:
         await db.commit()
+
+    auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
 
     return ApiResponse(
         success=True,
@@ -462,6 +519,7 @@ async def get_workday_summary(
             money_in_play_today=today_potential_revenue,
             money_at_risk_today=money_at_risk_today,
             critical_deals_count=critical_deals_count,
+            auto_actions_executed_today=auto_actions_executed_today,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -543,14 +601,14 @@ async def get_workday_performance(
     completion) is, by definition, still unresolved from at least
     yesterday — a strict subset of overdue_tasks.
 
-    Ten queries total (two inside _workday_stats, two counts, one
+    Eleven queries total (two inside _workday_stats, two counts, one
     ignored-leads row fetch for the revenue estimate, two inside
     rank_leads_by_priority for revenue_at_risk/critical_deals, one dedup
     check for the performance-alert notification, two inside
-    _compute_money_saved_today for the AI Deal Coach round's money_saved_today),
-    none per-row. Reuses _count_overdue_tasks and _workday_stats (both
-    already used by /next and /summary), plus the same
-    rank_leads_by_priority()/_compute_revenue_at_risk()/
+    _compute_money_saved_today for the AI Deal Coach round's money_saved_today,
+    one for auto_actions_executed_today's own count), none per-row. Reuses
+    _count_overdue_tasks and _workday_stats (both already used by /next and
+    /summary), plus the same rank_leads_by_priority()/_compute_revenue_at_risk()/
     _compute_deal_risk_summary() pairing GET /workday/summary already uses,
     instead of re-deriving any of this a third time."""
     start = time.perf_counter()
@@ -593,6 +651,7 @@ async def get_workday_performance(
     revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
     _money_at_risk_today, critical_deals = _compute_deal_risk_summary(ranked)
     money_saved_today = await _compute_money_saved_today(db, organization_id, today_start)
+    auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
 
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks
@@ -632,6 +691,7 @@ async def get_workday_performance(
             revenue_at_risk=revenue_at_risk,
             critical_deals=critical_deals,
             money_saved_today=money_saved_today,
+            auto_actions_executed_today=auto_actions_executed_today,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

@@ -112,6 +112,15 @@ class LeadResponse(BaseModel):
     # matching next_best_action's prose. None only for converted leads.
     next_best_action_type: str | None = None
     next_best_action_urgency: str | None = None
+    # Execution-assistance round — the "just do it for me" gate: true only
+    # when next_best_action_type == "send_message" AND suggested_message is
+    # actually populated, in which case ready_to_send_message mirrors
+    # suggested_message so the frontend's "Enviar agora" button (and
+    # POST /leads/{id}/execute-action) don't have to re-derive the same two-
+    # field check themselves. False/None otherwise — never a stale or
+    # partially-stale value.
+    ready_to_send_message: str | None = None
+    auto_action_available: bool = False
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
@@ -227,6 +236,17 @@ class GenerateMessageResponse(BaseModel):
     see generate_first_contact_message() in enrichment.py."""
 
     message: str
+
+
+class ExecuteLeadActionRequest(BaseModel):
+    """POST /leads/{id}/execute-action — execution-assistance round. A
+    Literal (not the free-string pattern LeadUpdateStatus.reason uses)
+    since these three are the entire, fixed vocabulary
+    compute_action_type_and_urgency() (scoring.py) ever produces; a
+    request for anything else is a client bug, not a future-proofing
+    concern worth a plain string for."""
+
+    action: Literal["send_message", "call_now", "schedule_meeting"]
 
 
 class ConversionInsightsResponse(BaseModel):

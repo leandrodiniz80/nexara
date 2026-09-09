@@ -688,6 +688,13 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         )
         action_type, action_urgency = compute_action_type_and_urgency(lead, deal_risk_level)
 
+        # Execution-assistance round — "ready to just do it" gate. Not its
+        # own compute_*() function: it's a plain two-field AND already fully
+        # expressed by values this loop iteration already has in scope, so a
+        # separate function would just be indirection.
+        is_ready_to_send = action_type == "send_message" and suggested_message is not None
+        ready_to_send_message = suggested_message if is_ready_to_send else None
+
         response = LeadResponse.model_validate(lead)
         responses.append(
             response.model_copy(
@@ -706,6 +713,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "deal_risk_reason": deal_risk_reason,
                     "next_best_action_type": action_type,
                     "next_best_action_urgency": action_urgency,
+                    "ready_to_send_message": ready_to_send_message,
+                    "auto_action_available": is_ready_to_send,
                 }
             )
         )

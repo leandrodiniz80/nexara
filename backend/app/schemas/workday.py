@@ -56,6 +56,14 @@ class WorkdaySummaryResponse(BaseModel):
     money_in_play_today: int = 0
     money_at_risk_today: int = 0
     critical_deals_count: int = 0
+    # Execution-assistance round — how many leads maybe_auto_execute()
+    # (execution_engine.py) auto-sent a message for today, gated behind
+    # settings.AUTO_MODE_ENABLED (always 0 while that's off, which is the
+    # default). Counted via its own distinct UserNotification message
+    # prefix, not LeadActivityLog's "message_sent" entries — those also
+    # include a manual "Enviar agora" click (POST /leads/{id}/execute-action),
+    # which this field deliberately excludes: "auto" means auto.
+    auto_actions_executed_today: int = 0
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):
@@ -108,6 +116,9 @@ class WorkdayPerformanceResponse(BaseModel):
     # that got acted on today instead of going cold."
     critical_deals: int = 0
     money_saved_today: float = 0
+    # Same auto-send-only count as WorkdaySummaryResponse.auto_actions_executed_today
+    # above — the Performance Panel's own "ações automatizadas hoje".
+    auto_actions_executed_today: int = 0
 
 
 class WorkdayTargetResponse(BaseModel):

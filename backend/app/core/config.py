@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # new code path.
     ENRICHMENT_ENABLED: bool = True
     AI_ENABLED: bool = True
+    # Execution-assistance round's auto-execution mode — off by default
+    # (unlike the two flags above): this one doesn't just show more, it acts
+    # on the org's behalf (auto-sends a message for a critical-risk lead),
+    # so it stays opt-in until an org explicitly turns it on. See
+    # maybe_auto_execute() in app/services/leads/execution_engine.py.
+    AUTO_MODE_ENABLED: bool = False
 
 
 settings = Settings()

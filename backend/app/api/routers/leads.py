@@ -20,6 +20,7 @@ from app.models.platform_auth.user import PlatformUser
 from app.models.platform_auth.user_organization import PlatformUserOrganization
 from app.schemas.leads.lead import (
     ConversionInsightsResponse,
+    ExecuteLeadActionRequest,
     GenerateMessageResponse,
     LeadActivityFeedEntry,
     LeadCreate,
@@ -37,6 +38,7 @@ from app.schemas.leads.lead import (
 )
 from app.services.leads.automation_engine import fire_stale_lead_automations, run_automations
 from app.services.leads.enrichment import generate_first_contact_message, simulate_enrichment
+from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
 from app.services.leads.scoring import LOSS_REASON_MARKER, compute_conversion_insights, score_leads
 
 logger = logging.getLogger("app.api.routers.leads")
@@ -977,6 +979,61 @@ async def generate_lead_message(
     return ApiResponse(
         success=True,
         data=GenerateMessageResponse(message=message),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("/{lead_id}/execute-action", response_model=ApiResponse[LeadResponse])
+async def execute_lead_action_endpoint(
+    lead_id: uuid.UUID,
+    body: ExecuteLeadActionRequest,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadResponse]:
+    """Execution-assistance round — "assistant → executor". Scores the
+    lead once up front (to validate the request against its own current
+    ready_to_send_message/auto_action_available — see execute_lead_action(),
+    execution_engine.py — and so send_message's precondition is checked
+    against the same snapshot the frontend's own "Enviar agora" button
+    saw), then again after the mutation to return the lead's fresh state
+    (cleared next_action, bumped updated_at, new score/next_best_action
+    now that something changed). Two score_leads() calls, same "cheap
+    relative to the mutation itself" precedent every other single-lead
+    mutation endpoint on this router already accepts (see PATCH
+    /{lead_id}/status, .../owner, .../details — all re-score once after
+    committing)."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+    user_email = session.get("email")
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    (current,) = await score_leads(db, [lead])
+
+    try:
+        await execute_lead_action(
+            db,
+            lead,
+            body.action,
+            response=current,
+            organization_id=organization_id,
+            user_email=user_email,
+        )
+    except InvalidLeadAction as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+    await db.refresh(lead)
+
+    (scored_lead,) = await score_leads(db, [lead])
+
+    return ApiResponse(
+        success=True,
+        data=scored_lead,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
