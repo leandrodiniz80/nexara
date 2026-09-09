@@ -160,6 +160,20 @@ class LeadResponse(BaseModel):
     enrichment_data: EnrichmentData | None = None
     created_at: datetime
     updated_at: datetime
+    # Revenue-maximization round — Opportunity Cost Engine (Task 1):
+    # this org's single highest expected_value among the batch score_leads()
+    # last scored this lead alongside, minus this lead's own expected_value.
+    # Always >= 0 (the highest-value lead's own opportunity_cost is 0
+    # against itself). Powers LeadCard's own "⚠️ Perdendo R$ X" badge.
+    opportunity_cost: int = 0
+    # Revenue Acceleration Mode (Task 3) — a global, org-wide flag (see
+    # compute_acceleration_mode(), scoring.py), uniform across every
+    # LeadResponse in the same score_leads() batch, not a genuine per-lead
+    # attribute. Exposed here so a caller already holding an already-scored
+    # list (e.g. auto_execute_engine(), execution_engine.py) can read the
+    # same global state score_leads() already computed without a second,
+    # redundant DB round-trip.
+    acceleration_mode: bool = False
 
 
 class LeadStatusUpdateResponse(BaseModel):
@@ -319,13 +333,21 @@ class RevenueAttributionResponse(BaseModel):
     actions, no ML. revenue_by_action's three keys always exist (0.0
     default, not absent) since "no revenue from calls yet" is itself a
     useful, real answer; revenue_by_industry/revenue_by_company_size only
-    carry keys that actually have at least one converted lead behind them."""
+    carry keys that actually have at least one converted lead behind them.
+
+    Winner Pattern Replication (Task 4, revenue-maximization round) adds
+    top_combination: the single "action | industry | company_size" string
+    (e.g. "call | Technology | 500+") with the most attributed revenue
+    behind it — None until at least one converted lead has both a
+    qualifying action link and enrichment_data at once, same "no signal
+    yet" rule this codebase's other learned fields already follow."""
 
     revenue_by_action: dict[str, float] = Field(
         default_factory=lambda: {"call": 0.0, "message": 0.0, "meeting": 0.0}
     )
     revenue_by_industry: dict[str, float] = Field(default_factory=dict)
     revenue_by_company_size: dict[str, float] = Field(default_factory=dict)
+    top_combination: str | None = None
 
 
 class ResponseMetricsResponse(BaseModel):

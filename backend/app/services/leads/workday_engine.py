@@ -92,6 +92,20 @@ _HIGH_REVENUE_OPPORTUNITY_THRESHOLD = 10000.0
 _HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY = 70
 _HIGH_REVENUE_OPPORTUNITY_ALERT_DEDUP_HOURS = 6
 
+# Revenue-maximization round — maybe_notify_focus_shift()'s own trigger
+# (Task 5): same opportunity_cost bar Task 1's own score penalty uses
+# (scoring.py's _OPPORTUNITY_COST_THRESHOLD), and the same "touched very
+# recently" window that penalty's own has_recent_manual_activity proxy
+# would cover, restated here in days since this is an org-wide, once-a-
+# batch check rather than a per-lead one already carrying that boolean.
+_FOCUS_SHIFT_OPPORTUNITY_COST_THRESHOLD = 5000
+_FOCUS_SHIFT_RECENT_ACTIVITY_DAYS = 1
+_FOCUS_SHIFT_ALERT_DEDUP_HOURS = 6
+# Org-wide alert marker (see IGNORED_LEADS_ALERT_MARKER's own comment
+# above for why an org-wide alert needs its own message marker rather than
+# maybe_notify_performance_alert()'s generic null-lead_id dedup check).
+FOCUS_SHIFT_ALERT_MARKER = "focando nos leads errados"
+
 
 def build_action_queue(leads: list[LeadResponse]) -> list[LeadResponse]:
     """Execution-engine round — the deterministic "what do I do next, in
@@ -164,17 +178,19 @@ async def get_next_actionable_lead(
     db: AsyncSession, organization_id: str, *, exclude_lead_id: uuid.UUID | None = None
 ) -> LeadResponse | None:
     """One lead to work on next for POST /workday/complete-and-next — same
-    ranking rank_leads_by_priority() already gives GET /leads/priority
-    (overdue first, then due today, then future, then no next_action at
-    all; score DESC within each bucket), which already implies this
-    endpoint's own stated criteria: an overdue or due-today lead always
-    outranks everything else, and among leads with no due date at all the
-    highest-scoring (most valuable, most worth not losing) one comes first.
+    ranking rank_leads_by_priority() gives everywhere else it's used.
+    Dynamic Deal Reallocation (Task 2, revenue-maximization round) changed
+    what that ranking actually optimizes for: deal_risk_level (critical
+    first), then expected_value/win_probability/opportunity_cost/score, all
+    DESC — revenue-first, not the "overdue first" urgency-bucket ordering
+    this function's own docstring used to describe (GET /leads/priority
+    keeps that original ordering in its own separate implementation,
+    unaffected).
 
     exclude_lead_id skips the lead the caller just completed — it usually
-    wouldn't resurface anyway (its next_action is now cleared, so it's
-    already fallen to the last bucket), but a small org with few other
-    leads could otherwise hand the same lead right back."""
+    wouldn't resurface anyway (its next_action is now cleared, so its own
+    expected_value/win_probability typically drop with it), but a small org
+    with few other leads could otherwise hand the same lead right back."""
     ranked = await rank_leads_by_priority(db, organization_id)
     for response in ranked:
         if exclude_lead_id is not None and response.id == exclude_lead_id:
@@ -576,3 +592,55 @@ async def maybe_notify_high_revenue_opportunity(
         )
         notified += 1
     return notified
+
+
+async def maybe_notify_focus_shift(
+    db: AsyncSession, *, organization_id: str, user_email: str, leads: list[LeadResponse], now: datetime
+) -> bool:
+    """Revenue-maximization round (Task 5) — an org-wide nudge (not
+    per-lead, since the point is redirecting overall attention, not
+    flagging one specific lead): fires when the user has recently touched
+    (days_since_last_activity <= _FOCUS_SHIFT_RECENT_ACTIVITY_DAYS) a lead
+    whose opportunity_cost (Task 1's own highest_expected_value minus this
+    lead's own expected_value, scoring.py) clears
+    _FOCUS_SHIFT_OPPORTUNITY_COST_THRESHOLD — a real higher-value lead
+    sitting elsewhere while this one gets the attention. Takes an already-
+    scored `leads` list, zero new candidate query. Same org-wide, own-
+    marker dedup shape as maybe_notify_ignored_leads()/
+    maybe_notify_pipeline_risk() above. Caller commits; returns whether a
+    row was actually staged."""
+    worst_offender = max(
+        (
+            lead
+            for lead in leads
+            if lead.days_since_last_activity <= _FOCUS_SHIFT_RECENT_ACTIVITY_DAYS
+        ),
+        key=lambda lead: lead.opportunity_cost,
+        default=None,
+    )
+    if worst_offender is None or worst_offender.opportunity_cost <= _FOCUS_SHIFT_OPPORTUNITY_COST_THRESHOLD:
+        return False
+
+    cutoff = now - timedelta(hours=_FOCUS_SHIFT_ALERT_DEDUP_HOURS)
+    recent_stmt = select(UserNotification.id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.user_email == user_email,
+        UserNotification.message.contains(FOCUS_SHIFT_ALERT_MARKER),
+        UserNotification.created_at >= cutoff,
+    )
+    already_sent = (await db.execute(recent_stmt)).scalar_one_or_none()
+    if already_sent is not None:
+        return False
+
+    db.add(
+        UserNotification(
+            organization_id=organization_id,
+            user_email=user_email,
+            lead_id=None,
+            message=(
+                f"Você está {FOCUS_SHIFT_ALERT_MARKER}. Existe uma oportunidade maior de "
+                f"R$ {format_brl(worst_offender.opportunity_cost)}."
+            ),
+        )
+    )
+    return True

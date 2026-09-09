@@ -107,6 +107,17 @@ class WorkdaySummaryResponse(BaseModel):
     top_revenue_action: str | None = None
     top_revenue_industry: str | None = None
     top_revenue_company_size: str | None = None
+    # Revenue-maximization round. lost_opportunity_today sums
+    # opportunity_cost (Task 1, scoring.py) across leads not touched today
+    # (days_since_last_activity >= 1) — reuses the same already-scored
+    # `ranked` list this endpoint already computes, zero extra query.
+    # top_revenue_combination is compute_revenue_attribution()'s own
+    # top_combination (Task 4) — the single "action | industry |
+    # company_size" pattern generating the most real revenue org-wide,
+    # reusing the same revenue_attribution call already made above for
+    # top_revenue_action/industry/company_size.
+    lost_opportunity_today: int = 0
+    top_revenue_combination: str | None = None
 
 
 class EnforcementStateResponse(BaseModel):
@@ -256,7 +267,14 @@ class WorkdayTargetResponse(BaseModel):
     current_expected reuses the same expected_value-summed-over-today's-
     actionable-leads figure WorkdaySummaryResponse.today_potential_revenue
     already computes; gap is simply the difference, positive when behind
-    target."""
+    target.
+
+    Revenue Acceleration Mode (Task 3) — acceleration_mode is this
+    endpoint's own precise `gap > 5000` check, computed directly from the
+    same gap above (distinct from — and more precise than —
+    compute_acceleration_mode()'s own cheap approximation that scoring.py
+    uses internally; see that function's own docstring for why the two
+    can't share one computation)."""
 
     daily_target: int
     completed_today: int
@@ -265,3 +283,4 @@ class WorkdayTargetResponse(BaseModel):
     daily_target_revenue: float = 0.0
     current_expected: int = 0
     gap: float = 0.0
+    acceleration_mode: bool = False

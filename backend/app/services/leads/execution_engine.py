@@ -145,6 +145,13 @@ _AUTO_EXECUTE_DAILY_LIMIT = 10
 # display sentence, this one gates a real mutation, and the two shouldn't
 # silently move together just because they happen to share a number today.
 _AUTO_EXECUTE_MEETING_WIN_PROBABILITY = 80
+# Revenue Acceleration Mode's own relaxation of the overdue check above
+# (Task 3, revenue-maximization round) — "allow schedule_meeting even if
+# slightly overdue," bounded to a small grace window rather than dropping
+# the overdue check entirely: unbounded tolerance would contradict this
+# codebase's own "safe, bounded automation" precedent every other auto-
+# execution rule already follows.
+_ACCELERATION_MEETING_OVERDUE_GRACE_DAYS = 1
 
 # auto_execute_engine()'s own event-type vocabulary — an ADDITIONAL marker
 # on top of (not a replacement for) whatever execute_lead_action() below
@@ -189,6 +196,13 @@ async def auto_execute_engine(
          without being overdue, and win_probability >= 80 doesn't
          preclude that). A critical lead needs the forced call_now
          escalation, never a quietly auto-scheduled meeting instead.
+         Revenue Acceleration Mode (Task 3, revenue-maximization round)
+         relaxes the "not overdue" half of this rule to "not overdue by
+         more than _ACCELERATION_MEETING_OVERDUE_GRACE_DAYS" whenever
+         response.acceleration_mode is true — LeadResponse's own global
+         flag (see that field's own docstring, schemas/leads/lead.py),
+         read straight from the already-scored `leads` list rather than a
+         second DB round-trip.
 
     call_now is never auto-executed — no rule above ever produces it.
 
@@ -233,11 +247,17 @@ async def auto_execute_engine(
         if response.id in already_executed_lead_ids:
             continue
 
+        is_within_overdue_grace = not response.is_overdue or (
+            response.acceleration_mode
+            and response.days_overdue is not None
+            and response.days_overdue <= _ACCELERATION_MEETING_OVERDUE_GRACE_DAYS
+        )
+
         if response.ready_to_send_message is not None:
             candidates.append((response, "send_message"))
         elif (
             response.deal_risk_level != "critical"
-            and not response.is_overdue
+            and is_within_overdue_grace
             and response.win_probability >= _AUTO_EXECUTE_MEETING_WIN_PROBABILITY
         ):
             candidates.append((response, "schedule_meeting"))

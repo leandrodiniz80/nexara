@@ -235,6 +235,49 @@ _FORECAST_OVERDUE_DECAY = 0.6
 _FORECAST_IDLE_DECAY = 0.7
 _FORECAST_IDLE_DECAY_DAYS = 3
 
+# Revenue-maximization round — Opportunity Cost Engine's own bar (Task 1):
+# the prompt's own number. "Being interacted with" has no real "selected
+# in the UI" signal reaching scoring at all (no such state is ever sent to
+# this backend), so this reuses has_recent_manual_activity — already
+# computed per lead for other bonuses above — as the closest available
+# proxy; see score_leads()'s own comment where it's applied.
+_OPPORTUNITY_COST_THRESHOLD = 5000
+_OPPORTUNITY_COST_PENALTY = -40
+
+# Dynamic Deal Reallocation's own risk-tier ordering (Task 2,
+# rank_leads_by_priority()) — a local copy of workday_engine.py's own
+# _RISK_LEVEL_ORDER: that module already imports FROM this one, so the
+# reverse import would be circular — same small-duplicated-constant
+# precedent format_brl's own two independent copies already established.
+_RISK_LEVEL_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+# rank_leads_by_priority()'s own "force to the top" bar (Task 2) — same
+# technique and numbers as build_action_queue()'s own
+# _MONEY_FIRST_THRESHOLD/_MONEY_FIRST_TOP_SLOTS (workday_engine.py), kept
+# as separate constants here since the two functions share no code, just
+# the same prompt-specified numbers.
+_REALLOCATION_FORCE_TOP_VALUE = 10000
+_REALLOCATION_FORCE_TOP_WIN_PROBABILITY = 70
+_REALLOCATION_FORCE_TOP_SLOTS = 3
+
+# Revenue Acceleration Mode's own trigger (Task 3) — see
+# compute_acceleration_mode()'s own docstring for why this is a cheap
+# approximation of the same "gap > 5000" check GET /workday/target
+# computes precisely (workday.py).
+_ACCELERATION_MODE_GAP_THRESHOLD = 5000.0
+_ACCELERATION_MODE_TARGET_WINDOW_DAYS = 7
+# compute_lead_score()'s acceleration-mode bonuses — the prompt's own +20
+# for both signals; both stack independently (a lead can be high-value AND
+# high-probability at once, earning both).
+_ACCELERATION_HIGH_VALUE_BONUS = 20
+_ACCELERATION_HIGH_PROBABILITY_BONUS = 20
+
+# Winner Pattern Replication's own bonus (Task 4) — the single largest
+# per-lead bonus in this file: matching the org's own single best-proven
+# (action, industry, company_size) combination is a stronger, more
+# specific signal than any of the broader "matches a learned dimension"
+# bonuses above.
+_WINNER_PATTERN_BONUS = 25
+
 
 def compute_win_probability(
     lead: Lead, *, has_recent_manual_activity: bool, task_completed_recently: bool, now: datetime
@@ -393,6 +436,10 @@ def compute_lead_score(
     message_success_rate: float | None,
     top_revenue_action: str | None,
     is_low_potential: bool,
+    opportunity_cost: int,
+    is_high_opportunity_cost: bool,
+    acceleration_mode: bool,
+    top_combination: str | None,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -742,6 +789,68 @@ def compute_lead_score(
         )
         total += _REVENUE_LEARNING_BONUS
 
+    # Revenue-maximization round — Opportunity Cost Engine (Task 1): a
+    # bigger single penalty than any of the learned-channel bonuses above,
+    # on purpose — actively working a lead while a much bigger one
+    # (> _OPPORTUNITY_COST_THRESHOLD more expected_value) sits neglected is
+    # a harder, more concrete signal than any "matches a learned pattern"
+    # bonus. is_high_opportunity_cost is computed once by score_leads()
+    # (has_recent_manual_activity is its own "being interacted with" proxy
+    # — see that function's own comment for why there's no real "selected
+    # in the UI" signal to check instead).
+    if is_high_opportunity_cost:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="Você está deixando de focar em leads que podem gerar mais R$",
+                impact=_OPPORTUNITY_COST_PENALTY,
+            )
+        )
+        total += _OPPORTUNITY_COST_PENALTY
+
+    # Revenue Acceleration Mode (Task 3) — when the org is meaningfully
+    # behind its daily revenue target (compute_acceleration_mode()), every
+    # high-value or high-probability lead gets an extra push, additive on
+    # top of (not instead of) this function's own existing high-value/
+    # high-probability bonuses above: the system leaning harder into
+    # whatever already looks winnable, rather than spreading effort evenly,
+    # while the org is playing catch-up.
+    if acceleration_mode:
+        if expected_value >= HIGH_VALUE_LEAD_THRESHOLD:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Modo aceleração: lead de alto valor",
+                    impact=_ACCELERATION_HIGH_VALUE_BONUS,
+                )
+            )
+            total += _ACCELERATION_HIGH_VALUE_BONUS
+        if win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Modo aceleração: alta probabilidade de fechamento",
+                    impact=_ACCELERATION_HIGH_PROBABILITY_BONUS,
+                )
+            )
+            total += _ACCELERATION_HIGH_PROBABILITY_BONUS
+
+    # Winner Pattern Replication (Task 4) — compute_revenue_attribution()'s
+    # own top_combination (whichever action+industry+company_size has
+    # generated the most real revenue org-wide). Rebuilt here from this
+    # lead's own action_type argument plus lead.enrichment_data rather than
+    # passed in pre-built, since only this function has both at once.
+    if top_combination is not None and lead.enrichment_data:
+        industry = lead.enrichment_data.get("industry")
+        company_size = lead.enrichment_data.get("company_size")
+        action_label = ACTION_TYPE_TO_REVENUE_LABEL.get(action_type)
+        if action_label and industry and company_size:
+            lead_combination = f"{action_label} | {industry} | {company_size}"
+            if lead_combination == top_combination:
+                breakdown.append(
+                    ScoreBreakdownItem(
+                        reason="Segue padrão que mais gera receita", impact=_WINNER_PATTERN_BONUS
+                    )
+                )
+                total += _WINNER_PATTERN_BONUS
+
     # Autonomous-sales-OS round — intelligent pipeline pruning: a lead
     # this unlikely to close (win_probability), this small even if it did
     # (expected_value), and this neglected (days_since_last_activity) has
@@ -1067,6 +1176,16 @@ async def compute_revenue_attribution(
     toward revenue_by_industry/revenue_by_company_size below, since those
     two don't depend on the action link at all.
 
+    Winner Pattern Replication (Task 4, revenue-maximization round) adds
+    top_combination: the single "action | industry | company_size" string
+    (e.g. "call | Technology | 500+" — " | " chosen over "+" as the
+    delimiter since a company_size value like "500+" already contains a
+    literal "+") with the most attributed revenue behind it. Unlike
+    revenue_by_industry/revenue_by_company_size, a combination DOES need
+    the action link — "action" is literally part of the key — so a
+    converted lead with no qualifying action_* event never contributes one,
+    same as revenue_by_action itself.
+
     Two queries regardless of org size: one Lead scan (converted, this
     org), one LeadActivityLog scan scoped to just those leads' ids."""
     converted_stmt = select(Lead).where(
@@ -1079,6 +1198,7 @@ async def compute_revenue_attribution(
     revenue_by_action = {"call": 0.0, "message": 0.0, "meeting": 0.0}
     revenue_by_industry: dict[str, float] = {}
     revenue_by_company_size: dict[str, float] = {}
+    revenue_by_combination: dict[str, float] = {}
 
     if not converted_leads:
         return RevenueAttributionResponse(
@@ -1115,24 +1235,33 @@ async def compute_revenue_attribution(
             continue
 
         event_type = last_action_event_type.get(lead.id)
+        label = None
         if event_type is not None:
             label = REVENUE_ACTION_LABEL_BY_EVENT_TYPE[event_type]
             revenue_by_action[label] += value
 
         if lead.enrichment_data:
             industry = lead.enrichment_data.get("industry")
+            company_size = lead.enrichment_data.get("company_size")
             if industry:
                 revenue_by_industry[industry] = revenue_by_industry.get(industry, 0.0) + value
-            company_size = lead.enrichment_data.get("company_size")
             if company_size:
                 revenue_by_company_size[company_size] = (
                     revenue_by_company_size.get(company_size, 0.0) + value
                 )
+            if label and industry and company_size:
+                combination = f"{label} | {industry} | {company_size}"
+                revenue_by_combination[combination] = (
+                    revenue_by_combination.get(combination, 0.0) + value
+                )
+
+    top_combination = top_revenue_bucket(revenue_by_combination) if revenue_by_combination else None
 
     return RevenueAttributionResponse(
         revenue_by_action=revenue_by_action,
         revenue_by_industry=revenue_by_industry,
         revenue_by_company_size=revenue_by_company_size,
+        top_combination=top_combination,
     )
 
 
@@ -1192,6 +1321,74 @@ async def compute_revenue_summary(
     return revenue_generated_today, avg_revenue_per_conversion
 
 
+async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> bool:
+    """Revenue Acceleration Mode's own trigger (Task 3, revenue-
+    maximization round) — true whenever the org looks more than
+    _ACCELERATION_MODE_GAP_THRESHOLD behind its daily revenue target.
+    Deliberately a cheap, independent approximation, NOT the same precise
+    gap GET /workday/target reports (see that endpoint's own
+    daily_target_revenue/current_expected, workday.py, for the
+    authoritative figure driving the frontend's banner): computing the
+    precise version here would need rank_leads_by_priority()'s own fully-
+    scored candidate pool, but rank_leads_by_priority() is itself the
+    function that calls score_leads() — the one place this flag actually
+    needs to reach — so a direct dependency would be circular.
+
+    daily_target_revenue below is the same 7-day "lead_won" average that
+    endpoint also computes. current_expected is a lighter stand-in:
+    win_probability computed fresh (compute_win_probability(), assuming no
+    recent manual activity or task completion — checking those here would
+    mean re-deriving most of score_leads() itself) for just the leads due
+    today or already overdue, summed. Rougher than the authoritative
+    figure, but the same "close enough to act on" bar this codebase's
+    other proxies already accept (see money_saved_today's own docstring,
+    workday.py).
+
+    Two queries: one lead_won id scan (7-day window) plus its leads' own
+    row-fetch for daily_target_revenue, one due-today/overdue Lead row-
+    fetch for current_expected."""
+    now = datetime.now(timezone.utc)
+    today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    target_cutoff = now - timedelta(days=_ACCELERATION_MODE_TARGET_WINDOW_DAYS)
+
+    won_ids_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type == "lead_won",
+            LeadActivityLog.created_at >= target_cutoff,
+        )
+    )
+    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
+    daily_target_revenue = 0.0
+    if won_ids:
+        won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
+        won_leads = (await db.execute(won_leads_stmt)).scalars().all()
+        daily_target_revenue = (
+            sum(get_lead_estimated_value(lead) for lead in won_leads)
+            / _ACCELERATION_MODE_TARGET_WINDOW_DAYS
+        )
+
+    due_stmt = select(Lead).where(
+        Lead.organization_id == organization_id,
+        Lead.deleted_at.is_(None),
+        Lead.status.notin_(("converted", "lost")),
+        Lead.next_action_due_at.isnot(None),
+        Lead.next_action_due_at < today_end,
+    )
+    due_leads = (await db.execute(due_stmt)).scalars().all()
+    current_expected = 0
+    for lead in due_leads:
+        win_probability = compute_win_probability(
+            lead, has_recent_manual_activity=False, task_completed_recently=False, now=now
+        )
+        current_expected += round(get_lead_estimated_value(lead) * win_probability / 100)
+
+    gap = daily_target_revenue - current_expected
+    return gap > _ACCELERATION_MODE_GAP_THRESHOLD
+
+
 def build_priority_reason(
     lead: Lead,
     *,
@@ -1200,6 +1397,7 @@ def build_priority_reason(
     days_idle: int,
     is_overdue: bool,
     is_low_potential: bool = False,
+    is_high_opportunity_cost: bool = False,
 ) -> str:
     """"Why this lead?" (feedback-loop round) — one ready-to-render
     sentence explaining the same signals score_leads() already computed for
@@ -1211,13 +1409,19 @@ def build_priority_reason(
     through from score_leads() — same criteria as compute_lead_score()'s
     own pruning penalty) always wins the sentence outright when true: a
     lead with no real revenue potential left doesn't need its other,
-    now-moot signals (value/probability/idle) listed alongside it."""
+    now-moot signals (value/probability/idle) listed alongside it.
+    is_high_opportunity_cost (revenue-maximization round's Opportunity Cost
+    Engine, Task 1) is checked next, same "outright override" treatment —
+    it's a stronger, more actionable signal than any of the composed
+    clauses below."""
     if lead.status == "converted":
         return "Lead convertido — nada a fazer."
     if lead.status == "lost":
         return "Lead perdido — nada a fazer."
     if is_low_potential:
         return "Lead sem potencial de receita — recomendado descarte."
+    if is_high_opportunity_cost:
+        return "Você está deixando de focar em leads que podem gerar mais R$."
 
     clauses: list[str] = []
     if estimated_value >= HIGH_VALUE_LEAD_THRESHOLD:
@@ -1301,6 +1505,7 @@ def compute_action_type_and_urgency(
     *,
     expected_value: int = 0,
     top_revenue_action: str | None = None,
+    acceleration_mode: bool = False,
 ) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
@@ -1327,13 +1532,24 @@ def compute_action_type_and_urgency(
     "for high-value leads" qualifier — a small deal doesn't warrant the
     extra weight of booking a meeting just because meetings convert well
     elsewhere). Urgency is left exactly as risk_level would have set it in
-    every case: this shift changes WHICH channel to use, never how urgently."""
+    every case: this shift changes WHICH channel to use, never how urgently.
+
+    Revenue Acceleration Mode (Task 3, revenue-maximization round): once
+    compute_acceleration_mode() reports the org is meaningfully behind its
+    daily revenue target, every remaining non-critical, non-terminal lead
+    is forced to call_now at "high" urgency — checked right after the
+    "critical" tier's own call_now above (still absolute: an emergency
+    escalation outranks a blanket policy) but before the revenue-
+    attribution strategy shift, since "call everything now, we're behind"
+    is a stronger, more urgent signal than a learned channel preference."""
     if lead.status == "lost":
         return "drop_lead", "low"
     if lead.status == "converted":
         return None, None
     if risk_level == "critical":
         return "call_now", "immediate"
+    if acceleration_mode:
+        return "call_now", "high"
 
     urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
 
@@ -1353,10 +1569,11 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
     LeadResponse.model_validate(lead) every lead-returning endpoint used
-    before this. Up to eleven extra queries total (recent automation
+    before this. Up to thirteen extra queries total (recent automation
     activity, recent manual activity, compute_conversion_insights()'s own
     two, compute_response_metrics()'s own one, compute_action_effectiveness()'s
-    own two, compute_revenue_attribution()'s own two, one covering both
+    own two, compute_revenue_attribution()'s own two, compute_acceleration_mode()'s
+    own two (revenue-maximization round), one covering both
     lead_response_state and has_pending_response/response_delay_minutes,
     plus one for days_since_last_activity) for the whole batch, regardless
     of how many leads are passed in — no N+1."""
@@ -1377,6 +1594,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     action_effectiveness = await compute_action_effectiveness(db, organization_id)
     revenue_attribution = await compute_revenue_attribution(db, organization_id)
     top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
+    top_combination = revenue_attribution.top_combination
+    acceleration_mode = await compute_acceleration_mode(db, organization_id)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -1447,25 +1666,40 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     )
     last_activity_by_lead = dict((await db.execute(last_activity_stmt)).all())
 
-    responses = []
+    # Opportunity Cost Engine (Task 1, revenue-maximization round) — needs
+    # every lead's own win_probability/expected_value to find this batch's
+    # single highest expected_value before the main loop below can compute
+    # each lead's opportunity_cost against it. Both are pure, cheap
+    # functions (no DB access), so precomputing them here just means the
+    # main loop reads from these dicts instead of recomputing the same
+    # values a second time.
+    win_probability_by_lead_id: dict = {}
+    expected_value_by_lead_id: dict = {}
     for lead in leads:
-        is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
-        days_overdue = (now - lead.next_action_due_at).days if is_overdue else None
-        days_idle = (now - lead.updated_at).days
-
         win_probability = compute_win_probability(
             lead,
             has_recent_manual_activity=lead.id in recent_manual_activity_ids,
             task_completed_recently=lead.id in recent_task_completed_ids,
             now=now,
         )
-        # Both always exact whole numbers: estimated_value is one of
-        # 0/1000/5000/20000, win_probability an integer 0-100, so their
-        # product divided by 100 never leaves a fraction — round() is just
-        # a guard against float imprecision (e.g. 5000 * 42 / 100), not a
-        # real rounding decision.
+        win_probability_by_lead_id[lead.id] = win_probability
+        expected_value_by_lead_id[lead.id] = round(
+            get_lead_estimated_value(lead) * win_probability / 100
+        )
+    highest_expected_value = max(expected_value_by_lead_id.values(), default=0)
+
+    responses = []
+    for lead in leads:
+        is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
+        days_overdue = (now - lead.next_action_due_at).days if is_overdue else None
+        days_idle = (now - lead.updated_at).days
+
+        win_probability = win_probability_by_lead_id[lead.id]
+        expected_value = expected_value_by_lead_id[lead.id]
+        # estimated_value (raw, unweighted) is still needed on its own
+        # below — same cheap, pure function the precompute pass above
+        # already called once per lead.
         estimated_value = get_lead_estimated_value(lead)
-        expected_value = round(estimated_value * win_probability / 100)
 
         latest_response = latest_response_by_lead.get(lead.id)
         lead_response_state = (
@@ -1510,6 +1744,20 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             and days_since_last_activity > _PRUNE_IDLE_DAYS_THRESHOLD
         )
 
+        # Opportunity Cost Engine (Task 1, revenue-maximization round) —
+        # how much more this org's single highest-value lead is worth than
+        # this one. is_high_opportunity_cost also requires this lead to be
+        # the one actually getting attention right now — has_recent_manual_
+        # activity is the closest available proxy for "being interacted
+        # with" (no "selected in the UI" signal reaches this backend at
+        # all), so it stands in for that half of the prompt's own
+        # condition.
+        opportunity_cost = highest_expected_value - expected_value
+        is_high_opportunity_cost = (
+            opportunity_cost > _OPPORTUNITY_COST_THRESHOLD
+            and lead.id in recent_manual_activity_ids
+        )
+
         # Moved ahead of compute_lead_score()/compute_next_best_action()
         # (execution-engine round): both now need deal_risk_level (the
         # force-priority rule) and/or action_type (the action-learning
@@ -1526,6 +1774,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             deal_risk_level,
             expected_value=expected_value,
             top_revenue_action=top_revenue_action,
+            acceleration_mode=acceleration_mode,
         )
         if is_low_potential:
             deal_risk_level = "low"
@@ -1553,6 +1802,10 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             message_success_rate=action_effectiveness.message_success_rate,
             top_revenue_action=top_revenue_action,
             is_low_potential=is_low_potential,
+            opportunity_cost=opportunity_cost,
+            is_high_opportunity_cost=is_high_opportunity_cost,
+            acceleration_mode=acceleration_mode,
+            top_combination=top_combination,
             now=now,
         )
 
@@ -1578,6 +1831,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             days_idle=days_idle,
             is_overdue=is_overdue,
             is_low_potential=is_low_potential,
+            is_high_opportunity_cost=is_high_opportunity_cost,
         )
 
         # Execution-assistance round — "ready to just do it" gate. Not its
@@ -1612,6 +1866,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "has_pending_response": has_pending_response,
                     "response_delay_minutes": response_delay_minutes,
                     "days_since_last_activity": days_since_last_activity,
+                    "opportunity_cost": opportunity_cost,
+                    "acceleration_mode": acceleration_mode,
                 }
             )
         )
@@ -1625,19 +1881,27 @@ _PRIORITY_CANDIDATE_POOL_SIZE = 200
 
 
 async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list[LeadResponse]:
-    """Same urgency bucketing as GET /leads/priority (overdue tasks first,
-    then due today, then future-dated, then no next_action at all),
-    factored out so the workday command-mode engine
-    (get_next_actionable_lead(), workday_engine.py) can reuse it without a
-    second, separately-maintained copy of the bucket logic. Deliberately
-    duplicates GET /leads/priority's own inline implementation rather than
-    having that endpoint call this — it's already shipped and working, and
-    this round's mandate is zero regression on existing routes.
+    """Dynamic Deal Reallocation (Task 2, revenue-maximization round)
+    replaces this function's original urgency-bucket-first ordering
+    (overdue tasks first, then due today, then future-dated, then no
+    next_action at all — still what GET /leads/priority's own separate
+    inline implementation uses, untouched by this round's mandate of zero
+    regression on existing routes) with a revenue-first key: deal_risk_level
+    (critical first) > expected_value DESC > win_probability DESC >
+    opportunity_cost DESC > score DESC. This is a deliberate behavior
+    change, not an addition — "worst-off first" is no longer this
+    function's own priority, "highest revenue first" is. Callers that still
+    want the original ordering (GET /leads/priority) already have their
+    own separate implementation, unaffected; get_next_actionable_lead()
+    (workday_engine.py, POST /workday/complete-and-next) now hands back
+    whichever lead maximizes revenue rather than whichever is most overdue.
 
-    Within each urgency bucket, ordering is money-first (revenue-
-    intelligence round): expected_value DESC, then win_probability DESC,
-    then the base score DESC as a final tiebreaker — "money × probability ×
-    urgency" instead of urgency-then-score alone."""
+    Money-first override on top: any lead worth >=
+    _REALLOCATION_FORCE_TOP_VALUE with win_probability >=
+    _REALLOCATION_FORCE_TOP_WIN_PROBABILITY is pulled into the very top
+    _REALLOCATION_FORCE_TOP_SLOTS positions regardless of risk tier — same
+    technique build_action_queue()'s own money-first override
+    (workday_engine.py) already uses."""
     candidate_pool_stmt = (
         select(Lead)
         .where(
@@ -1651,25 +1915,25 @@ async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list
     candidates = (await db.execute(candidate_pool_stmt)).scalars().all()
 
     scored = await score_leads(db, candidates)
-    now = datetime.now(timezone.utc)
-
-    def bucket(response: LeadResponse) -> int:
-        due = response.next_action_due_at
-        if due is None:
-            return 3
-        if response.is_overdue:
-            return 0
-        return 1 if due.date() == now.date() else 2
 
     scored.sort(
         key=lambda response: (
-            bucket(response),
+            -_RISK_LEVEL_ORDER.get(response.deal_risk_level, 0),
             -response.expected_value,
             -response.win_probability,
+            -response.opportunity_cost,
             -response.score,
         )
     )
-    return scored
+
+    forced = [
+        response
+        for response in scored
+        if response.expected_value >= _REALLOCATION_FORCE_TOP_VALUE
+        and response.win_probability >= _REALLOCATION_FORCE_TOP_WIN_PROBABILITY
+    ][:_REALLOCATION_FORCE_TOP_SLOTS]
+    forced_ids = {response.id for response in forced}
+    return forced + [response for response in scored if response.id not in forced_ids]
 
 
 def compute_forecast_value(response: LeadResponse) -> float:

@@ -47,6 +47,7 @@ from app.services.leads.workday_engine import (
     get_next_actionable_lead,
     get_next_mandatory_lead,
     maybe_notify_critical_deals,
+    maybe_notify_focus_shift,
     maybe_notify_high_revenue_opportunity,
     maybe_notify_high_value_leads,
     maybe_notify_ignored_leads,
@@ -75,6 +76,15 @@ _DEFAULT_DAILY_TARGET = 5
 # a rarer signal; a week is enough here since conversions are the much
 # more frequent event being averaged).
 _DAILY_TARGET_REVENUE_WINDOW_DAYS = 7
+# Revenue Acceleration Mode's own trigger (Task 3, revenue-maximization
+# round) — this endpoint's own precise `gap > 5000` check, computed
+# directly from the accurate gap just above. Kept as its own local
+# constant, same value as scoring.py's compute_acceleration_mode() own
+# _ACCELERATION_MODE_GAP_THRESHOLD, rather than importing it — that one is
+# a cheap approximation feeding a different consumer (score_leads()); see
+# WorkdayTargetResponse's own docstring for why the two can't share one
+# computation.
+_ACCELERATION_MODE_GAP_THRESHOLD = 5000.0
 
 # Below this computed score, a lead is "low enough" to qualify for the
 # workday queue even with no next_action set — roughly the midpoint of the
@@ -528,6 +538,20 @@ def _compute_response_and_pipeline_pressure(
     return pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value
 
 
+def _compute_lost_opportunity_today(ranked: list[LeadResponse]) -> int:
+    """"Oportunidade perdida hoje" (Task 6, revenue-maximization round) —
+    sum of opportunity_cost (Task 1, scoring.py) across leads not touched
+    today (days_since_last_activity >= 1): leads sitting idle right now,
+    weighted by how much revenue upside each one represents versus the
+    org's single highest-value lead. Reuses whatever rank_leads_by_priority()
+    already scored, zero extra query."""
+    return sum(
+        response.opportunity_cost
+        for response in ranked
+        if response.days_since_last_activity >= 1 and response.status not in ("converted", "lost")
+    )
+
+
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -539,12 +563,13 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Nine queries total, none per-row (up to 6 more, conditional: one dedup
+    Nine queries total, none per-row (up to 7 more, conditional: one dedup
     check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()/
     maybe_notify_ignored_leads()/maybe_notify_pipeline_risk()/
-    maybe_notify_high_revenue_opportunity(), one Lead row-fetch for
-    auto_execute_engine() (execution_engine.py) — all six only when there's
-    an actual candidate/threshold breach, and the last only when
+    maybe_notify_high_revenue_opportunity()/maybe_notify_focus_shift()
+    (revenue-maximization round), one Lead row-fetch for
+    auto_execute_engine() (execution_engine.py) — all seven only when
+    there's an actual candidate/threshold breach, and the last only when
     settings.AUTO_MODE_ENABLED is even on, which it isn't by default):
     pending_responses_count/high_value_at_risk_count/pipeline_expected_value
     (_compute_response_and_pipeline_pressure) also reuse `ranked`, zero
@@ -625,7 +650,10 @@ async def get_workday_summary(
     )
     # Autonomous-sales-OS round — a no-op while settings.AUTO_MODE_ENABLED
     # is off (the default); see auto_execute_engine()'s own docstring
-    # (execution_engine.py) for its two auto-execution rules and daily cap.
+    # (execution_engine.py) for its two auto-execution rules and daily cap
+    # (its own schedule_meeting overdue-grace relaxation reads
+    # response.acceleration_mode straight off each already-scored `ranked`
+    # entry, no extra parameter needed here).
     auto_executed_count = await auto_execute_engine(db, organization_id, ranked)
     # Sales-operating-system round — two more org-wide nudges, both no-ops
     # most of the time (gated behind their own thresholds) and both reusing
@@ -650,6 +678,12 @@ async def get_workday_summary(
     notified_count += await maybe_notify_high_revenue_opportunity(
         db, organization_id=organization_id, leads=ranked, now=now
     )
+    # Revenue-maximization round (Task 5) — redirects attention away from
+    # low-value leads when a much bigger one sits neglected, reusing the
+    # same `ranked` list.
+    notified_count += await maybe_notify_focus_shift(
+        db, organization_id=organization_id, user_email=user_email, leads=ranked, now=now
+    )
     if notified_count or auto_executed_count:
         await db.commit()
 
@@ -668,6 +702,12 @@ async def get_workday_summary(
     top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
     top_revenue_industry = top_revenue_bucket(revenue_attribution.revenue_by_industry)
     top_revenue_company_size = top_revenue_bucket(revenue_attribution.revenue_by_company_size)
+
+    # Revenue-maximization round (Task 6) — "Oportunidade perdida hoje"
+    # and "Top padrão de receita", both additive/derived at zero extra
+    # query cost from data already computed above.
+    lost_opportunity_today = _compute_lost_opportunity_today(ranked)
+    top_revenue_combination = revenue_attribution.top_combination
 
     return ApiResponse(
         success=True,
@@ -692,6 +732,8 @@ async def get_workday_summary(
             top_revenue_action=top_revenue_action,
             top_revenue_industry=top_revenue_industry,
             top_revenue_company_size=top_revenue_company_size,
+            lost_opportunity_today=lost_opportunity_today,
+            top_revenue_combination=top_revenue_combination,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -1026,6 +1068,7 @@ async def get_workday_target(
     ranked = await rank_leads_by_priority(db, organization_id)
     current_expected = _sum_today_potential_revenue(ranked, now=now)
     gap = daily_target_revenue - current_expected
+    acceleration_mode = gap > _ACCELERATION_MODE_GAP_THRESHOLD
 
     return ApiResponse(
         success=True,
@@ -1037,6 +1080,7 @@ async def get_workday_target(
             daily_target_revenue=daily_target_revenue,
             current_expected=current_expected,
             gap=gap,
+            acceleration_mode=acceleration_mode,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
