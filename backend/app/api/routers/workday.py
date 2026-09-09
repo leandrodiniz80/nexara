@@ -16,11 +16,19 @@ from app.schemas.workday import (
     WorkdayCompleteAndNextRequest,
     WorkdayCompleteAndNextResponse,
     WorkdayNextResponse,
+    WorkdayPerformanceResponse,
     WorkdaySummaryResponse,
 )
 from app.services.leads.enrichment import COMPANY_SIZE_REVENUE_ESTIMATE
 from app.services.leads.scoring import rank_leads_by_priority, score_leads
-from app.services.leads.workday_engine import complete_lead_task, get_next_actionable_lead
+from app.services.leads.workday_engine import (
+    complete_lead_task,
+    detect_user_failure_state,
+    format_brl,
+    generate_accountability_message,
+    get_next_actionable_lead,
+    maybe_notify_performance_alert,
+)
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/workday", tags=["Workday"])
 
@@ -238,12 +246,6 @@ async def get_workday_next(
     )
 
 
-def _format_brl(value: float) -> str:
-    """1234567.0 -> '1.234.567' — pt-BR thousands separator, no decimals
-    (this is a rough estimate, not exact currency)."""
-    return f"{value:,.0f}".replace(",", ".")
-
-
 def _build_focus_message(
     *, overdue_tasks: int, today_tasks: int, leads_at_risk: int, revenue_at_risk: float
 ) -> str:
@@ -255,7 +257,7 @@ def _build_focus_message(
     if overdue_tasks > 0 and revenue_at_risk > 0:
         return (
             f"Você tem {overdue_tasks} leads atrasados e pode perder até "
-            f"R$ {_format_brl(revenue_at_risk)} hoje se não agir."
+            f"R$ {format_brl(revenue_at_risk)} hoje se não agir."
         )
     if overdue_tasks > 0:
         return f"Você tem {overdue_tasks} leads atrasados esperando ação."
@@ -264,6 +266,18 @@ def _build_focus_message(
     if leads_at_risk > 0:
         return f"Você tem {leads_at_risk} leads esfriando sem contato recente."
     return "Nenhuma ação urgente agora — bom momento para prospectar novos leads."
+
+
+async def _count_overdue_tasks(db: AsyncSession, organization_id: str, now: dt) -> int:
+    """Shared by GET /workday/summary and GET /workday/performance — same
+    query, same index (ix_leads_org_id_next_action_due_at)."""
+    stmt = select(func.count(Lead.id)).where(
+        Lead.organization_id == organization_id,
+        Lead.deleted_at.is_(None),
+        Lead.next_action_due_at.isnot(None),
+        Lead.next_action_due_at < now,
+    )
+    return (await db.execute(stmt)).scalar_one()
 
 
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
@@ -301,13 +315,7 @@ async def get_workday_summary(
     )
     today_tasks = (await db.execute(today_tasks_stmt)).scalar_one()
 
-    overdue_tasks_stmt = select(func.count(Lead.id)).where(
-        Lead.organization_id == organization_id,
-        Lead.deleted_at.is_(None),
-        Lead.next_action_due_at.isnot(None),
-        Lead.next_action_due_at < now,
-    )
-    overdue_tasks = (await db.execute(overdue_tasks_stmt)).scalar_one()
+    overdue_tasks = await _count_overdue_tasks(db, organization_id, now)
 
     at_risk_cutoff = now - timedelta(days=_AT_RISK_STALE_AFTER_DAYS)
     at_risk_stmt = (
@@ -396,6 +404,116 @@ async def complete_and_next(
             completed_lead_id=body.lead_id,
             completed_lead=scored_completed,
             next_lead=next_lead,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+# Pool cap on the "ignored yesterday" row fetch (needed for per-lead
+# enrichment_data, not just a count) — same rationale as _AT_RISK_POOL_SIZE.
+_IGNORED_POOL_SIZE = 500
+
+
+@router.get("/performance", response_model=ApiResponse[WorkdayPerformanceResponse])
+async def get_workday_performance(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[WorkdayPerformanceResponse]:
+    """The accountability layer: how much of today's expected work actually
+    got done, what's still overdue, what yesterday's neglect is costing,
+    and the completion streak — collapsed into one failure_state
+    ("on_track"/"at_risk"/"failing") and one accountability_message.
+
+    tasks_expected_today is next_action_due_at <= today (i.e. due by end of
+    today — overdue and due-today combined in one query, since "expected
+    today" includes anything that should already be done). completion_rate
+    is completed/expected (1.0 when nothing was expected — nothing to fail
+    at). leads_ignored_yesterday reads current state only, no historical
+    snapshot needed: a lead whose next_action_due_at was already in the
+    past *before today started* and is still set (not cleared by a
+    completion) is, by definition, still unresolved from at least
+    yesterday — a strict subset of overdue_tasks.
+
+    Six queries total (two inside _workday_stats, two counts, one
+    ignored-leads row fetch for the revenue estimate, one dedup check for
+    the notification), none per-row. Reuses _count_overdue_tasks and
+    _workday_stats (both already used by /next and /summary) instead of
+    re-deriving overdue/streak logic a third time."""
+    start = time.perf_counter()
+    organization_id, user_email = _require_caller(session)
+    now = dt.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+
+    tasks_completed_today, streak_days = await _workday_stats(db, organization_id, user_email, now)
+
+    expected_stmt = select(func.count(Lead.id)).where(
+        Lead.organization_id == organization_id,
+        Lead.deleted_at.is_(None),
+        Lead.next_action_due_at.isnot(None),
+        Lead.next_action_due_at < today_end,
+    )
+    tasks_expected_today = (await db.execute(expected_stmt)).scalar_one()
+    completion_rate = (
+        tasks_completed_today / tasks_expected_today if tasks_expected_today > 0 else 1.0
+    )
+
+    overdue_tasks = await _count_overdue_tasks(db, organization_id, now)
+
+    ignored_stmt = (
+        select(Lead)
+        .where(
+            Lead.organization_id == organization_id,
+            Lead.deleted_at.is_(None),
+            Lead.next_action_due_at.isnot(None),
+            Lead.next_action_due_at < today_start,
+        )
+        .limit(_IGNORED_POOL_SIZE)
+    )
+    ignored_leads = (await db.execute(ignored_stmt)).scalars().all()
+    leads_ignored_yesterday = len(ignored_leads)
+    estimated_revenue_lost = sum(
+        COMPANY_SIZE_REVENUE_ESTIMATE.get(lead.enrichment_data.get("company_size", ""), 0.0)
+        for lead in ignored_leads
+        if lead.enrichment_data
+    )
+
+    failure_state = detect_user_failure_state(
+        completion_rate=completion_rate, overdue_tasks=overdue_tasks
+    )
+    accountability_message = generate_accountability_message(
+        failure_state=failure_state,
+        overdue_tasks=overdue_tasks,
+        leads_ignored_yesterday=leads_ignored_yesterday,
+        estimated_revenue_lost=estimated_revenue_lost,
+        tasks_remaining_today=max(tasks_expected_today - tasks_completed_today, 0),
+    )
+
+    if failure_state == "failing":
+        notified = await maybe_notify_performance_alert(
+            db,
+            organization_id=organization_id,
+            user_email=user_email,
+            message=accountability_message,
+            now=now,
+        )
+        if notified:
+            await db.commit()
+
+    return ApiResponse(
+        success=True,
+        data=WorkdayPerformanceResponse(
+            tasks_completed_today=tasks_completed_today,
+            tasks_expected_today=tasks_expected_today,
+            completion_rate=completion_rate,
+            overdue_tasks=overdue_tasks,
+            leads_ignored_yesterday=leads_ignored_yesterday,
+            estimated_revenue_lost=estimated_revenue_lost,
+            streak_days=streak_days,
+            failure_state=failure_state,
+            accountability_message=accountability_message,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
+from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
+from app.schemas.workday import FailureState
 from app.services.leads.scoring import rank_leads_by_priority
+
+# detect_user_failure_state()'s thresholds — see its own docstring.
+_FAILING_COMPLETION_RATE = 0.3
+_AT_RISK_COMPLETION_RATE = 0.6
+_FAILING_OVERDUE_THRESHOLD = 5
+
+# maybe_notify_performance_alert()'s dedup window — a "failing" alert isn't
+# repeated more often than this, however often the dashboard is refreshed.
+_PERFORMANCE_ALERT_DEDUP_HOURS = 6
 
 
 async def get_next_actionable_lead(
@@ -69,4 +81,84 @@ async def complete_lead_task(
     )
     lead.next_action = None
     lead.next_action_due_at = None
+    return True
+
+
+def format_brl(value: float) -> str:
+    """1234567.0 -> '1.234.567' — pt-BR thousands separator, no decimals
+    (this is a rough estimate, not exact currency). Shared by
+    _build_focus_message (workday.py) and generate_accountability_message
+    below, so the two money-mentioning sentences format it identically."""
+    return f"{value:,.0f}".replace(",", ".")
+
+
+def detect_user_failure_state(*, completion_rate: float, overdue_tasks: int) -> FailureState:
+    """"on_track" / "at_risk" / "failing" — a plain rule table over GET
+    /workday/performance's own completion_rate/overdue_tasks, no ML.
+    completion_rate can run above 1.0 (someone can complete more today than
+    was strictly due today) — that still reads as on_track, which is
+    correct."""
+    if completion_rate < _FAILING_COMPLETION_RATE or overdue_tasks > _FAILING_OVERDUE_THRESHOLD:
+        return "failing"
+    if completion_rate < _AT_RISK_COMPLETION_RATE:
+        return "at_risk"
+    return "on_track"
+
+
+def generate_accountability_message(
+    *,
+    failure_state: FailureState,
+    overdue_tasks: int,
+    leads_ignored_yesterday: int,
+    estimated_revenue_lost: float,
+    tasks_remaining_today: int,
+) -> str:
+    """The Performance Panel's (and Command Center's) headline sentence for
+    the caller's current failure_state — built here, not the frontend, same
+    "backend writes the sentence" rule the timeline/activity feed and
+    _build_focus_message already follow."""
+    if failure_state == "failing":
+        if leads_ignored_yesterday > 0 and estimated_revenue_lost > 0:
+            return (
+                f"Você está deixando dinheiro na mesa. {leads_ignored_yesterday} leads "
+                f"ignorados podem representar R$ {format_brl(estimated_revenue_lost)} perdidos."
+            )
+        return f"Você está atrasado em {overdue_tasks} leads. Aja agora antes que piore."
+    if failure_state == "at_risk":
+        focus_count = max(tasks_remaining_today, 1)
+        return f"Você ainda pode recuperar seu dia. Foque nos próximos {focus_count} leads."
+    return "Bom ritmo. Continue assim para fechar mais negócios hoje."
+
+
+async def maybe_notify_performance_alert(
+    db: AsyncSession, *, organization_id: str, user_email: str, message: str, now: datetime
+) -> bool:
+    """Persists a "failing"-state alert to UserNotification (so it also
+    shows in the notification bell, same channel automation "notify"
+    actions already use) — but only if the caller isn't due for a repeat
+    yet. Deduped on lead_id IS NULL within _PERFORMANCE_ALERT_DEDUP_HOURS:
+    every other notification kind always carries a lead_id (see
+    automation_engine.py's own notify path, which only persists a row when
+    the lead has an owner), so a null lead_id row is unambiguously one of
+    these performance alerts. Caller commits; returns whether a row was
+    actually staged."""
+    cutoff = now - timedelta(hours=_PERFORMANCE_ALERT_DEDUP_HOURS)
+    recent_alert_stmt = select(UserNotification.id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.user_email == user_email,
+        UserNotification.lead_id.is_(None),
+        UserNotification.created_at >= cutoff,
+    )
+    already_sent = (await db.execute(recent_alert_stmt)).scalar_one_or_none()
+    if already_sent is not None:
+        return False
+
+    db.add(
+        UserNotification(
+            organization_id=organization_id,
+            user_email=user_email,
+            lead_id=None,
+            message=message,
+        )
+    )
     return True

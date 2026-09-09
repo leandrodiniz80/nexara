@@ -1,8 +1,11 @@
 import uuid
+from typing import Literal
 
 from pydantic import BaseModel
 
 from app.schemas.leads.lead import LeadResponse
+
+FailureState = Literal["on_track", "at_risk", "failing"]
 
 
 class WorkdayNextResponse(BaseModel):
@@ -50,3 +53,22 @@ class WorkdayCompleteAndNextResponse(BaseModel):
     completed_lead_id: uuid.UUID
     completed_lead: LeadResponse
     next_lead: LeadResponse | None
+
+
+class WorkdayPerformanceResponse(BaseModel):
+    """GET /workday/performance — the accountability layer's own snapshot:
+    how much of today's expected work actually got done, what yesterday's
+    neglect is now costing, and the streak. failure_state/
+    accountability_message are additive beyond the original spec's literal
+    field list — the Performance Panel needs both to render its message and
+    color, and there's no other endpoint that already carries them."""
+
+    tasks_completed_today: int
+    tasks_expected_today: int
+    completion_rate: float
+    overdue_tasks: int
+    leads_ignored_yesterday: int
+    estimated_revenue_lost: float
+    streak_days: int
+    failure_state: FailureState
+    accountability_message: str
