@@ -33,13 +33,19 @@ from app.schemas.leads.lead import (
     LeadTaskCompleteResponse,
     LeadTimelineEntry,
     LeadUpdateStatus,
+    RecordLeadResponseRequest,
     UpdateLeadDetailsRequest,
     UpdateLeadOwnerRequest,
 )
 from app.services.leads.automation_engine import fire_stale_lead_automations, run_automations
 from app.services.leads.enrichment import generate_first_contact_message, simulate_enrichment
 from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
-from app.services.leads.scoring import LOSS_REASON_MARKER, compute_conversion_insights, score_leads
+from app.services.leads.scoring import (
+    LOSS_REASON_MARKER,
+    RESPONSE_EVENT_TYPE_BY_STATE,
+    compute_conversion_insights,
+    score_leads,
+)
 
 logger = logging.getLogger("app.api.routers.leads")
 
@@ -1028,6 +1034,82 @@ async def execute_lead_action_endpoint(
 
     await db.commit()
     await db.refresh(lead)
+
+    (scored_lead,) = await score_leads(db, [lead])
+
+    return ApiResponse(
+        success=True,
+        data=scored_lead,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.post("/{lead_id}/record-response", response_model=ApiResponse[LeadResponse])
+async def record_lead_response(
+    lead_id: uuid.UUID,
+    body: RecordLeadResponseRequest,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[LeadResponse]:
+    """Feedback-loop-of-outcomes round — closes the loop execute-action
+    opened: this is where a real reply gets recorded, so
+    lead_response_state/compute_response_metrics/compute_lead_score
+    (scoring.py) all have real outcomes to learn from instead of
+    assumptions. Logs one LeadActivityLog entry (event_type from
+    RESPONSE_EVENT_TYPE_BY_STATE) with response_time_minutes — timed from
+    this lead's own most recent "message_sent" entry — on duration_seconds,
+    same column execute_lead_action() already writes time-to-close/
+    time-to-respond figures to elsewhere. lead_response_state itself is
+    never written anywhere: score_leads() derives it fresh from this same
+    log on every read (see LeadResponse's own docstring)."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+    user_email = session.get("email")
+    now = datetime.now(timezone.utc)
+
+    lead = await db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    last_message_stmt = (
+        select(LeadActivityLog.created_at)
+        .where(LeadActivityLog.lead_id == lead.id, LeadActivityLog.event_type == "message_sent")
+        .order_by(LeadActivityLog.created_at.desc())
+        .limit(1)
+    )
+    last_message_sent_at = (await db.execute(last_message_stmt)).scalar_one_or_none()
+    response_time_minutes = (
+        max(round((now - last_message_sent_at).total_seconds() / 60), 0)
+        if last_message_sent_at is not None
+        else None
+    )
+
+    message_by_response = {
+        "responded": (
+            f"Lead respondeu em {response_time_minutes} minutos."
+            if response_time_minutes is not None
+            else "Lead respondeu."
+        ),
+        "interested": "Lead demonstrou interesse.",
+        "not_interested": "Lead não tem interesse.",
+    }
+
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type=RESPONSE_EVENT_TYPE_BY_STATE[body.response],
+            message=message_by_response[body.response],
+            user_email=user_email,
+            duration_seconds=(
+                response_time_minutes * 60 if response_time_minutes is not None else None
+            ),
+        )
+    )
+    await db.commit()
 
     (scored_lead,) = await score_leads(db, [lead])
 

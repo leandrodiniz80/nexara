@@ -121,6 +121,17 @@ class LeadResponse(BaseModel):
     # partially-stale value.
     ready_to_send_message: str | None = None
     auto_action_available: bool = False
+    # Feedback-loop-of-outcomes round — derived from LeadActivityLog's
+    # "lead_responded"/"lead_interested"/"lead_rejected" entries (see
+    # POST /leads/{id}/record-response), not a stored column: no migration,
+    # same "encode it in the log, derive it at read time" adaptation
+    # LOSS_REASON_MARKER (scoring.py) already established. "no_response" is
+    # a real, always-populated value here — not a stand-in for null — for
+    # a lead with no response recorded yet. response_time_minutes is only
+    # non-null once a response exists, timed from that lead's most recent
+    # "message_sent" entry.
+    lead_response_state: str = "no_response"
+    response_time_minutes: int | None = None
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
@@ -247,6 +258,32 @@ class ExecuteLeadActionRequest(BaseModel):
     concern worth a plain string for."""
 
     action: Literal["send_message", "call_now", "schedule_meeting"]
+
+
+class RecordLeadResponseRequest(BaseModel):
+    """POST /leads/{id}/record-response — feedback-loop-of-outcomes round.
+    A Literal for the same reason ExecuteLeadActionRequest.action is one:
+    this is the entire fixed vocabulary lead_response_state
+    (score_leads()/scoring.py) ever derives from it."""
+
+    response: Literal["responded", "interested", "not_interested"]
+
+
+class ResponseMetricsResponse(BaseModel):
+    """compute_response_metrics() (scoring.py) — org-wide messaging
+    effectiveness mined from the last 30 days of message_sent/lead_responded/
+    lead_interested/lead_rejected activity, the same "None until there's
+    real signal" rule ConversionInsightsResponse already follows.
+    best_response_industry feeds compute_lead_score()'s own "Matches
+    high-response segment" bonus, beyond this round's literal response_rate/
+    interest_rate/avg_response_time_minutes ask — exposed here too since a
+    future Learning Panel extension will want it, and it's already computed
+    as part of the same pass."""
+
+    response_rate: float = 0.0
+    interest_rate: float = 0.0
+    avg_response_time_minutes: float | None = None
+    best_response_industry: str | None = None
 
 
 class ConversionInsightsResponse(BaseModel):

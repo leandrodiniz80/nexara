@@ -64,6 +64,14 @@ class WorkdaySummaryResponse(BaseModel):
     # include a manual "Enviar agora" click (POST /leads/{id}/execute-action),
     # which this field deliberately excludes: "auto" means auto.
     auto_actions_executed_today: int = 0
+    # Feedback-loop-of-outcomes round — the Command Center's "X% das suas
+    # mensagens recebem resposta": compute_response_metrics()'s own 30-day
+    # response_rate (scoring.py), reused as-is rather than a second,
+    # today-only figure — a single day of sends is too small a sample to
+    # headline with (see WorkdayPerformanceResponse.response_rate_today
+    # below for the sharper, noisier daily number the Performance Panel
+    # shows instead).
+    response_rate: float = 0.0
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):
@@ -119,6 +127,12 @@ class WorkdayPerformanceResponse(BaseModel):
     # Same auto-send-only count as WorkdaySummaryResponse.auto_actions_executed_today
     # above — the Performance Panel's own "ações automatizadas hoje".
     auto_actions_executed_today: int = 0
+    # Feedback-loop-of-outcomes round — today-only counterpart to
+    # WorkdaySummaryResponse.response_rate above (that one's a steadier
+    # 30-day figure for the Command Center's headline; these are the day's
+    # own raw numbers for the accountability layer).
+    response_rate_today: float = 0.0
+    responses_received_today: int = 0
 
 
 class WorkdayTargetResponse(BaseModel):

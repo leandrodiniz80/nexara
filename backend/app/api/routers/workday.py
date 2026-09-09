@@ -24,7 +24,7 @@ from app.schemas.workday import (
 )
 from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
 from app.services.leads.execution_engine import AUTO_EXECUTION_NOTIFICATION_PREFIX, maybe_auto_execute
-from app.services.leads.scoring import rank_leads_by_priority, score_leads
+from app.services.leads.scoring import compute_response_metrics, rank_leads_by_priority, score_leads
 from app.services.leads.workday_engine import (
     complete_lead_task,
     detect_user_failure_state,
@@ -381,6 +381,35 @@ async def _count_auto_actions_today(db: AsyncSession, organization_id: str, toda
     return (await db.execute(stmt)).scalar_one()
 
 
+async def _compute_response_metrics_today(
+    db: AsyncSession, organization_id: str, today_start: dt
+) -> tuple[float, int]:
+    """(response_rate_today, responses_received_today) — feedback-loop-of-
+    outcomes round. Today-only counterpart to compute_response_metrics()'s
+    steadier 30-day figure (scoring.py): same message_sent vs. response-type
+    event_type split, just scoped to today and without the industry
+    breakdown that endpoint's best_response_industry needs. One query."""
+    stmt = select(LeadActivityLog.event_type, func.count(LeadActivityLog.id)).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type.in_(
+            ["message_sent", "lead_responded", "lead_interested", "lead_rejected"]
+        ),
+        LeadActivityLog.created_at >= today_start,
+    ).group_by(LeadActivityLog.event_type)
+    counts = dict((await db.execute(stmt)).all())
+
+    sent_today = counts.get("message_sent", 0)
+    responses_received_today = (
+        counts.get("lead_responded", 0)
+        + counts.get("lead_interested", 0)
+        + counts.get("lead_rejected", 0)
+    )
+    response_rate_today = (
+        round(responses_received_today / sent_today * 100, 1) if sent_today else 0.0
+    )
+    return response_rate_today, responses_received_today
+
+
 async def _maybe_auto_execute_critical_deals(
     db: AsyncSession, organization_id: str, ranked: list[LeadResponse]
 ) -> int:
@@ -504,6 +533,7 @@ async def get_workday_summary(
         await db.commit()
 
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
+    response_metrics = await compute_response_metrics(db, organization_id)
 
     return ApiResponse(
         success=True,
@@ -520,6 +550,7 @@ async def get_workday_summary(
             money_at_risk_today=money_at_risk_today,
             critical_deals_count=critical_deals_count,
             auto_actions_executed_today=auto_actions_executed_today,
+            response_rate=response_metrics.response_rate,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -652,6 +683,9 @@ async def get_workday_performance(
     _money_at_risk_today, critical_deals = _compute_deal_risk_summary(ranked)
     money_saved_today = await _compute_money_saved_today(db, organization_id, today_start)
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
+    response_rate_today, responses_received_today = await _compute_response_metrics_today(
+        db, organization_id, today_start
+    )
 
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks
@@ -692,6 +726,8 @@ async def get_workday_performance(
             critical_deals=critical_deals,
             money_saved_today=money_saved_today,
             auto_actions_executed_today=auto_actions_executed_today,
+            response_rate_today=response_rate_today,
+            responses_received_today=responses_received_today,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

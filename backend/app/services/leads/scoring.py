@@ -9,7 +9,12 @@ from app.core.config import settings
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
-from app.schemas.leads.lead import ConversionInsightsResponse, LeadResponse, ScoreBreakdownItem
+from app.schemas.leads.lead import (
+    ConversionInsightsResponse,
+    LeadResponse,
+    ResponseMetricsResponse,
+    ScoreBreakdownItem,
+)
 from app.services.leads.enrichment import (
     ACTION_CLOSE_DEAL,
     ACTION_FIRST_CONTACT,
@@ -86,6 +91,37 @@ _DEAL_RISK_HIGH_WIN_PROBABILITY = 60
 # contribution).
 _CONVERSION_PROFILE_INDUSTRY_BONUS = 10
 _CONVERSION_PROFILE_COMPANY_SIZE_BONUS = 8
+
+# Feedback-loop-of-outcomes round — maps a LeadActivityLog event_type to the
+# lead_response_state it represents (LeadResponse/scoring.py's own "derived,
+# no migration" field — see that model's own docstring). "message_sent" is
+# deliberately absent: it's what response_time_minutes is timed *from*, not
+# a response state itself.
+RESPONSE_STATE_BY_EVENT_TYPE = {
+    "lead_responded": "responded",
+    "lead_interested": "interested",
+    "lead_rejected": "not_interested",
+}
+# The reverse of the mapping above — POST /leads/{id}/record-response
+# (leads.py) uses this to turn its own request body's `response` back into
+# the event_type it logs, so the two directions can't drift out of sync.
+RESPONSE_EVENT_TYPE_BY_STATE = {state: event_type for event_type, state in RESPONSE_STATE_BY_EVENT_TYPE.items()}
+# compute_response_metrics()'s reporting window — the prompt's own number,
+# a stable-enough sample without going stale the way an all-time rate would
+# as messaging habits/segments shift.
+_RESPONSE_METRICS_WINDOW_DAYS = 30
+# compute_lead_score()'s response-outcome bonuses/penalty — a real "the
+# market told us" signal, so both outweigh every purely-behavioral line
+# above (the biggest of which is -30, matched here so a rejection is never
+# a *smaller* deal than "task overdue").
+_INTERESTED_SCORE_BONUS = 25
+_NOT_INTERESTED_SCORE_PENALTY = -30
+# compute_lead_score()'s "matches the org's best-responding segment" bonus
+# — same magnitude as the feedback-loop round's own adaptive-scoring
+# industry bonus (_CONVERSION_PROFILE_INDUSTRY_BONUS), since this is the
+# same kind of learned-not-hardcoded signal, just for response rate instead
+# of conversion.
+_RESPONSE_SEGMENT_BONUS = 10
 
 
 def compute_win_probability(
@@ -189,15 +225,18 @@ def compute_lead_score(
     has_recent_manual_activity: bool,
     task_completed_recently: bool,
     insights: ConversionInsightsResponse,
+    lead_response_state: str,
+    best_response_industry: str | None,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem], int]:
     """Dynamic score, computed at read time from the lead's current state —
     never persisted (Lead.score, the stored column, is only this
     computation's starting baseline). Pure: no DB access, so a batch of
-    leads can share one query for each of the three things this needs
-    beyond the lead row itself (has_recent_automation,
-    has_recent_manual_activity, task_completed_recently) — see
-    score_leads() below.
+    leads can share one query for each of the things this needs beyond the
+    lead row itself (has_recent_automation, has_recent_manual_activity,
+    task_completed_recently, lead_response_state) plus the two org-wide
+    aggregates (insights, best_response_industry) — see score_leads()
+    below.
 
     converted leads short-circuit to 100 outright ("score máximo"), no
     other factor considered. Every other status accumulates deltas on top
@@ -359,12 +398,43 @@ def compute_lead_score(
                 )
             )
             total += profile_size_impact
+
+        # Feedback-loop-of-outcomes round — same "learned, not hardcoded"
+        # reward as the two lines above, but for response rate
+        # (compute_response_metrics()) rather than conversion.
+        if best_response_industry and industry == best_response_industry:
+            segment_impact = _RESPONSE_SEGMENT_BONUS
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Matches high-response segment", impact=segment_impact
+                )
+            )
+            total += segment_impact
     else:
         unenriched_impact = -5
         breakdown.append(
             ScoreBreakdownItem(reason="Lead not yet enriched", impact=unenriched_impact)
         )
         total += unenriched_impact
+
+    # Feedback-loop-of-outcomes round — a real "the market told us" signal,
+    # not a proxy: outweighs every purely-behavioral line above, same
+    # rationale as _INTERESTED_SCORE_BONUS/_NOT_INTERESTED_SCORE_PENALTY's
+    # own docstring note.
+    if lead_response_state == "interested":
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="Lead responded and showed interest", impact=_INTERESTED_SCORE_BONUS
+            )
+        )
+        total += _INTERESTED_SCORE_BONUS
+    elif lead_response_state == "not_interested":
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="Lead responded — not interested", impact=_NOT_INTERESTED_SCORE_PENALTY
+            )
+        )
+        total += _NOT_INTERESTED_SCORE_PENALTY
 
     win_probability = compute_win_probability(
         lead,
@@ -469,6 +539,96 @@ async def compute_conversion_insights(
         best_company_size=best_company_size,
         avg_time_to_close_days=avg_time_to_close_days,
         top_loss_reason=top_loss_reason,
+    )
+
+
+async def compute_response_metrics(
+    db: AsyncSession, organization_id: str
+) -> ResponseMetricsResponse:
+    """Feedback-loop-of-outcomes round — org-wide messaging effectiveness
+    mined from the last _RESPONSE_METRICS_WINDOW_DAYS of real outcomes, no
+    ML. One query (message_sent/lead_responded/lead_interested/lead_rejected
+    LeadActivityLog rows joined to their Lead for industry), aggregated in
+    Python — same "one shared query per batch" precedent as
+    compute_conversion_insights(). Every rate is 0.0 (not a misleading
+    default like a stray None) when there's simply been nothing sent yet;
+    avg_response_time_minutes/best_response_industry stay None in that
+    case, same "None until there's real signal" rule
+    ConversionInsightsResponse's own fields already follow.
+
+    response_rate/interest_rate share the same denominator (messages sent),
+    not compounding: interest_rate isn't "of those who responded, how many
+    were interested" — it's "of everything sent, how many became
+    interested," so the two read as directly comparable percentages of the
+    same whole. Both can technically read above 100%: a single sent message
+    can accumulate more than one response-type entry over time (e.g.
+    "responded" today, "interested" logged later once that conversation
+    develops), each counted here — a known approximation, same spirit as
+    money_saved_today's own disclosed proxy (workday.py), not a strict
+    one-to-one send/response ledger.
+
+    best_response_industry is the industry with the highest per-industry
+    response_rate among industries with at least one message sent — "what
+    wins" here isn't about every message, only which segment is actually
+    replying. Feeds compute_lead_score()'s "Matches high-response segment"
+    bonus."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_RESPONSE_METRICS_WINDOW_DAYS)
+    rows_stmt = (
+        select(LeadActivityLog.event_type, LeadActivityLog.duration_seconds, Lead.enrichment_data)
+        .join(Lead, Lead.id == LeadActivityLog.lead_id)
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type.in_(list(RESPONSE_STATE_BY_EVENT_TYPE) + ["message_sent"]),
+            LeadActivityLog.created_at >= cutoff,
+        )
+    )
+    rows = (await db.execute(rows_stmt)).all()
+
+    sent_count = 0
+    responded_count = 0
+    interested_count = 0
+    response_times_minutes: list[float] = []
+    sent_by_industry: dict[str, int] = {}
+    responded_by_industry: dict[str, int] = {}
+
+    for row in rows:
+        industry = row.enrichment_data.get("industry") if row.enrichment_data else None
+        if row.event_type == "message_sent":
+            sent_count += 1
+            if industry:
+                sent_by_industry[industry] = sent_by_industry.get(industry, 0) + 1
+            continue
+
+        responded_count += 1
+        if industry:
+            responded_by_industry[industry] = responded_by_industry.get(industry, 0) + 1
+        if row.event_type == "lead_interested":
+            interested_count += 1
+        if row.duration_seconds is not None:
+            response_times_minutes.append(row.duration_seconds / 60)
+
+    response_rate = round(responded_count / sent_count * 100, 1) if sent_count else 0.0
+    interest_rate = round(interested_count / sent_count * 100, 1) if sent_count else 0.0
+    avg_response_time_minutes = (
+        round(sum(response_times_minutes) / len(response_times_minutes), 1)
+        if response_times_minutes
+        else None
+    )
+
+    best_response_industry = (
+        max(
+            sent_by_industry,
+            key=lambda industry: responded_by_industry.get(industry, 0) / sent_by_industry[industry],
+        )
+        if sent_by_industry
+        else None
+    )
+
+    return ResponseMetricsResponse(
+        response_rate=response_rate,
+        interest_rate=interest_rate,
+        avg_response_time_minutes=avg_response_time_minutes,
+        best_response_industry=best_response_industry,
     )
 
 
@@ -592,10 +752,11 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
     LeadResponse.model_validate(lead) every lead-returning endpoint used
-    before this. Four extra queries total (recent automation activity,
-    recent manual activity, plus compute_conversion_insights()'s own two)
-    for the whole batch, regardless of how many leads are passed in — no
-    N+1."""
+    before this. Six extra queries total (recent automation activity,
+    recent manual activity, compute_conversion_insights()'s own two,
+    compute_response_metrics()'s own one, plus one for each lead's current
+    lead_response_state) for the whole batch, regardless of how many leads
+    are passed in — no N+1."""
     if not leads:
         return []
 
@@ -607,7 +768,9 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     # same invariant the automation/manual-activity queries below rely on
     # by filtering only on lead_id, not organization_id) — so the first
     # lead's organization_id is this whole batch's.
-    insights = await compute_conversion_insights(db, leads[0].organization_id)
+    organization_id = leads[0].organization_id
+    insights = await compute_conversion_insights(db, organization_id)
+    response_metrics = await compute_response_metrics(db, organization_id)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -640,14 +803,48 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         if row.event_type == "task_completed" and row.created_at >= task_completion_cutoff
     }
 
+    # lead_response_state is a current-state snapshot, not a 30-day-windowed
+    # rate like compute_response_metrics() above — so this queries all time,
+    # picking each lead's most recent response-type entry (a later
+    # "interested" supersedes an earlier plain "responded", etc.).
+    response_state_stmt = select(
+        LeadActivityLog.lead_id,
+        LeadActivityLog.event_type,
+        LeadActivityLog.duration_seconds,
+        LeadActivityLog.created_at,
+    ).where(
+        LeadActivityLog.lead_id.in_(lead_ids),
+        LeadActivityLog.event_type.in_(list(RESPONSE_STATE_BY_EVENT_TYPE)),
+    )
+    response_state_rows = (await db.execute(response_state_stmt)).all()
+    latest_response_by_lead = {}
+    for row in response_state_rows:
+        current = latest_response_by_lead.get(row.lead_id)
+        if current is None or row.created_at > current.created_at:
+            latest_response_by_lead[row.lead_id] = row
+
     responses = []
     for lead in leads:
+        latest_response = latest_response_by_lead.get(lead.id)
+        lead_response_state = (
+            RESPONSE_STATE_BY_EVENT_TYPE.get(latest_response.event_type, "no_response")
+            if latest_response is not None
+            else "no_response"
+        )
+        response_time_minutes = (
+            round(latest_response.duration_seconds / 60)
+            if latest_response is not None and latest_response.duration_seconds is not None
+            else None
+        )
+
         score, breakdown, win_probability = compute_lead_score(
             lead,
             has_recent_automation=lead.id in recent_lead_ids,
             has_recent_manual_activity=lead.id in recent_manual_activity_ids,
             task_completed_recently=lead.id in recent_task_completed_ids,
             insights=insights,
+            lead_response_state=lead_response_state,
+            best_response_industry=response_metrics.best_response_industry,
             now=now,
         )
         is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
@@ -715,6 +912,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "next_best_action_urgency": action_urgency,
                     "ready_to_send_message": ready_to_send_message,
                     "auto_action_available": is_ready_to_send,
+                    "lead_response_state": lead_response_state,
+                    "response_time_minutes": response_time_minutes,
                 }
             )
         )
