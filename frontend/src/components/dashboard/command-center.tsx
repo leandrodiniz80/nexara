@@ -27,6 +27,42 @@ const ACTION_LABELS_PT: Record<string, string> = {
   meeting: "Reuniões",
 };
 
+// Adaptive Intelligence round (Task 8) — turns one adaptiveWeights key
+// (GET /intelligence/adaptive-weights, e.g. "industry:healthcare" or
+// "action:call_now") into the friendly segment/action label the "🤖
+// Sistema sugere focar em" line shows.
+const ADAPTIVE_ACTION_LABELS_PT: Record<string, string> = {
+  call_now: "ligações",
+  send_message: "mensagens",
+  schedule_meeting: "reuniões",
+};
+
+function formatAdaptiveWeightKey(key: string): string {
+  if (key.startsWith("industry:")) return `setor ${key.slice("industry:".length)}`;
+  if (key.startsWith("company_size:")) return `empresas de porte ${key.slice("company_size:".length)}`;
+  if (key.startsWith("action:")) {
+    const action = key.slice("action:".length);
+    return ADAPTIVE_ACTION_LABELS_PT[action] ?? action;
+  }
+  if (key === "fast_response") return "respostas rápidas";
+  if (key === "high_risk") return "negociações de risco";
+  return key;
+}
+
+/** Adaptive Intelligence round (Task 8) — the single highest-weighted
+ * signal (GET /intelligence/adaptive-weights), only when it's actually a
+ * positive lift (> 1.0 — a weight at or below 1.0 has nothing worth
+ * suggesting). null when there's no real weight data yet, same "omit,
+ * don't show a misleading default" convention every other conditional
+ * line in this card already follows. */
+function topAdaptiveWeightLabel(adaptiveWeights: Record<string, number> | undefined): string | null {
+  if (!adaptiveWeights) return null;
+  const entries = Object.entries(adaptiveWeights).filter(([, weight]) => weight > 1.0);
+  if (entries.length === 0) return null;
+  const [topKey] = entries.reduce((best, entry) => (entry[1] > best[1] ? entry : best));
+  return formatAdaptiveWeightKey(topKey);
+}
+
 export function CommandCenter({
   summary,
   performance,
@@ -34,6 +70,9 @@ export function CommandCenter({
   onStart,
   isStarting,
   onOpenMandatoryLead,
+  execInsight,
+  adaptiveWeights,
+  hasRecentReassignments,
 }: {
   summary: WorkdaySummary;
   /** Optional so the card still renders (with its default look) before
@@ -50,7 +89,20 @@ export function CommandCenter({
    * omittable (no button rendered) when the caller hasn't resolved that id
    * against a full Lead yet. */
   onOpenMandatoryLead?: (leadId: string) => void;
+  /** Adaptive Intelligence round (Task 8) — GET /intelligence/exec-insight's
+   * own ready-to-render sentence, backing "📈 Receita potencial não
+   * capturada." Optional/omittable while that endpoint hasn't loaded yet. */
+  execInsight?: string;
+  /** GET /intelligence/adaptive-weights, backing "🤖 Sistema sugere focar
+   * em: [segment/action]" (topAdaptiveWeightLabel() picks the highest one
+   * worth suggesting). */
+  adaptiveWeights?: Record<string, number>;
+  /** True when GET /leads/activity shows a recent "lead_reassigned" entry
+   * — the Lead Reassignment Engine (Task 4) ran and actually moved
+   * something. Backs "⚠️ Leads redistribuídos automaticamente." */
+  hasRecentReassignments?: boolean;
 }) {
+  const suggestedFocusLabel = topAdaptiveWeightLabel(adaptiveWeights);
   const remaining = summary.overdueTasks + summary.todayTasks;
   const total = tasksCompletedToday + remaining;
   const progressPct = total > 0 ? (tasksCompletedToday / total) * 100 : 100;
@@ -147,6 +199,23 @@ export function CommandCenter({
               )}
             </ul>
           </div>
+        )}
+
+        {/* Adaptive Intelligence round (Task 8) — the three new Command
+            Center notices, each omitted until its own backend data says
+            there's something real to show. */}
+        {execInsight && (
+          <p className="text-sm font-semibold text-success">📈 {execInsight}</p>
+        )}
+        {suggestedFocusLabel && (
+          <p className="text-sm font-semibold text-primary">
+            🤖 Sistema sugere focar em: {suggestedFocusLabel}
+          </p>
+        )}
+        {hasRecentReassignments && (
+          <p className="text-sm font-semibold text-warning">
+            ⚠️ Leads redistribuídos automaticamente
+          </p>
         )}
 
         <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">

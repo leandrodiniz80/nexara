@@ -28,6 +28,7 @@ import { useToast } from "@/components/ui/toast";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
+import { getAdaptiveWeights, getExecInsight } from "@/lib/api/intelligence";
 import { getLeaderboard, getTeamSummary } from "@/lib/api/performance";
 import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
@@ -131,6 +132,26 @@ export default function DashboardPage() {
     retry: false,
     refetchInterval: 45000,
   });
+
+  // Adaptive Intelligence round (Task 8) — Command Center's own three new
+  // notices. adaptiveWeights/execInsight are independent, low-frequency
+  // reads (no need for activityFeed's own 45s poll rhythm); hasRecentReassignments
+  // is derived from activityFeed above, already fetched for Recent Activity.
+  const { data: adaptiveWeights } = useQuery({
+    queryKey: ["intelligence-adaptive-weights"],
+    queryFn: getAdaptiveWeights,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: execInsight } = useQuery({
+    queryKey: ["intelligence-exec-insight"],
+    queryFn: getExecInsight,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const hasRecentReassignments = activityFeed?.some((entry) => entry.type === "lead_reassigned") ?? false;
 
   // Execution-engine round — full leads, so the mandatory-lead button and
   // each action-queue row's own button can resolve an id into a full Lead
@@ -445,6 +466,9 @@ export default function DashboardPage() {
                 onStart={() => commandStartMutation.mutate()}
                 isStarting={commandStartMutation.isPending}
                 onOpenMandatoryLead={openLeadById}
+                execInsight={execInsight}
+                adaptiveWeights={adaptiveWeights}
+                hasRecentReassignments={hasRecentReassignments}
               />
             )}
 

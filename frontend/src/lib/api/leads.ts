@@ -332,7 +332,13 @@ export type LeadTimelineEntryType =
   | "details_updated"
   | "task_completed"
   | "enriched"
-  | "message_generated";
+  | "message_generated"
+  // Lead Reassignment Engine (Task 4, Adaptive Intelligence round) —
+  // reassign_leads_if_needed() (team_performance.py) logs this event_type
+  // straight into LeadActivityLog; GET /leads/activity already returns
+  // every event_type unfiltered (see that endpoint's own docstring), this
+  // just lets the frontend type-check comparing against it.
+  | "lead_reassigned";
 
 /** Coarse bucket for `type`, additive alongside it — lets the UI pick an
  * icon without a case per exact fine-grained type. See TimelineCategory in
