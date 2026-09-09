@@ -35,6 +35,14 @@ _HIGH_VALUE_ALERT_THRESHOLD = HIGH_VALUE_LEAD_THRESHOLD
 # compute_win_probability's own idle penalty and compute_lead_score's "Idle
 # for over a week" line already use.
 _HIGH_VALUE_ALERT_IDLE_DAYS = 7
+# maybe_notify_critical_deals()'s own per-lead dedup window (AI Deal Coach
+# round) — same 6h rhythm as the other per-lead alert above. Shares the
+# same lead_id+created_at dedup query shape (no `type` column on
+# UserNotification to filter on — see that model's own docstring), so a
+# lead that already got the high-value alert in the last 6h won't also get
+# this one in the same window, and vice versa: by design, one lead gets at
+# most one of these per-lead nudges per window, whichever fires first.
+_CRITICAL_DEAL_ALERT_DEDUP_HOURS = 6
 
 # generate_accountability_message()'s "high pressure" tier — a stricter bar
 # than detect_user_failure_state()'s own "failing" thresholds (overdue > 5,
@@ -267,6 +275,50 @@ async def maybe_notify_high_value_leads(
                 user_email=lead.owner_email,
                 lead_id=lead.id,
                 message=f"Lead de R$ {format_brl(lead.estimated_value)} parado há {days_idle} dias.",
+            )
+        )
+        notified += 1
+    return notified
+
+
+async def maybe_notify_critical_deals(
+    db: AsyncSession, *, organization_id: str, leads: list[LeadResponse], now: datetime
+) -> int:
+    """AI Deal Coach round — the "you're about to lose this" alert for any
+    lead score_leads() has already flagged deal_risk_level == "critical".
+    Same shape as maybe_notify_high_value_leads() just above (already-scored
+    list, no new candidate query; per-lead dedup within
+    _CRITICAL_DEAL_ALERT_DEDUP_HOURS; skips leads with no owner_email to
+    notify) — kept as its own function rather than folded into that one
+    since the two trigger on genuinely different conditions (deal_risk_level
+    vs. a flat value+idle-days check) even though they share a dedup
+    mechanism. Caller commits; returns how many notifications were actually
+    staged."""
+    candidates = [
+        lead for lead in leads if lead.deal_risk_level == "critical" and lead.owner_email is not None
+    ]
+    if not candidates:
+        return 0
+
+    cutoff = now - timedelta(hours=_CRITICAL_DEAL_ALERT_DEDUP_HOURS)
+    lead_ids = [lead.id for lead in candidates]
+    already_notified_stmt = select(UserNotification.lead_id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.lead_id.in_(lead_ids),
+        UserNotification.created_at >= cutoff,
+    )
+    already_notified_ids = set((await db.execute(already_notified_stmt)).scalars().all())
+
+    notified = 0
+    for lead in candidates:
+        if lead.id in already_notified_ids:
+            continue
+        db.add(
+            UserNotification(
+                organization_id=organization_id,
+                user_email=lead.owner_email,
+                lead_id=lead.id,
+                message=f"Você pode perder R$ {format_brl(lead.expected_value)} hoje.",
             )
         )
         notified += 1

@@ -21,7 +21,7 @@ from app.schemas.workday import (
     WorkdaySummaryResponse,
     WorkdayTargetResponse,
 )
-from app.services.leads.enrichment import get_lead_estimated_value
+from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
 from app.services.leads.scoring import rank_leads_by_priority, score_leads
 from app.services.leads.workday_engine import (
     complete_lead_task,
@@ -29,6 +29,7 @@ from app.services.leads.workday_engine import (
     format_brl,
     generate_accountability_message,
     get_next_actionable_lead,
+    maybe_notify_critical_deals,
     maybe_notify_high_value_leads,
     maybe_notify_performance_alert,
 )
@@ -319,6 +320,50 @@ def _sum_today_potential_revenue(ranked: list[LeadResponse], *, now: dt) -> int:
     return total
 
 
+def _compute_deal_risk_summary(ranked: list[LeadResponse]) -> tuple[int, int]:
+    """(money_at_risk_today, critical_deals_count) — AI Deal Coach round.
+    Reuses whatever rank_leads_by_priority() already scored (deal_risk_level
+    is populated by score_leads() for every response in `ranked`), zero
+    extra query. Shared by GET /workday/summary and .../performance, same
+    "reuse the already-scored list" pattern as _compute_revenue_at_risk."""
+    critical = [response for response in ranked if response.deal_risk_level == "critical"]
+    money_at_risk = sum(response.expected_value for response in critical)
+    return money_at_risk, len(critical)
+
+
+async def _compute_money_saved_today(db: AsyncSession, organization_id: str, today_start: dt) -> float:
+    """A proxy, not an exact figure (AI Deal Coach round): the deal_risk_level
+    a now-completed lead had *before* its task was finished isn't recoverable
+    at read time (completing it clears next_action_due_at and bumps
+    updated_at, so recomputing risk now would show "low" regardless of what
+    it was) — so this sums estimated_value for leads with a task_completed
+    activity today whose estimated_value clears HIGH_VALUE_LEAD_THRESHOLD,
+    as a stand-in for "high-value deals that got acted on today instead of
+    going cold." Two queries: distinct lead_ids from today's completions,
+    then those leads' rows for their enrichment_data."""
+    completed_ids_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type == "task_completed",
+            LeadActivityLog.created_at >= today_start,
+        )
+    )
+    completed_ids = (await db.execute(completed_ids_stmt)).scalars().all()
+    if not completed_ids:
+        return 0.0
+
+    completed_leads_stmt = select(Lead).where(Lead.id.in_(completed_ids))
+    completed_leads = (await db.execute(completed_leads_stmt)).scalars().all()
+
+    return sum(
+        value
+        for lead in completed_leads
+        if (value := get_lead_estimated_value(lead)) >= HIGH_VALUE_LEAD_THRESHOLD
+    )
+
+
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -330,17 +375,18 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Six queries total, none per-row (a 7th, conditional, only when a new
-    high-value alert is actually staged): today/overdue are plain COUNTs
-    (backed by ix_leads_org_id_next_action_due_at, same index GET
-    /leads/tasks uses); leads-at-risk is the same WHERE shape as GET
-    /leads/attention (ix_leads_org_id_status_updated_at), fetched as rows
-    (not just a count) since estimated_revenue_at_risk needs each one's
-    enrichment_data; high_priority_leads/revenue_at_risk/
-    today_potential_revenue all reuse the one rank_leads_by_priority() call
-    (candidate query + score_leads' own one extra query) — the same cost
-    GET /leads/priority already pays elsewhere on this same dashboard —
-    plus one dedup check for maybe_notify_high_value_leads()."""
+    Six queries total, none per-row (up to 2 more, conditional, only when a
+    new high-value or critical-deal alert is actually staged): today/overdue
+    are plain COUNTs (backed by ix_leads_org_id_next_action_due_at, same
+    index GET /leads/tasks uses); leads-at-risk is the same WHERE shape as
+    GET /leads/attention (ix_leads_org_id_status_updated_at), fetched as
+    rows (not just a count) since estimated_revenue_at_risk needs each
+    one's enrichment_data; high_priority_leads/revenue_at_risk/
+    today_potential_revenue/money_at_risk_today/critical_deals_count all
+    reuse the one rank_leads_by_priority() call (candidate query +
+    score_leads' own one extra query) — the same cost GET /leads/priority
+    already pays elsewhere on this same dashboard — plus one dedup check
+    each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()."""
     start = time.perf_counter()
     organization_id, _user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -378,6 +424,7 @@ async def get_workday_summary(
     high_priority_leads = len(ranked[:_HIGH_PRIORITY_TOP_N])
     revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
     today_potential_revenue = _sum_today_potential_revenue(ranked, now=now)
+    money_at_risk_today, critical_deals_count = _compute_deal_risk_summary(ranked)
 
     focus_message = _build_focus_message(
         overdue_tasks=overdue_tasks,
@@ -390,6 +437,12 @@ async def get_workday_summary(
     # per-lead alert (distinct from the org-wide "failing" one GET
     # /workday/performance already sends) — reuses `ranked`, no new query.
     notified_count = await maybe_notify_high_value_leads(
+        db, organization_id=organization_id, leads=ranked, now=now
+    )
+    # AI Deal Coach round — separate per-lead alert for critical-risk deals,
+    # reusing the same `ranked` list (see maybe_notify_critical_deals's own
+    # docstring for how its dedup window relates to the high-value alert's).
+    notified_count += await maybe_notify_critical_deals(
         db, organization_id=organization_id, leads=ranked, now=now
     )
     if notified_count:
@@ -406,6 +459,9 @@ async def get_workday_summary(
             focus_message=focus_message,
             revenue_at_risk=revenue_at_risk,
             today_potential_revenue=today_potential_revenue,
+            money_in_play_today=today_potential_revenue,
+            money_at_risk_today=money_at_risk_today,
+            critical_deals_count=critical_deals_count,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -487,14 +543,16 @@ async def get_workday_performance(
     completion) is, by definition, still unresolved from at least
     yesterday — a strict subset of overdue_tasks.
 
-    Eight queries total (two inside _workday_stats, two counts, one
+    Ten queries total (two inside _workday_stats, two counts, one
     ignored-leads row fetch for the revenue estimate, two inside
-    rank_leads_by_priority for revenue_at_risk, one dedup check for the
-    notification), none per-row. Reuses _count_overdue_tasks and
-    _workday_stats (both already used by /next and /summary), plus the
-    same rank_leads_by_priority()/_compute_revenue_at_risk() pairing GET
-    /workday/summary already uses, instead of re-deriving any of this a
-    third time."""
+    rank_leads_by_priority for revenue_at_risk/critical_deals, one dedup
+    check for the performance-alert notification, two inside
+    _compute_money_saved_today for the AI Deal Coach round's money_saved_today),
+    none per-row. Reuses _count_overdue_tasks and _workday_stats (both
+    already used by /next and /summary), plus the same
+    rank_leads_by_priority()/_compute_revenue_at_risk()/
+    _compute_deal_risk_summary() pairing GET /workday/summary already uses,
+    instead of re-deriving any of this a third time."""
     start = time.perf_counter()
     organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -533,6 +591,8 @@ async def get_workday_performance(
     at_risk_cutoff = now - timedelta(days=_AT_RISK_STALE_AFTER_DAYS)
     ranked = await rank_leads_by_priority(db, organization_id)
     revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+    _money_at_risk_today, critical_deals = _compute_deal_risk_summary(ranked)
+    money_saved_today = await _compute_money_saved_today(db, organization_id, today_start)
 
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks
@@ -570,6 +630,8 @@ async def get_workday_performance(
             failure_state=failure_state,
             accountability_message=accountability_message,
             revenue_at_risk=revenue_at_risk,
+            critical_deals=critical_deals,
+            money_saved_today=money_saved_today,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

@@ -45,6 +45,17 @@ class WorkdaySummaryResponse(BaseModel):
     # over today's actionable leads (overdue + due today).
     revenue_at_risk: int = 0
     today_potential_revenue: int = 0
+    # AI Deal Coach round, all additive/derived at read time from the same
+    # already-scored `ranked` list this endpoint already computes — zero new
+    # queries. money_in_play_today is the same figure as
+    # today_potential_revenue above, just re-exposed under the Deal Coach's
+    # own vocabulary (expected_value summed over today's actionable leads);
+    # money_at_risk_today narrows that further to only deal_risk_level ==
+    # "critical" leads (compute_deal_risk, scoring.py); critical_deals_count
+    # is how many of those there are.
+    money_in_play_today: int = 0
+    money_at_risk_today: int = 0
+    critical_deals_count: int = 0
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):
@@ -85,6 +96,18 @@ class WorkdayPerformanceResponse(BaseModel):
     # Same probability-weighted "contacted + (overdue or stale)" figure as
     # WorkdaySummaryResponse.revenue_at_risk above — additive.
     revenue_at_risk: int = 0
+    # AI Deal Coach round. critical_deals is the same deal_risk_level ==
+    # "critical" count as WorkdaySummaryResponse.critical_deals_count, reused
+    # from this endpoint's own already-computed `ranked` list. money_saved_today
+    # is a proxy, not an exact figure: the exact deal_risk_level a now-
+    # completed lead had *before* its task was finished isn't recoverable at
+    # read time (completing it clears next_action_due_at/bumps updated_at, so
+    # recomputing risk now would show "low") — so this sums estimated_value
+    # for leads with a task_completed activity today whose estimated_value
+    # clears HIGH_VALUE_LEAD_THRESHOLD, as a stand-in for "high-value deals
+    # that got acted on today instead of going cold."
+    critical_deals: int = 0
+    money_saved_today: float = 0
 
 
 class WorkdayTargetResponse(BaseModel):

@@ -63,6 +63,19 @@ _LOW_WIN_PROBABILITY_THRESHOLD = 40
 # this harsher one on top, same "layers stack additively" precedent this
 # function's own docstring already documents for the overdue/idle lines.
 _FOLLOW_UP_ESCALATION_IDLE_DAYS = 3
+# compute_deal_risk()'s idle-days cutoffs (AI Deal Coach round). CRITICAL's
+# is deliberately higher than HIGH/MEDIUM's — a big deal has to be *further*
+# gone before it's the worst bucket, since CRITICAL is also reachable via
+# is_overdue alone (no idle-days floor at all) for a high-value lead.
+_DEAL_RISK_CRITICAL_IDLE_DAYS = 5
+_DEAL_RISK_HIGH_IDLE_DAYS = 3
+_DEAL_RISK_MEDIUM_IDLE_DAYS = 3
+# compute_deal_risk()'s HIGH-tier win_probability floor — the prompt's own
+# number, deliberately distinct from _HIGH_WIN_PROBABILITY_THRESHOLD (70):
+# that one gates a score bonus for an already-good sign, this one gates
+# "worth the alarm" for a stalling deal that still looks winnable.
+_DEAL_RISK_HIGH_WIN_PROBABILITY = 60
+
 # compute_lead_score()'s adaptive-scoring bonuses (feedback-loop round) —
 # rewarding a lead that matches the org's own real-world highest-converting
 # profile (compute_conversion_insights()). Industry counts for more than
@@ -496,6 +509,85 @@ def build_priority_reason(
     return sentence[0].upper() + sentence[1:] + "."
 
 
+def compute_deal_risk(
+    lead: Lead, *, expected_value: int, win_probability: int, is_overdue: bool, now: datetime
+) -> tuple[str, str]:
+    """AI Deal Coach round — a plain rule table (no ML/external AI calls)
+    collapsing money/probability/activity recency into one at-a-glance
+    risk_level plus a short reason sentence. expected_value/win_probability
+    aren't columns on Lead itself (they're computed earlier in the same
+    score_leads() pass — compute_win_probability/get_lead_estimated_value),
+    so they're passed in rather than recomputed here; idle_days is derived
+    from lead.updated_at, same "cheap, pure, independently derived"
+    precedent compute_win_probability's own is_overdue/days_idle already
+    set. Converted/lost leads are always "low" — nothing left to lose, so
+    nothing left to be at risk.
+
+    Ordered highest-severity-first, same style as compute_next_best_action's
+    own decision tree:
+      CRITICAL: a big deal (>= HIGH_VALUE_LEAD_THRESHOLD) that's either
+        overdue or idle for over _DEAL_RISK_CRITICAL_IDLE_DAYS.
+      HIGH: a big deal that still looks winnable
+        (win_probability >= _DEAL_RISK_HIGH_WIN_PROBABILITY) but idle for
+        over _DEAL_RISK_HIGH_IDLE_DAYS.
+      MEDIUM: idle for over _DEAL_RISK_MEDIUM_IDLE_DAYS, or overdue,
+        regardless of value/probability — everything CRITICAL/HIGH didn't
+        already catch.
+      LOW: everything else.
+    """
+    if lead.status in ("converted", "lost"):
+        return "low", "Lead já resolvido — nada em jogo."
+
+    idle_days = (now - lead.updated_at).days
+    is_big_deal = expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+
+    if is_big_deal and (is_overdue or idle_days > _DEAL_RISK_CRITICAL_IDLE_DAYS):
+        cause = "com tarefa atrasada" if is_overdue else f"parado há {idle_days} dias"
+        return "critical", (
+            f"Negócio de R$ {format_brl(expected_value)} {cause} — risco de perda iminente."
+        )
+
+    if (
+        is_big_deal
+        and win_probability >= _DEAL_RISK_HIGH_WIN_PROBABILITY
+        and idle_days > _DEAL_RISK_HIGH_IDLE_DAYS
+    ):
+        return "high", (
+            f"Negócio de R$ {format_brl(expected_value)} com {win_probability}% de chance de "
+            f"fechar, mas sem contato há {idle_days} dias."
+        )
+
+    if idle_days > _DEAL_RISK_MEDIUM_IDLE_DAYS or is_overdue:
+        reason = "Tarefa atrasada — agende um contato." if is_overdue else (
+            f"Sem atividade há {idle_days} dias."
+        )
+        return "medium", reason
+
+    return "low", "Sob controle por enquanto."
+
+
+def compute_action_type_and_urgency(lead: Lead, risk_level: str) -> tuple[str | None, str | None]:
+    """AI Deal Coach's action recommendation — collapses risk_level (plus
+    the lead's own status) into one concrete next action + urgency tag for
+    the frontend's call-to-action button (LeadCard), distinct from
+    next_best_action's full sentence. status is checked before risk_level:
+    a lost lead always gets "drop_lead" regardless of risk (compute_deal_risk
+    already returns "low" for it, so risk_level alone can't distinguish
+    "lost" from "healthy"); a converted lead gets no action at all, same
+    "nothing left to do" rule next_best_action already follows."""
+    if lead.status == "lost":
+        return "drop_lead", "low"
+    if lead.status == "converted":
+        return None, None
+    if risk_level == "critical":
+        return "call_now", "immediate"
+    if risk_level == "high":
+        return "send_message", "high"
+    if risk_level == "medium":
+        return "schedule_meeting", "medium"
+    return "monitor", "low"
+
+
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
@@ -587,6 +679,15 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             is_overdue=is_overdue,
         )
 
+        deal_risk_level, deal_risk_reason = compute_deal_risk(
+            lead,
+            expected_value=expected_value,
+            win_probability=win_probability,
+            is_overdue=is_overdue,
+            now=now,
+        )
+        action_type, action_urgency = compute_action_type_and_urgency(lead, deal_risk_level)
+
         response = LeadResponse.model_validate(lead)
         responses.append(
             response.model_copy(
@@ -601,6 +702,10 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "estimated_value": round(estimated_value),
                     "expected_value": expected_value,
                     "priority_reason": priority_reason,
+                    "deal_risk_level": deal_risk_level,
+                    "deal_risk_reason": deal_risk_reason,
+                    "next_best_action_type": action_type,
+                    "next_best_action_urgency": action_urgency,
                 }
             )
         )

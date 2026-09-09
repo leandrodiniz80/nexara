@@ -96,6 +96,22 @@ class LeadResponse(BaseModel):
     # accountability_message. Always populated by score_leads(), never
     # empty — even a quiet lead gets a neutral sentence.
     priority_reason: str = ""
+    # AI Deal Coach round — deterministic, no external AI calls: risk_level
+    # collapses expected_value/win_probability/activity recency into one
+    # "how worried should I be" bucket (compute_deal_risk, scoring.py),
+    # deal_risk_reason a short one-line explanation. Both populated by
+    # score_leads() the same way score/win_probability already are.
+    deal_risk_level: str | None = None
+    deal_risk_reason: str | None = None
+    # Coarse, machine-readable action recommendation driven by
+    # deal_risk_level (compute_action_type_and_urgency, scoring.py) —
+    # distinct from next_best_action above (a full sentence from an older,
+    # separate rule table): "call_now"/"send_message"/"schedule_meeting"/
+    # "drop_lead"/"monitor", paired with an urgency tag, meant for the
+    # frontend to badge/button on directly (LeadCard) without string-
+    # matching next_best_action's prose. None only for converted leads.
+    next_best_action_type: str | None = None
+    next_best_action_urgency: str | None = None
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
