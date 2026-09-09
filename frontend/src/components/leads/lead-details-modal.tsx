@@ -150,6 +150,8 @@ function LeadNotesAndTasks({
       queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
       onTaskCompleted?.(nextLead);
     },
   });

@@ -1,18 +1,32 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { WorkdaySummary } from "@/lib/api/workday";
+import type { FailureState, WorkdayPerformance, WorkdaySummary } from "@/lib/api/workday";
 
 function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
 }
 
+// Section 7's "reforço psicológico" — same red/yellow/green mapping the
+// Performance Panel uses, so a "failing" state reads the same way in both
+// places.
+const STATE_STYLES: Record<FailureState, { border: string; bg: string; text: string }> = {
+  failing: { border: "border-destructive/40", bg: "bg-destructive/10", text: "text-destructive" },
+  at_risk: { border: "border-warning/40", bg: "bg-warning/10", text: "text-warning" },
+  on_track: { border: "border-success/40", bg: "bg-success/10", text: "text-success" },
+};
+
 export function CommandCenter({
   summary,
+  performance,
   tasksCompletedToday,
   onStart,
   isStarting,
 }: {
   summary: WorkdaySummary;
+  /** Optional so the card still renders (with its default look) before
+   * GET /workday/performance has loaded — accountability is a layer on top
+   * of the existing Command Center, not a hard dependency of it. */
+  performance?: WorkdayPerformance;
   /** Leads resolved today, from the same workday-stats counter GET
    * /workday/next already reports — the progress bar's numerator. */
   tasksCompletedToday: number;
@@ -22,14 +36,25 @@ export function CommandCenter({
   const remaining = summary.overdueTasks + summary.todayTasks;
   const total = tasksCompletedToday + remaining;
   const progressPct = total > 0 ? (tasksCompletedToday / total) * 100 : 100;
+  const stateStyle = performance ? STATE_STYLES[performance.failureState] : null;
 
   return (
-    <Card className="border-primary/40 bg-primary/5">
+    <Card
+      className={
+        stateStyle ? `${stateStyle.border} ${stateStyle.bg}` : "border-primary/40 bg-primary/5"
+      }
+    >
       <CardHeader>
         <CardTitle className="text-foreground">Command Center</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm font-medium text-foreground">{summary.focusMessage}</p>
+
+        {performance && (
+          <p className={`text-sm font-semibold ${stateStyle?.text}`}>
+            {performance.accountabilityMessage}
+          </p>
+        )}
 
         <div className="grid grid-cols-3 gap-3 text-center">
           <div>

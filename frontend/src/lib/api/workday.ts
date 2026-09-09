@@ -118,3 +118,62 @@ export async function completeAndNext(leadId: string): Promise<WorkdayCompleteAn
     throw toApiClientError(error);
   }
 }
+
+export type FailureState = "on_track" | "at_risk" | "failing";
+
+export interface WorkdayPerformance {
+  tasksCompletedToday: number;
+  tasksExpectedToday: number;
+  completionRate: number;
+  overdueTasks: number;
+  leadsIgnoredYesterday: number;
+  estimatedRevenueLost: number;
+  streakDays: number;
+  failureState: FailureState;
+  /** Ready-to-render sentence — built by the backend, same rule
+   * focusMessage/the timeline/activity feed already follow. */
+  accountabilityMessage: string;
+}
+
+interface WorkdayPerformanceDto {
+  tasks_completed_today: number;
+  tasks_expected_today: number;
+  completion_rate: number;
+  overdue_tasks: number;
+  leads_ignored_yesterday: number;
+  estimated_revenue_lost: number;
+  streak_days: number;
+  failure_state: FailureState;
+  accountability_message: string;
+}
+
+/** GET /api/v1/workday/performance — the accountability layer: how much of
+ * today's expected work got done, what's still overdue, what yesterday's
+ * neglect is costing, and the streak — collapsed into one failureState and
+ * one backend-written accountabilityMessage. A "failing" read also fires a
+ * persistent notification server-side (deduped within 6h), so this is a
+ * real read, not idempotent-safe to call more aggressively than the rest of
+ * the dashboard's polling. */
+export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<WorkdayPerformanceDto>>(
+      "/workday/performance"
+    );
+    if (!data.data) {
+      throw new Error("Workday performance request succeeded but returned no data");
+    }
+    return {
+      tasksCompletedToday: data.data.tasks_completed_today,
+      tasksExpectedToday: data.data.tasks_expected_today,
+      completionRate: data.data.completion_rate,
+      overdueTasks: data.data.overdue_tasks,
+      leadsIgnoredYesterday: data.data.leads_ignored_yesterday,
+      estimatedRevenueLost: data.data.estimated_revenue_lost,
+      streakDays: data.data.streak_days,
+      failureState: data.data.failure_state,
+      accountabilityMessage: data.data.accountability_message,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}

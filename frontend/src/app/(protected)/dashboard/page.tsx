@@ -9,6 +9,7 @@ import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
 import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
 import { NeedsAttention } from "@/components/dashboard/needs-attention";
+import { PerformancePanel } from "@/components/dashboard/performance-panel";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
 import { RecentActivity } from "@/components/dashboard/recent-activity";
 import { TodaysFocus } from "@/components/dashboard/todays-focus";
@@ -32,7 +33,12 @@ import {
   type Lead,
   type LeadStatus,
 } from "@/lib/api/leads";
-import { completeAndNext, getWorkdayNext, getWorkdaySummary } from "@/lib/api/workday";
+import {
+  completeAndNext,
+  getWorkdayNext,
+  getWorkdayPerformance,
+  getWorkdaySummary,
+} from "@/lib/api/workday";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -111,6 +117,17 @@ export default function DashboardPage() {
     refetchInterval: 45000,
   });
 
+  // Accountability layer's own snapshot — a "failing" read also fires a
+  // persistent notification server-side (deduped within 6h), so this is a
+  // deliberate real read, same 45s cadence as the other dashboard polls.
+  const { data: workdayPerformance } = useQuery({
+    queryKey: ["workday-performance"],
+    queryFn: getWorkdayPerformance,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
   // "Começar meu dia": fetches the one lead to work on right now, marks it
   // in_focus server-side, and opens its modal. Completing that lead's task
   // (see the modal's onTaskCompleted below) calls this again automatically
@@ -173,6 +190,7 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
       queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
     },
   });
 
@@ -191,6 +209,8 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
       queryClient.invalidateQueries({ queryKey: ["leads"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
       showToast("Task completed");
     },
   });
@@ -242,11 +262,14 @@ export default function DashboardPage() {
             {workdaySummary && (
               <CommandCenter
                 summary={workdaySummary}
+                performance={workdayPerformance}
                 tasksCompletedToday={workdayStats?.tasksCompletedToday ?? 0}
                 onStart={() => commandStartMutation.mutate()}
                 isStarting={commandStartMutation.isPending}
               />
             )}
+
+            {workdayPerformance && <PerformancePanel performance={workdayPerformance} />}
 
             <div className="flex flex-col items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
