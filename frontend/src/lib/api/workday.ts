@@ -56,6 +56,13 @@ export interface WorkdaySummary {
   /** "Hoje você pode gerar R$ X" — expectedValue summed over today's
    * actionable leads (overdue or due today). */
   todayPotentialRevenue: number;
+  /** AI Deal Coach round — same figure as todayPotentialRevenue above,
+   * re-exposed under the Deal Coach's own vocabulary. */
+  moneyInPlayToday: number;
+  /** expectedValue summed over dealRiskLevel === "critical" leads only —
+   * narrower and more urgent than revenueAtRisk above. */
+  moneyAtRiskToday: number;
+  criticalDealsCount: number;
 }
 
 interface WorkdaySummaryDto {
@@ -67,6 +74,9 @@ interface WorkdaySummaryDto {
   focus_message: string;
   revenue_at_risk: number;
   today_potential_revenue: number;
+  money_in_play_today: number;
+  money_at_risk_today: number;
+  critical_deals_count: number;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -87,6 +97,9 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       focusMessage: data.data.focus_message,
       revenueAtRisk: data.data.revenue_at_risk,
       todayPotentialRevenue: data.data.today_potential_revenue,
+      moneyInPlayToday: data.data.money_in_play_today,
+      moneyAtRiskToday: data.data.money_at_risk_today,
+      criticalDealsCount: data.data.critical_deals_count,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -146,6 +159,13 @@ export interface WorkdayPerformance {
   accountabilityMessage: string;
   /** Same probability-weighted figure as WorkdaySummary.revenueAtRisk. */
   revenueAtRisk: number;
+  /** AI Deal Coach round. criticalDeals is the same dealRiskLevel ===
+   * "critical" count as WorkdaySummary.criticalDealsCount. moneySavedToday
+   * is a proxy (not exact — see backend's own docstring): high-value leads
+   * with a task completed today, standing in for "deals that got acted on
+   * instead of going cold." */
+  criticalDeals: number;
+  moneySavedToday: number;
 }
 
 interface WorkdayPerformanceDto {
@@ -159,6 +179,8 @@ interface WorkdayPerformanceDto {
   failure_state: FailureState;
   accountability_message: string;
   revenue_at_risk: number;
+  critical_deals: number;
+  money_saved_today: number;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -187,6 +209,8 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       failureState: data.data.failure_state,
       accountabilityMessage: data.data.accountability_message,
       revenueAtRisk: data.data.revenue_at_risk,
+      criticalDeals: data.data.critical_deals,
+      moneySavedToday: data.data.money_saved_today,
     };
   } catch (error) {
     throw toApiClientError(error);

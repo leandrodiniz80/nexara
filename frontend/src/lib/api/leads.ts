@@ -65,6 +65,19 @@ export interface Lead {
    * estimatedValue/activity signals already on this object. Never empty —
    * a quiet lead still gets a neutral sentence. */
   priorityReason: string;
+  /** AI Deal Coach round — deterministic, no external AI calls: a coarse
+   * "how worried should I be" bucket (compute_deal_risk, scoring.py) from
+   * money/probability/activity recency, plus a short reason sentence. Null
+   * only if this Lead somehow bypassed score_leads(), which no real caller
+   * does. */
+  dealRiskLevel: "low" | "medium" | "high" | "critical" | null;
+  dealRiskReason: string | null;
+  /** Machine-readable action recommendation driven by dealRiskLevel
+   * (compute_action_type_and_urgency, scoring.py) — distinct from
+   * nextBestAction above (a full sentence from a separate, older rule
+   * table). Null for a converted lead (nothing left to do). */
+  nextBestActionType: "call_now" | "send_message" | "schedule_meeting" | "drop_lead" | "monitor" | null;
+  nextBestActionUrgency: "immediate" | "high" | "medium" | "low" | null;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -107,6 +120,10 @@ export interface LeadDto {
   estimated_value: number;
   expected_value: number;
   priority_reason: string;
+  deal_risk_level: "low" | "medium" | "high" | "critical" | null;
+  deal_risk_reason: string | null;
+  next_best_action_type: "call_now" | "send_message" | "schedule_meeting" | "drop_lead" | "monitor" | null;
+  next_best_action_urgency: "immediate" | "high" | "medium" | "low" | null;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -136,6 +153,10 @@ export function toLead(dto: LeadDto): Lead {
     estimatedValue: dto.estimated_value,
     expectedValue: dto.expected_value,
     priorityReason: dto.priority_reason,
+    dealRiskLevel: dto.deal_risk_level,
+    dealRiskReason: dto.deal_risk_reason,
+    nextBestActionType: dto.next_best_action_type,
+    nextBestActionUrgency: dto.next_best_action_urgency,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,

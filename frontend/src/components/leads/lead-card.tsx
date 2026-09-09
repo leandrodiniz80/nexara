@@ -38,6 +38,31 @@ function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
 }
 
+/** AI Deal Coach round — dealRiskLevel's visual treatment. "low" and null
+ * are deliberately absent (no entry, no badge rendered): a quiet lead
+ * competing for attention against real risk badges would defeat the point.
+ * critical/high/medium all use Badge's "outline" base (border-border,
+ * text-foreground) with these classes layered on top via cn()'s
+ * twMerge — last one wins for the same-category utility, so this fully
+ * overrides the outline look rather than fighting it. high gets its own
+ * orange rather than reusing warning's yellow (already spoken for by
+ * medium), since the prompt calls for three visually distinct tiers, not
+ * two. */
+const RISK_BADGE_STYLE: Record<"critical" | "high" | "medium", { className: string; label: string }> = {
+  critical: {
+    className: "border-transparent bg-destructive/15 text-destructive",
+    label: "🔥 Risco crítico",
+  },
+  high: {
+    className: "border-transparent bg-orange-500/15 text-orange-600 dark:text-orange-400",
+    label: "Risco alto",
+  },
+  medium: {
+    className: "border-transparent bg-warning/15 text-warning",
+    label: "Risco médio",
+  },
+};
+
 /** Native browser tooltip (no tooltip component in this UI kit yet, and one
  * factor list on hover doesn't warrant building one) — one line per factor,
  * signed impact so positive/negative reads at a glance. */
@@ -89,6 +114,13 @@ export function LeadCard({
     if (await copyToClipboard(lead.suggestedMessage)) {
       showToast("Mensagem copiada");
     }
+  }
+
+  /** AI Deal Coach's "Ligar agora" — a plain tel: handoff to the device's
+   * own dialer, no in-app calling infrastructure to build. */
+  function handleCallNow(event: MouseEvent) {
+    stopCardGesture(event);
+    if (lead.phone) window.location.href = `tel:${lead.phone}`;
   }
 
   return (
@@ -145,6 +177,15 @@ export function LeadCard({
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {lead.dealRiskLevel && lead.dealRiskLevel !== "low" && (
+          <Badge
+            variant="outline"
+            className={RISK_BADGE_STYLE[lead.dealRiskLevel].className}
+            title={lead.dealRiskReason ?? undefined}
+          >
+            {RISK_BADGE_STYLE[lead.dealRiskLevel].label}
+          </Badge>
+        )}
         <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>
           Score {lead.score}
         </Badge>
@@ -163,6 +204,11 @@ export function LeadCard({
               : lead.nextAction}
           </Badge>
         )}
+        {lead.nextBestActionType === "call_now" && lead.phone && (
+          <Button size="sm" variant="destructive" onMouseDown={stopCardGesture} onClick={handleCallNow}>
+            📞 Ligar agora
+          </Button>
+        )}
         {lead.suggestedMessage && (
           <Button
             size="sm"
@@ -173,7 +219,7 @@ export function LeadCard({
               handleCopyMessage();
             }}
           >
-            Copiar mensagem
+            {lead.nextBestActionType === "send_message" ? "Enviar mensagem" : "Copiar mensagem"}
           </Button>
         )}
       </div>

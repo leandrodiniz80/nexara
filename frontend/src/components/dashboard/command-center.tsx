@@ -62,6 +62,19 @@ export function CommandCenter({
           </p>
         )}
 
+        {/* AI Deal Coach round — same >5000 threshold HIGH_VALUE_LEAD_THRESHOLD
+            uses backend-side, kept in sync only by convention (this is a
+            display-only highlight, not a value the backend needs to send). */}
+        {summary.moneyAtRiskToday > 0 && (
+          <p
+            className={`text-sm font-semibold ${
+              summary.moneyAtRiskToday > 5000 ? "text-destructive" : "text-warning"
+            }`}
+          >
+            Você tem R$ {formatBRL(summary.moneyAtRiskToday)} em risco agora
+          </p>
+        )}
+
         <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
           <div>
             <p className="text-lg font-semibold text-foreground">{summary.todayTasks}</p>

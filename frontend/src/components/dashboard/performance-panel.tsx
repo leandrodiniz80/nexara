@@ -67,6 +67,16 @@ export function PerformancePanel({ performance }: { performance: WorkdayPerforma
             </p>
             <p className="text-xs text-muted-foreground">Em risco</p>
           </div>
+          <div>
+            <p className="text-lg font-semibold text-destructive">{performance.criticalDeals}</p>
+            <p className="text-xs text-muted-foreground">Negócios críticos</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-success">
+              R$ {formatBRL(performance.moneySavedToday)}
+            </p>
+            <p className="text-xs text-muted-foreground">Dinheiro salvo hoje</p>
+          </div>
         </div>
       </CardContent>
     </Card>
