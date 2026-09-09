@@ -89,6 +89,25 @@ const RESPONSE_BADGE_STYLE: Record<
   },
 };
 
+/** Sales-operating-system round — hasPendingResponse's visual treatment.
+ * No badge under an hour (still well within a normal reply window, same
+ * "quiet default gets nothing" precedent RISK_BADGE_STYLE/
+ * RESPONSE_BADGE_STYLE above already follow) — yellow past that, red past
+ * 24h, matching the same severity split compute_lead_score's own
+ * pending-response penalty uses (scoring.py). */
+function pendingResponseBadgeVariant(delayMinutes: number): "warning" | "destructive" | null {
+  if (delayMinutes > 24 * 60) return "destructive";
+  if (delayMinutes > 60) return "warning";
+  return null;
+}
+
+function formatDelay(minutes: number): string {
+  if (minutes < 60) return `${minutes}min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
 /** Native browser tooltip (no tooltip component in this UI kit yet, and one
  * factor list on hover doesn't warrant building one) — one line per factor,
  * signed impact so positive/negative reads at a glance. */
@@ -171,6 +190,11 @@ export function LeadCard({
     executeAction.mutate();
   }
 
+  const pendingBadgeVariant =
+    lead.hasPendingResponse && lead.responseDelayMinutes !== null
+      ? pendingResponseBadgeVariant(lead.responseDelayMinutes)
+      : null;
+
   return (
     <div
       onMouseDown={onDragStart}
@@ -245,6 +269,14 @@ export function LeadCard({
             }
           >
             {RESPONSE_BADGE_STYLE[lead.leadResponseState].label}
+          </Badge>
+        )}
+        {pendingBadgeVariant && (
+          <Badge
+            variant={pendingBadgeVariant}
+            title={`Mensagem enviada há ${formatDelay(lead.responseDelayMinutes ?? 0)}, sem resposta`}
+          >
+            ⏱ {formatDelay(lead.responseDelayMinutes ?? 0)}
           </Badge>
         )}
         <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>

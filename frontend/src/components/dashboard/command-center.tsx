@@ -112,6 +112,18 @@ export function CommandCenter({
             </p>
             <p className="text-xs text-muted-foreground">Ações automáticas hoje</p>
           </div>
+          <div>
+            <p className="text-lg font-semibold text-warning">
+              {summary.pendingResponsesCount}
+            </p>
+            <p className="text-xs text-muted-foreground">Leads aguardando resposta</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-foreground">
+              R$ {formatBRL(summary.pipelineExpectedValue)}
+            </p>
+            <p className="text-xs text-muted-foreground">Pipeline esperado hoje</p>
+          </div>
         </div>
 
         {total > 0 && (

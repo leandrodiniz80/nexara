@@ -666,6 +666,15 @@ export function LeadDetailsModal({
               </p>
             )}
 
+            {/* Sales-operating-system round — shown whenever any message
+                has ever been sent (pending or already answered), not just
+                while LeadResponseAction's own buttons are visible below. */}
+            {lead.responseDelayMinutes !== null && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Última mensagem enviada há {lead.responseDelayMinutes} minutos
+              </p>
+            )}
+
             <LeadOwnerAssignment lead={lead} onLeadUpdate={setLead} />
 
             <div className="mt-5 space-y-2">

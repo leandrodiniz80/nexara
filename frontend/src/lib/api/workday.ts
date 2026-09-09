@@ -73,6 +73,18 @@ export interface WorkdaySummary {
    * noisy figure — see WorkdayPerformance.responseRateToday below for
    * that sharper daily number instead. */
   responseRate: number;
+  /** Sales-operating-system round — Command Center's "Leads aguardando
+   * resposta": every lead with a message out and no reply yet, whatever
+   * the delay (a lead that's specifically been ignored for >24h feeds the
+   * separate maybe_notify_ignored_leads() org-wide alert instead, backend-
+   * side only — not its own field here). */
+  pendingResponsesCount: number;
+  /** expectedValue >= R$5000 AND dealRiskLevel in ("high", "critical"). */
+  highValueAtRiskCount: number;
+  /** Command Center's "Pipeline esperado hoje (R$)" — expectedValue summed
+   * across every open (new/contacted) lead, not just today's actionable
+   * ones the way todayPotentialRevenue above is scoped. */
+  pipelineExpectedValue: number;
 }
 
 interface WorkdaySummaryDto {
@@ -89,6 +101,9 @@ interface WorkdaySummaryDto {
   critical_deals_count: number;
   auto_actions_executed_today: number;
   response_rate: number;
+  pending_responses_count: number;
+  high_value_at_risk_count: number;
+  pipeline_expected_value: number;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -114,6 +129,9 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       criticalDealsCount: data.data.critical_deals_count,
       autoActionsExecutedToday: data.data.auto_actions_executed_today,
       responseRate: data.data.response_rate,
+      pendingResponsesCount: data.data.pending_responses_count,
+      highValueAtRiskCount: data.data.high_value_at_risk_count,
+      pipelineExpectedValue: data.data.pipeline_expected_value,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -188,6 +206,11 @@ export interface WorkdayPerformance {
    * figure for the Command Center's headline). */
   responseRateToday: number;
   responsesReceivedToday: number;
+  /** Sales-operating-system round — from the same today-scoped response
+   * rows responsesReceivedToday above already reads. avgResponseTimeToday
+   * is null (not 0) when nobody responded today at all. */
+  avgResponseTimeToday: number | null;
+  fastResponsesToday: number;
 }
 
 interface WorkdayPerformanceDto {
@@ -206,6 +229,8 @@ interface WorkdayPerformanceDto {
   auto_actions_executed_today: number;
   response_rate_today: number;
   responses_received_today: number;
+  avg_response_time_today: number | null;
+  fast_responses_today: number;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -239,6 +264,8 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       autoActionsExecutedToday: data.data.auto_actions_executed_today,
       responseRateToday: data.data.response_rate_today,
       responsesReceivedToday: data.data.responses_received_today,
+      avgResponseTimeToday: data.data.avg_response_time_today,
+      fastResponsesToday: data.data.fast_responses_today,
     };
   } catch (error) {
     throw toApiClientError(error);

@@ -95,6 +95,20 @@ export interface Lead {
   /** Minutes between this lead's most recent "message_sent" activity and
    * its response — null until a response is actually recorded. */
   responseTimeMinutes: number | null;
+  /** Sales-operating-system round — true whenever a "message_sent" exists
+   * with no reply after it yet (stays true across a stale old response and
+   * a newer unanswered message — see backend's own docstring,
+   * scoring.py). responseDelayMinutes is minutes since that lead's most
+   * recent message_sent, populated whenever one exists at all (pending or
+   * not) — distinct from responseTimeMinutes above, which is only ever set
+   * once a response actually landed. */
+  hasPendingResponse: boolean;
+  responseDelayMinutes: number | null;
+  /** Days since this lead's most recent LeadActivityLog entry of any
+   * kind — not the same as isOverdue/daysOverdue above (those track
+   * next_action_due_at); some activity (e.g. recording a response) logs to
+   * the timeline without otherwise touching the lead. */
+  daysSinceLastActivity: number;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -145,6 +159,9 @@ export interface LeadDto {
   auto_action_available: boolean;
   lead_response_state: "no_response" | "responded" | "interested" | "not_interested";
   response_time_minutes: number | null;
+  has_pending_response: boolean;
+  response_delay_minutes: number | null;
+  days_since_last_activity: number;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -182,6 +199,9 @@ export function toLead(dto: LeadDto): Lead {
     autoActionAvailable: dto.auto_action_available,
     leadResponseState: dto.lead_response_state,
     responseTimeMinutes: dto.response_time_minutes,
+    hasPendingResponse: dto.has_pending_response,
+    responseDelayMinutes: dto.response_delay_minutes,
+    daysSinceLastActivity: dto.days_since_last_activity,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,
