@@ -96,6 +96,12 @@ export function CommandCenter({
             </p>
             <p className="text-xs text-muted-foreground">Em risco (ponderado)</p>
           </div>
+          <div>
+            <p className="text-lg font-semibold text-success">
+              {summary.autoActionsExecutedToday}
+            </p>
+            <p className="text-xs text-muted-foreground">Ações automáticas hoje</p>
+          </div>
         </div>
 
         {total > 0 && (

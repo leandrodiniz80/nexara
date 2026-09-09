@@ -2,13 +2,14 @@
 
 import { MoreVertical } from "lucide-react";
 import type { MouseEvent } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/components/ui/toast";
-import type { Lead, LeadStatus } from "@/lib/api/leads";
+import { executeLeadAction, type Lead, type LeadStatus } from "@/lib/api/leads";
 import { cn } from "@/lib/utils/cn";
 import { copyToClipboard } from "@/lib/utils/clipboard";
 
@@ -108,6 +109,7 @@ export function LeadCard({
   onOpenDetails: () => void;
 }) {
   const { showToast } = useToast();
+  const queryClient = useQueryClient();
 
   async function handleCopyMessage() {
     if (!lead.suggestedMessage) return;
@@ -121,6 +123,27 @@ export function LeadCard({
   function handleCallNow(event: MouseEvent) {
     stopCardGesture(event);
     if (lead.phone) window.location.href = `tel:${lead.phone}`;
+  }
+
+  // Execution-assistance round's "Enviar agora" — same self-contained
+  // mutation + cache-patch pattern LeadIntelligence (lead-details-modal.tsx)
+  // already uses for enrich/generate-message, since LeadCard (only ever
+  // rendered from LeadsKanban) has no mutation plumbing of its own passed
+  // down from its parent the way onMove does for status changes.
+  const executeAction = useMutation({
+    mutationFn: () => executeLeadAction(lead.id, "send_message"),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+      queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
+      showToast("Mensagem enviada");
+    },
+  });
+
+  function handleSendNow(event: MouseEvent) {
+    stopCardGesture(event);
+    executeAction.mutate();
   }
 
   return (
@@ -209,18 +232,30 @@ export function LeadCard({
             📞 Ligar agora
           </Button>
         )}
-        {lead.suggestedMessage && (
+        {lead.autoActionAvailable ? (
           <Button
             size="sm"
-            variant="outline"
+            variant="default"
+            disabled={executeAction.isPending}
             onMouseDown={stopCardGesture}
-            onClick={(event) => {
-              stopCardGesture(event);
-              handleCopyMessage();
-            }}
+            onClick={handleSendNow}
           >
-            {lead.nextBestActionType === "send_message" ? "Enviar mensagem" : "Copiar mensagem"}
+            {executeAction.isPending ? "Enviando…" : "✅ Enviar agora"}
           </Button>
+        ) : (
+          lead.suggestedMessage && (
+            <Button
+              size="sm"
+              variant="outline"
+              onMouseDown={stopCardGesture}
+              onClick={(event) => {
+                stopCardGesture(event);
+                handleCopyMessage();
+              }}
+            >
+              {lead.nextBestActionType === "send_message" ? "Enviar mensagem" : "Copiar mensagem"}
+            </Button>
+          )
         )}
       </div>
     </div>

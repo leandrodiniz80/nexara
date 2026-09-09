@@ -77,6 +77,12 @@ export function PerformancePanel({ performance }: { performance: WorkdayPerforma
             </p>
             <p className="text-xs text-muted-foreground">Dinheiro salvo hoje</p>
           </div>
+          <div>
+            <p className="text-lg font-semibold text-success">
+              {performance.autoActionsExecutedToday}
+            </p>
+            <p className="text-xs text-muted-foreground">Ações automatizadas hoje</p>
+          </div>
         </div>
       </CardContent>
     </Card>

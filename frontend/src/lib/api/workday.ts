@@ -63,6 +63,11 @@ export interface WorkdaySummary {
    * narrower and more urgent than revenueAtRisk above. */
   moneyAtRiskToday: number;
   criticalDealsCount: number;
+  /** Execution-assistance round — how many leads the execution engine
+   * auto-sent a message for today (never counts a manual "Enviar agora"
+   * click — see backend's own docstring), gated behind AUTO_MODE_ENABLED
+   * (off by default, so this is 0 for most orgs today). */
+  autoActionsExecutedToday: number;
 }
 
 interface WorkdaySummaryDto {
@@ -77,6 +82,7 @@ interface WorkdaySummaryDto {
   money_in_play_today: number;
   money_at_risk_today: number;
   critical_deals_count: number;
+  auto_actions_executed_today: number;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -100,6 +106,7 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       moneyInPlayToday: data.data.money_in_play_today,
       moneyAtRiskToday: data.data.money_at_risk_today,
       criticalDealsCount: data.data.critical_deals_count,
+      autoActionsExecutedToday: data.data.auto_actions_executed_today,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -166,6 +173,9 @@ export interface WorkdayPerformance {
    * instead of going cold." */
   criticalDeals: number;
   moneySavedToday: number;
+  /** Same auto-send-only count as WorkdaySummary.autoActionsExecutedToday
+   * above — the Performance Panel's own "ações automatizadas hoje". */
+  autoActionsExecutedToday: number;
 }
 
 interface WorkdayPerformanceDto {
@@ -181,6 +191,7 @@ interface WorkdayPerformanceDto {
   revenue_at_risk: number;
   critical_deals: number;
   money_saved_today: number;
+  auto_actions_executed_today: number;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -211,6 +222,7 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       revenueAtRisk: data.data.revenue_at_risk,
       criticalDeals: data.data.critical_deals,
       moneySavedToday: data.data.money_saved_today,
+      autoActionsExecutedToday: data.data.auto_actions_executed_today,
     };
   } catch (error) {
     throw toApiClientError(error);

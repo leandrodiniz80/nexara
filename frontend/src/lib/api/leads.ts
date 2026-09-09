@@ -78,6 +78,14 @@ export interface Lead {
    * table). Null for a converted lead (nothing left to do). */
   nextBestActionType: "call_now" | "send_message" | "schedule_meeting" | "drop_lead" | "monitor" | null;
   nextBestActionUrgency: "immediate" | "high" | "medium" | "low" | null;
+  /** Execution-assistance round — non-null only when nextBestActionType ===
+   * "send_message" AND suggestedMessage is actually populated: the same
+   * text as suggestedMessage, just under the name the "Enviar agora" flow
+   * reads (LeadCard, executeLeadAction below). autoActionAvailable is that
+   * same gate as a plain boolean, for a truthy-check without also caring
+   * about the message's content. */
+  readyToSendMessage: string | null;
+  autoActionAvailable: boolean;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -124,6 +132,8 @@ export interface LeadDto {
   deal_risk_reason: string | null;
   next_best_action_type: "call_now" | "send_message" | "schedule_meeting" | "drop_lead" | "monitor" | null;
   next_best_action_urgency: "immediate" | "high" | "medium" | "low" | null;
+  ready_to_send_message: string | null;
+  auto_action_available: boolean;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -157,6 +167,8 @@ export function toLead(dto: LeadDto): Lead {
     dealRiskReason: dto.deal_risk_reason,
     nextBestActionType: dto.next_best_action_type,
     nextBestActionUrgency: dto.next_best_action_urgency,
+    readyToSendMessage: dto.ready_to_send_message,
+    autoActionAvailable: dto.auto_action_available,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,
@@ -525,6 +537,30 @@ export async function getLeadInsights(): Promise<ConversionInsights> {
       avgTimeToCloseDays: data.data.avg_time_to_close_days,
       topLossReason: data.data.top_loss_reason,
     };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export type LeadExecutableAction = "send_message" | "call_now" | "schedule_meeting";
+
+/** POST /api/v1/leads/{id}/execute-action — execution-assistance round.
+ * "send_message" 400s if the lead has no readyToSendMessage at the moment
+ * the backend re-checks it (LeadCard only ever shows the "Enviar agora"
+ * button when autoActionAvailable is already true, so this is a safety
+ * net for a stale client cache, not the normal path). Returns the lead's
+ * fresh state — same single-Lead shape enrichLead()/updateLeadOwner()
+ * already return, no {lead, notifications} wrapper (this endpoint doesn't
+ * fire automations). */
+export async function executeLeadAction(id: string, action: LeadExecutableAction): Promise<Lead> {
+  try {
+    const { data } = await apiClient.post<ApiResponse<LeadDto>>(`/leads/${id}/execute-action`, {
+      action,
+    });
+    if (!data.data) {
+      throw new Error("Execute-action request succeeded but returned no data");
+    }
+    return toLead(data.data);
   } catch (error) {
     throw toApiClientError(error);
   }
