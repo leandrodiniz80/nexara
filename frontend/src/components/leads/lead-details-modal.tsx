@@ -10,15 +10,18 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils/cn";
 import {
   completeLeadTask,
   enrichLead,
   generateLeadMessage,
   getLeadTimeline,
+  recordLeadResponse,
   updateLeadDetails,
   updateLeadOwner,
   type Lead,
+  type LeadResponseOutcome,
   type LeadStatus,
 } from "@/lib/api/leads";
 import { getOrgMembers } from "@/lib/api/organizations";
@@ -142,6 +145,7 @@ function LeadNotesAndTasks({
   lead,
   onTaskCompleted,
   completeTaskOverride,
+  onLeadUpdate,
 }: {
   lead: Lead;
   onTaskCompleted?: (nextLead?: Lead | null) => void;
@@ -152,6 +156,12 @@ function LeadNotesAndTasks({
    * Leads page's modal and the existing "Começar meu dia" flow is
    * unchanged. */
   completeTaskOverride?: (leadId: string) => Promise<{ lead: Lead; nextLead?: Lead | null }>;
+  /** Keeps the currently-open modal's own display in sync with this
+   * mutation's result — the `lead` prop is a snapshot the parent page
+   * only refreshes by closing/reopening the modal, so without this the
+   * Score/notes/next-action shown here would lag one action behind what
+   * just happened. See LeadDetailsModal's own liveLead state. */
+  onLeadUpdate?: (lead: Lead) => void;
 }) {
   const queryClient = useQueryClient();
   const [notes, setNotes] = useState(lead.notes ?? "");
@@ -179,6 +189,7 @@ function LeadNotesAndTasks({
       queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      onLeadUpdate?.(updated);
     },
   });
 
@@ -200,6 +211,7 @@ function LeadNotesAndTasks({
       queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
       queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
       queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
+      onLeadUpdate?.(updated);
       onTaskCompleted?.(nextLead);
     },
   });
@@ -267,7 +279,15 @@ function LeadNotesAndTasks({
   );
 }
 
-function LeadIntelligence({ lead }: { lead: Lead }) {
+function LeadIntelligence({
+  lead,
+  onLeadUpdate,
+}: {
+  lead: Lead;
+  /** See LeadNotesAndTasks's own doc — same "keep the open modal's snapshot
+   * current" purpose. */
+  onLeadUpdate?: (lead: Lead) => void;
+}) {
   const queryClient = useQueryClient();
   const [generatedMessage, setGeneratedMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -288,6 +308,7 @@ function LeadIntelligence({ lead }: { lead: Lead }) {
       );
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      onLeadUpdate?.(updated);
     },
   });
 
@@ -379,7 +400,15 @@ function LeadIntelligence({ lead }: { lead: Lead }) {
   );
 }
 
-function LeadOwnerAssignment({ lead }: { lead: Lead }) {
+function LeadOwnerAssignment({
+  lead,
+  onLeadUpdate,
+}: {
+  lead: Lead;
+  /** See LeadNotesAndTasks's own doc — same "keep the open modal's snapshot
+   * current" purpose. */
+  onLeadUpdate?: (lead: Lead) => void;
+}) {
   const queryClient = useQueryClient();
   const { data: members } = useQuery({
     queryKey: ["org-members"],
@@ -394,6 +423,7 @@ function LeadOwnerAssignment({ lead }: { lead: Lead }) {
       );
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      onLeadUpdate?.(updated);
     },
   });
 
@@ -420,8 +450,116 @@ function LeadOwnerAssignment({ lead }: { lead: Lead }) {
   );
 }
 
-export function LeadDetailsModal({
+/** Feedback-loop-of-outcomes round's visual language for leadResponseState —
+ * duplicated from lead-card.tsx's own RESPONSE_BADGE_STYLE rather than
+ * shared/exported, same "small lookup map, copy it" precedent formatBRL
+ * already sets across this codebase's dashboard components. "no_response"
+ * has no entry on purpose: LeadResponseAction below never renders a badge
+ * for it, only the three buttons. */
+const RESPONSE_BADGE_STYLE: Record<
+  "responded" | "interested" | "not_interested",
+  { className: string; label: string }
+> = {
+  responded: {
+    className: "border-transparent bg-blue-500/15 text-blue-600 dark:text-blue-400",
+    label: "💬 Respondeu",
+  },
+  interested: {
+    className: "border-transparent bg-success/15 text-success",
+    label: "✅ Interessado",
+  },
+  not_interested: {
+    className: "border-transparent bg-destructive/15 text-destructive",
+    label: "❌ Sem interesse",
+  },
+};
+
+/** "Resposta do lead" — feedback-loop-of-outcomes round's UI trigger for
+ * POST /leads/{id}/record-response. Rendered only when there's something
+ * useful to do here: nothing recorded yet (no_response), or the system is
+ * specifically recommending a message right now (nextBestActionType ===
+ * "send_message") — not on every lead, every time, which would just be
+ * noise. Once a response IS recorded the buttons are gone for good (this
+ * round's own edge case): recording an outcome is a one-time teaching
+ * moment per lead, not a toggle you can flip back and forth. */
+function LeadResponseAction({
   lead,
+  onLeadUpdate,
+}: {
+  lead: Lead;
+  onLeadUpdate?: (lead: Lead) => void;
+}) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  const recordResponse = useMutation({
+    mutationFn: (responseOutcome: LeadResponseOutcome) =>
+      recordLeadResponse(lead.id, responseOutcome),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
+        (prev ?? []).map((item) => (item.id === updated.id ? updated : item))
+      );
+      queryClient.invalidateQueries({ queryKey: ["leads"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
+      queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      onLeadUpdate?.(updated);
+      showToast("Resposta registrada");
+    },
+  });
+
+  if (lead.leadResponseState === "no_response" && lead.nextBestActionType !== "send_message") {
+    return null;
+  }
+
+  return (
+    <div className="mt-5 space-y-1.5">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Resposta do lead
+      </p>
+      {lead.leadResponseState === "no_response" ? (
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={recordResponse.isPending}
+            onClick={() => recordResponse.mutate("responded")}
+          >
+            Respondeu
+          </Button>
+          <Button
+            size="sm"
+            variant="default"
+            disabled={recordResponse.isPending}
+            onClick={() => recordResponse.mutate("interested")}
+          >
+            Interessado
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            disabled={recordResponse.isPending}
+            onClick={() => recordResponse.mutate("not_interested")}
+          >
+            Sem interesse
+          </Button>
+        </div>
+      ) : (
+        <Badge
+          variant="outline"
+          className={RESPONSE_BADGE_STYLE[lead.leadResponseState].className}
+        >
+          {RESPONSE_BADGE_STYLE[lead.leadResponseState].label}
+        </Badge>
+      )}
+    </div>
+  );
+}
+
+export function LeadDetailsModal({
+  lead: leadProp,
   onClose,
   onMove,
   onTaskCompleted,
@@ -443,6 +581,16 @@ export function LeadDetailsModal({
   completeTaskOverride?: (leadId: string) => Promise<{ lead: Lead; nextLead?: Lead | null }>;
 }) {
   const [tab, setTab] = useState<ModalTab>("details");
+  // The `lead` prop is a snapshot the parent page only refreshes by
+  // closing/reopening the modal (its own detailsLead state isn't wired to
+  // the "leads" query cache) — so this modal keeps its own live copy,
+  // updated by every child mutation's onLeadUpdate, and resynced whenever
+  // a *different* lead opens (or the modal closes).
+  const [lead, setLead] = useState<Lead | null>(leadProp);
+
+  useEffect(() => {
+    setLead(leadProp);
+  }, [leadProp]);
 
   if (!lead) return null;
 
@@ -518,7 +666,7 @@ export function LeadDetailsModal({
               </p>
             )}
 
-            <LeadOwnerAssignment lead={lead} />
+            <LeadOwnerAssignment lead={lead} onLeadUpdate={setLead} />
 
             <div className="mt-5 space-y-2">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -544,9 +692,12 @@ export function LeadDetailsModal({
               lead={lead}
               onTaskCompleted={onTaskCompleted}
               completeTaskOverride={completeTaskOverride}
+              onLeadUpdate={setLead}
             />
 
-            <LeadIntelligence lead={lead} />
+            <LeadIntelligence lead={lead} onLeadUpdate={setLead} />
+
+            <LeadResponseAction lead={lead} onLeadUpdate={setLead} />
           </>
         ) : (
           <LeadActivityTimeline leadId={lead.id} />
