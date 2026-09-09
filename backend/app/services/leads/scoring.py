@@ -1948,6 +1948,7 @@ async def compute_revenue_attribution(
         revenue_by_action=revenue_by_action,
         revenue_by_industry=revenue_by_industry,
         revenue_by_company_size=revenue_by_company_size,
+        revenue_by_combination=revenue_by_combination,
         top_combination=top_combination,
     )
 

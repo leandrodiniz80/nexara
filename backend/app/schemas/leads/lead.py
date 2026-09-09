@@ -359,13 +359,21 @@ class RevenueAttributionResponse(BaseModel):
     (e.g. "call | Technology | 500+") with the most attributed revenue
     behind it — None until at least one converted lead has both a
     qualifying action link and enrichment_data at once, same "no signal
-    yet" rule this codebase's other learned fields already follow."""
+    yet" rule this codebase's other learned fields already follow.
+
+    revenue_by_combination (final round) exposes the full per-combination
+    breakdown compute_revenue_attribution() already built internally to
+    derive top_combination — that computation existed either way, this
+    just also returns it instead of discarding it once the winner was
+    picked. Same "only carries keys with a real converted lead behind
+    them" rule as revenue_by_industry/revenue_by_company_size."""
 
     revenue_by_action: dict[str, float] = Field(
         default_factory=lambda: {"call": 0.0, "message": 0.0, "meeting": 0.0}
     )
     revenue_by_industry: dict[str, float] = Field(default_factory=dict)
     revenue_by_company_size: dict[str, float] = Field(default_factory=dict)
+    revenue_by_combination: dict[str, float] = Field(default_factory=dict)
     top_combination: str | None = None
 
 
