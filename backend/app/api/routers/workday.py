@@ -33,7 +33,9 @@ from app.services.leads.workday_engine import (
     get_next_actionable_lead,
     maybe_notify_critical_deals,
     maybe_notify_high_value_leads,
+    maybe_notify_ignored_leads,
     maybe_notify_performance_alert,
+    maybe_notify_pipeline_risk,
 )
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/workday", tags=["Workday"])
@@ -381,33 +383,92 @@ async def _count_auto_actions_today(db: AsyncSession, organization_id: str, toda
     return (await db.execute(stmt)).scalar_one()
 
 
+_RESPONSE_TYPE_EVENT_TYPES = ["lead_responded", "lead_interested", "lead_rejected"]
+# _compute_response_metrics_today()'s "fast" bar — same <30min cutoff
+# compute_lead_score()'s own "Fast response from lead" bonus uses
+# (_FAST_RESPONSE_MINUTES, scoring.py).
+_FAST_RESPONSE_MINUTES_TODAY = 30
+
+
 async def _compute_response_metrics_today(
     db: AsyncSession, organization_id: str, today_start: dt
-) -> tuple[float, int]:
-    """(response_rate_today, responses_received_today) — feedback-loop-of-
-    outcomes round. Today-only counterpart to compute_response_metrics()'s
-    steadier 30-day figure (scoring.py): same message_sent vs. response-type
-    event_type split, just scoped to today and without the industry
-    breakdown that endpoint's best_response_industry needs. One query."""
-    stmt = select(LeadActivityLog.event_type, func.count(LeadActivityLog.id)).where(
+) -> tuple[float, int, float | None, int]:
+    """(response_rate_today, responses_received_today, avg_response_time_today,
+    fast_responses_today) — feedback-loop-of-outcomes round's first two,
+    sales-operating-system round's last two. Today-only counterpart to
+    compute_response_metrics()'s steadier 30-day figure (scoring.py): same
+    message_sent vs. response-type event_type split, just scoped to today
+    and without the industry breakdown that endpoint's best_response_industry
+    needs. One query — raw rows (not grouped counts), since
+    avg_response_time_today/fast_responses_today need each row's own
+    duration_seconds, not just a count per event_type."""
+    stmt = select(LeadActivityLog.event_type, LeadActivityLog.duration_seconds).where(
         LeadActivityLog.organization_id == organization_id,
-        LeadActivityLog.event_type.in_(
-            ["message_sent", "lead_responded", "lead_interested", "lead_rejected"]
-        ),
+        LeadActivityLog.event_type.in_(["message_sent", *_RESPONSE_TYPE_EVENT_TYPES]),
         LeadActivityLog.created_at >= today_start,
-    ).group_by(LeadActivityLog.event_type)
-    counts = dict((await db.execute(stmt)).all())
-
-    sent_today = counts.get("message_sent", 0)
-    responses_received_today = (
-        counts.get("lead_responded", 0)
-        + counts.get("lead_interested", 0)
-        + counts.get("lead_rejected", 0)
     )
+    rows = (await db.execute(stmt)).all()
+
+    sent_today = sum(1 for row in rows if row.event_type == "message_sent")
+    response_rows = [row for row in rows if row.event_type in _RESPONSE_TYPE_EVENT_TYPES]
+    responses_received_today = len(response_rows)
     response_rate_today = (
         round(responses_received_today / sent_today * 100, 1) if sent_today else 0.0
     )
-    return response_rate_today, responses_received_today
+
+    response_times_today = [
+        row.duration_seconds / 60 for row in response_rows if row.duration_seconds is not None
+    ]
+    avg_response_time_today = (
+        round(sum(response_times_today) / len(response_times_today), 1)
+        if response_times_today
+        else None
+    )
+    fast_responses_today = sum(
+        1 for minutes in response_times_today if minutes < _FAST_RESPONSE_MINUTES_TODAY
+    )
+
+    return response_rate_today, responses_received_today, avg_response_time_today, fast_responses_today
+
+
+def _compute_response_and_pipeline_pressure(
+    ranked: list[LeadResponse],
+) -> tuple[int, int, int, int]:
+    """(pending_responses_count, ignored_count, high_value_at_risk_count,
+    pipeline_expected_value) — sales-operating-system round. All four reuse
+    whatever rank_leads_by_priority() already scored
+    (has_pending_response/response_delay_minutes/deal_risk_level/
+    expected_value, all populated by score_leads()), zero extra query.
+    pending_responses_count is every lead with a message out and no reply
+    yet, regardless of how long (WorkdaySummaryResponse's own field);
+    ignored_count narrows that to specifically >24h
+    (_PENDING_RESPONSE_DELAY_MINUTES_HIGH, scoring.py) — maybe_notify_ignored_leads()'s
+    own trigger, not exposed in the response schema (only asked for the
+    broader count there). pipeline_expected_value is scoped to "open" leads
+    (new/contacted) — rank_leads_by_priority's own candidate pool also
+    includes "lost" leads (it only ever excludes "converted"), but a lost
+    lead's expected_value is always 0 anyway (compute_win_probability
+    short-circuits win_probability to 0 for "lost", scoring.py), so this
+    filter is about being literal ("all open leads"), not about changing
+    the sum."""
+    pending_responses_count = sum(1 for response in ranked if response.has_pending_response)
+    ignored_count = sum(
+        1
+        for response in ranked
+        if response.has_pending_response
+        and response.response_delay_minutes is not None
+        and response.response_delay_minutes > 24 * 60
+    )
+    high_value_at_risk_count = sum(
+        1
+        for response in ranked
+        if response.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+        and response.deal_risk_level in ("high", "critical")
+    )
+    pipeline_expected_value = sum(
+        response.expected_value for response in ranked if response.status in ("new", "contacted")
+    )
+    return pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value
 
 
 async def _maybe_auto_execute_critical_deals(
@@ -452,11 +513,15 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Seven queries total, none per-row (up to 3 more, conditional: one dedup
-    check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals(),
-    one Lead row-fetch for _maybe_auto_execute_critical_deals() — all three
-    only when there's an actual candidate, and the last only when
+    Seven queries total, none per-row (up to 5 more, conditional: one dedup
+    check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()/
+    maybe_notify_ignored_leads()/maybe_notify_pipeline_risk(), one Lead
+    row-fetch for _maybe_auto_execute_critical_deals() — all five only when
+    there's an actual candidate/threshold breach, and the last only when
     settings.AUTO_MODE_ENABLED is even on, which it isn't by default):
+    pending_responses_count/high_value_at_risk_count/pipeline_expected_value
+    (_compute_response_and_pipeline_pressure) also reuse `ranked`, zero
+    extra query.
     today/overdue are plain COUNTs (backed by ix_leads_org_id_next_action_due_at,
     same index GET /leads/tasks uses); leads-at-risk is the same WHERE shape
     as GET /leads/attention (ix_leads_org_id_status_updated_at), fetched as
@@ -468,7 +533,7 @@ async def get_workday_summary(
     already pays elsewhere on this same dashboard; the 7th, unconditional,
     is auto_actions_executed_today's own count (_count_auto_actions_today)."""
     start = time.perf_counter()
-    organization_id, _user_email = _require_caller(session)
+    organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
 
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -505,6 +570,9 @@ async def get_workday_summary(
     revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
     today_potential_revenue = _sum_today_potential_revenue(ranked, now=now)
     money_at_risk_today, critical_deals_count = _compute_deal_risk_summary(ranked)
+    pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value = (
+        _compute_response_and_pipeline_pressure(ranked)
+    )
 
     focus_message = _build_focus_message(
         overdue_tasks=overdue_tasks,
@@ -529,6 +597,24 @@ async def get_workday_summary(
     # is off (the default); see _maybe_auto_execute_critical_deals's own
     # docstring.
     auto_executed_count = await _maybe_auto_execute_critical_deals(db, organization_id, ranked)
+    # Sales-operating-system round — two more org-wide nudges, both no-ops
+    # most of the time (gated behind their own thresholds) and both reusing
+    # data already computed above (pending_responses_count, revenue_at_risk)
+    # — zero new queries beyond their own dedup checks.
+    notified_count += await maybe_notify_ignored_leads(
+        db,
+        organization_id=organization_id,
+        user_email=user_email,
+        ignored_count=ignored_count,
+        now=now,
+    )
+    notified_count += await maybe_notify_pipeline_risk(
+        db,
+        organization_id=organization_id,
+        user_email=user_email,
+        revenue_at_risk=revenue_at_risk,
+        now=now,
+    )
     if notified_count or auto_executed_count:
         await db.commit()
 
@@ -551,6 +637,9 @@ async def get_workday_summary(
             critical_deals_count=critical_deals_count,
             auto_actions_executed_today=auto_actions_executed_today,
             response_rate=response_metrics.response_rate,
+            pending_responses_count=pending_responses_count,
+            high_value_at_risk_count=high_value_at_risk_count,
+            pipeline_expected_value=pipeline_expected_value,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -683,7 +772,12 @@ async def get_workday_performance(
     _money_at_risk_today, critical_deals = _compute_deal_risk_summary(ranked)
     money_saved_today = await _compute_money_saved_today(db, organization_id, today_start)
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
-    response_rate_today, responses_received_today = await _compute_response_metrics_today(
+    (
+        response_rate_today,
+        responses_received_today,
+        avg_response_time_today,
+        fast_responses_today,
+    ) = await _compute_response_metrics_today(
         db, organization_id, today_start
     )
 
@@ -728,6 +822,8 @@ async def get_workday_performance(
             auto_actions_executed_today=auto_actions_executed_today,
             response_rate_today=response_rate_today,
             responses_received_today=responses_received_today,
+            avg_response_time_today=avg_response_time_today,
+            fast_responses_today=fast_responses_today,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

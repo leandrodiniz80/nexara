@@ -44,6 +44,17 @@ _HIGH_VALUE_ALERT_IDLE_DAYS = 7
 # most one of these per-lead nudges per window, whichever fires first.
 _CRITICAL_DEAL_ALERT_DEDUP_HOURS = 6
 
+# maybe_notify_ignored_leads()'s trigger — the prompt's own number of leads
+# stuck in has_pending_response with a >24h response_delay_minutes
+# (scoring.py) before it's worth an org-wide nudge.
+_IGNORED_LEADS_ALERT_THRESHOLD = 5
+_IGNORED_LEADS_ALERT_DEDUP_HOURS = 6
+# maybe_notify_pipeline_risk()'s trigger — the prompt's own number, against
+# the same probability-weighted revenue_at_risk GET /workday/summary
+# already computes (_compute_revenue_at_risk, workday.py).
+_PIPELINE_RISK_ALERT_THRESHOLD = 10000.0
+_PIPELINE_RISK_ALERT_DEDUP_HOURS = 6
+
 # generate_accountability_message()'s "high pressure" tier — a stricter bar
 # than detect_user_failure_state()'s own "failing" thresholds (overdue > 5,
 # completion_rate < 0.3): this is for the *worst* of an already-failing day,
@@ -191,24 +202,114 @@ def generate_accountability_message(
     return "Bom ritmo. Continue assim para fechar mais negócios hoje."
 
 
+# Sales-operating-system round — maybe_notify_ignored_leads()/
+# maybe_notify_pipeline_risk() are both org-wide, null-lead_id alerts like
+# maybe_notify_performance_alert() below, but that function's own dedup
+# check ("any null-lead_id row in the window") assumes it's the *only*
+# kind of org-wide alert — see its own docstring. Adding two more under
+# that same generic check would let all three silently share (and starve)
+# one 6h budget between unrelated triggers, so each gets its own message
+# marker to dedupe on instead — the same "structured info via string
+# matching" technique LOSS_REASON_MARKER (scoring.py) already established,
+# just a `contains` substring anchor instead of a strict prefix, since the
+# varying count/value sits at the very start of each message.
+IGNORED_LEADS_ALERT_MARKER = "ignorando suas mensagens"
+PIPELINE_RISK_ALERT_MARKER = "do seu pipeline está em risco"
+
+
+async def maybe_notify_ignored_leads(
+    db: AsyncSession, *, organization_id: str, user_email: str, ignored_count: int, now: datetime
+) -> bool:
+    """Sales-operating-system round — fires when more than
+    _IGNORED_LEADS_ALERT_THRESHOLD leads are stuck in has_pending_response
+    with over a 24h response_delay_minutes (scoring.py) — "you're being
+    ignored, at scale." See IGNORED_LEADS_ALERT_MARKER's own comment above
+    for why this dedupes on its own message marker rather than
+    maybe_notify_performance_alert()'s generic null-lead_id check. Caller
+    commits; returns whether a row was actually staged."""
+    if ignored_count <= _IGNORED_LEADS_ALERT_THRESHOLD:
+        return False
+
+    cutoff = now - timedelta(hours=_IGNORED_LEADS_ALERT_DEDUP_HOURS)
+    recent_stmt = select(UserNotification.id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.user_email == user_email,
+        UserNotification.message.contains(IGNORED_LEADS_ALERT_MARKER),
+        UserNotification.created_at >= cutoff,
+    )
+    already_sent = (await db.execute(recent_stmt)).scalar_one_or_none()
+    if already_sent is not None:
+        return False
+
+    db.add(
+        UserNotification(
+            organization_id=organization_id,
+            user_email=user_email,
+            lead_id=None,
+            message=f"Você tem {ignored_count} leads {IGNORED_LEADS_ALERT_MARKER} agora.",
+        )
+    )
+    return True
+
+
+async def maybe_notify_pipeline_risk(
+    db: AsyncSession, *, organization_id: str, user_email: str, revenue_at_risk: float, now: datetime
+) -> bool:
+    """Sales-operating-system round — fires when revenue_at_risk (the same
+    probability-weighted figure GET /workday/summary already computes,
+    _compute_revenue_at_risk in workday.py) clears
+    _PIPELINE_RISK_ALERT_THRESHOLD. Same own-marker dedup shape as
+    maybe_notify_ignored_leads() above, for the same reason. Caller
+    commits; returns whether a row was actually staged."""
+    if revenue_at_risk <= _PIPELINE_RISK_ALERT_THRESHOLD:
+        return False
+
+    cutoff = now - timedelta(hours=_PIPELINE_RISK_ALERT_DEDUP_HOURS)
+    recent_stmt = select(UserNotification.id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.user_email == user_email,
+        UserNotification.message.contains(PIPELINE_RISK_ALERT_MARKER),
+        UserNotification.created_at >= cutoff,
+    )
+    already_sent = (await db.execute(recent_stmt)).scalar_one_or_none()
+    if already_sent is not None:
+        return False
+
+    db.add(
+        UserNotification(
+            organization_id=organization_id,
+            user_email=user_email,
+            lead_id=None,
+            message=f"R$ {format_brl(revenue_at_risk)} {PIPELINE_RISK_ALERT_MARKER} hoje.",
+        )
+    )
+    return True
+
+
 async def maybe_notify_performance_alert(
     db: AsyncSession, *, organization_id: str, user_email: str, message: str, now: datetime
 ) -> bool:
     """Persists a "failing"-state alert to UserNotification (so it also
     shows in the notification bell, same channel automation "notify"
     actions already use) — but only if the caller isn't due for a repeat
-    yet. Deduped on lead_id IS NULL within _PERFORMANCE_ALERT_DEDUP_HOURS:
-    every other notification kind always carries a lead_id (see
+    yet. Deduped on lead_id IS NULL within _PERFORMANCE_ALERT_DEDUP_HOURS,
+    excluding maybe_notify_ignored_leads()/maybe_notify_pipeline_risk()'s
+    own rows by their message markers (sales-operating-system round —
+    those two are also null-lead_id but dedupe on their own schedule; without
+    excluding them here, one of *their* alerts landing first would make this
+    check think a performance alert had already gone out, and skip a real
+    one). Every other notification kind always carries a lead_id (see
     automation_engine.py's own notify path, which only persists a row when
-    the lead has an owner), so a null lead_id row is unambiguously one of
-    these performance alerts. Caller commits; returns whether a row was
-    actually staged."""
+    the lead has an owner), so this is otherwise unambiguous. Caller
+    commits; returns whether a row was actually staged."""
     cutoff = now - timedelta(hours=_PERFORMANCE_ALERT_DEDUP_HOURS)
     recent_alert_stmt = select(UserNotification.id).where(
         UserNotification.organization_id == organization_id,
         UserNotification.user_email == user_email,
         UserNotification.lead_id.is_(None),
         UserNotification.created_at >= cutoff,
+        ~UserNotification.message.contains(IGNORED_LEADS_ALERT_MARKER),
+        ~UserNotification.message.contains(PIPELINE_RISK_ALERT_MARKER),
     )
     already_sent = (await db.execute(recent_alert_stmt)).scalar_one_or_none()
     if already_sent is not None:

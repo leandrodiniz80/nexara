@@ -105,6 +105,14 @@ ACTION_NURTURE_OR_DISCARD = "Nutrir lead ou descartar"
 # instead of two separately-maintained copies of the same 5000.0 constant.
 HIGH_VALUE_LEAD_THRESHOLD = 5000.0
 
+# Sales-operating-system round — two more next_best_action labels on top of
+# the six above, same "generate_lead_message_by_action() matches on the
+# prefix" contract. ACTION_AWAIT_RESPONSE has no message template below
+# (falls through to the final `return None`) — there's nothing to send
+# while waiting on a reply that's already out.
+ACTION_AWAIT_RESPONSE = "Aguardar resposta do lead"
+ACTION_ATTEMPT_CLOSE_DEAL = "Tentar fechar negócio agora"
+
 
 def _seeded_choice(seed: str, salt: str, options: list[str]) -> str:
     """Deterministic pick keyed on the lead's own id — the same lead always
@@ -257,6 +265,12 @@ def generate_lead_message_by_action(
         body = (
             f"Não quero ser inconveniente — só queria deixar a porta aberta para a {company}.{context}\n\n"
             "Se em algum momento fizer sentido retomar, é só me chamar."
+        )
+    elif action.startswith(ACTION_ATTEMPT_CLOSE_DEAL):
+        body = (
+            f"Sinto que estamos muito perto de fechar com a {company} — o momento para avançar "
+            f"é agora.{context}\n\n"
+            "Consigo preparar a proposta final ainda hoje. Podemos confirmar os próximos passos?"
         )
     else:
         return None

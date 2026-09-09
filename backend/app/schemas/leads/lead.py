@@ -132,6 +132,28 @@ class LeadResponse(BaseModel):
     # "message_sent" entry.
     lead_response_state: str = "no_response"
     response_time_minutes: int | None = None
+    # Sales-operating-system round — the "did they ever reply to what we
+    # last sent" pair, derived from the same LeadActivityLog rows as
+    # lead_response_state above but comparing timestamps directly rather
+    # than reading the latest response's own state: has_pending_response is
+    # true whenever a "message_sent" entry exists with no response-type
+    # entry after it (so it stays true across a stale old response and a
+    # newer unanswered message — see score_leads()'s own docstring).
+    # response_delay_minutes is minutes since that lead's most recent
+    # "message_sent", populated whenever one exists at all (pending or
+    # not) — distinct from response_time_minutes above, which is only ever
+    # set once a response actually landed.
+    has_pending_response: bool = False
+    response_delay_minutes: int | None = None
+    # Sales-operating-system round — days since this lead's most recent
+    # LeadActivityLog entry of any kind, not to be confused with the
+    # existing days_idle concept several score_breakdown lines already use
+    # internally (derived from the stored updated_at column): some
+    # activity — e.g. POST /leads/{id}/record-response — logs to the
+    # timeline without mutating any Lead column, so updated_at can lag
+    # behind what actually last happened on this lead. Falls back to the
+    # updated_at-based figure on a lead with no logged activity at all.
+    days_since_last_activity: int = 0
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None

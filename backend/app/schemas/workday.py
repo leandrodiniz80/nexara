@@ -72,6 +72,19 @@ class WorkdaySummaryResponse(BaseModel):
     # below for the sharper, noisier daily number the Performance Panel
     # shows instead).
     response_rate: float = 0.0
+    # Sales-operating-system round, all reused from the same already-scored
+    # `ranked` list this endpoint already computes (see
+    # _compute_response_and_pipeline_pressure() in workday.py) — zero new
+    # queries. pending_responses_count/high_value_at_risk_count both read
+    # score_leads()'s own has_pending_response/expected_value/deal_risk_level
+    # fields; pipeline_expected_value sums expected_value across every
+    # non-converted lead in that same candidate pool — an approximation at
+    # very large org scale, same one high_priority_leads/revenue_at_risk
+    # above already accept (see rank_leads_by_priority's own candidate-pool
+    # docstring, scoring.py).
+    pending_responses_count: int = 0
+    high_value_at_risk_count: int = 0
+    pipeline_expected_value: int = 0
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):
@@ -133,6 +146,14 @@ class WorkdayPerformanceResponse(BaseModel):
     # own raw numbers for the accountability layer).
     response_rate_today: float = 0.0
     responses_received_today: int = 0
+    # Sales-operating-system round — from the same today-scoped response
+    # rows responses_received_today above already reads
+    # (_compute_response_metrics_today, workday.py), no new query.
+    # avg_response_time_today is None (not 0.0) when nobody responded
+    # today at all, same "None until there's real signal" rule
+    # compute_response_metrics()'s own avg_response_time_minutes follows.
+    avg_response_time_today: float | None = None
+    fast_responses_today: int = 0
 
 
 class WorkdayTargetResponse(BaseModel):
