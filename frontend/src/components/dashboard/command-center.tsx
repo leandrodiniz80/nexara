@@ -75,6 +75,16 @@ export function CommandCenter({
           </p>
         )}
 
+        {/* Feedback-loop-of-outcomes round — omitted entirely (not just
+            shown as 0%) until there's been at least one message sent in
+            the last 30 days, so a brand-new org never sees a misleading
+            "0% respondem" headline. */}
+        {summary.responseRate > 0 && (
+          <p className="text-sm font-semibold text-primary">
+            {summary.responseRate.toFixed(0)}% das suas mensagens recebem resposta
+          </p>
+        )}
+
         <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
           <div>
             <p className="text-lg font-semibold text-foreground">{summary.todayTasks}</p>

@@ -68,6 +68,11 @@ export interface WorkdaySummary {
    * click — see backend's own docstring), gated behind AUTO_MODE_ENABLED
    * (off by default, so this is 0 for most orgs today). */
   autoActionsExecutedToday: number;
+  /** Feedback-loop-of-outcomes round — "X% das suas mensagens recebem
+   * resposta" (Command Center). A steady 30-day rate, not a single day's
+   * noisy figure — see WorkdayPerformance.responseRateToday below for
+   * that sharper daily number instead. */
+  responseRate: number;
 }
 
 interface WorkdaySummaryDto {
@@ -83,6 +88,7 @@ interface WorkdaySummaryDto {
   money_at_risk_today: number;
   critical_deals_count: number;
   auto_actions_executed_today: number;
+  response_rate: number;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -107,6 +113,7 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       moneyAtRiskToday: data.data.money_at_risk_today,
       criticalDealsCount: data.data.critical_deals_count,
       autoActionsExecutedToday: data.data.auto_actions_executed_today,
+      responseRate: data.data.response_rate,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -176,6 +183,11 @@ export interface WorkdayPerformance {
   /** Same auto-send-only count as WorkdaySummary.autoActionsExecutedToday
    * above — the Performance Panel's own "ações automatizadas hoje". */
   autoActionsExecutedToday: number;
+  /** Feedback-loop-of-outcomes round — today-only counterpart to
+   * WorkdaySummary.responseRate above (that one's a steadier 30-day
+   * figure for the Command Center's headline). */
+  responseRateToday: number;
+  responsesReceivedToday: number;
 }
 
 interface WorkdayPerformanceDto {
@@ -192,6 +204,8 @@ interface WorkdayPerformanceDto {
   critical_deals: number;
   money_saved_today: number;
   auto_actions_executed_today: number;
+  response_rate_today: number;
+  responses_received_today: number;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -223,6 +237,8 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       criticalDeals: data.data.critical_deals,
       moneySavedToday: data.data.money_saved_today,
       autoActionsExecutedToday: data.data.auto_actions_executed_today,
+      responseRateToday: data.data.response_rate_today,
+      responsesReceivedToday: data.data.responses_received_today,
     };
   } catch (error) {
     throw toApiClientError(error);

@@ -86,6 +86,15 @@ export interface Lead {
    * about the message's content. */
   readyToSendMessage: string | null;
   autoActionAvailable: boolean;
+  /** Feedback-loop-of-outcomes round — derived from LeadActivityLog's
+   * "lead_responded"/"lead_interested"/"lead_rejected" entries (see
+   * recordLeadResponse below), not a stored column. "no_response" is a
+   * real, always-present value — not a stand-in for null — for a lead
+   * with no response recorded yet. */
+  leadResponseState: "no_response" | "responded" | "interested" | "not_interested";
+  /** Minutes between this lead's most recent "message_sent" activity and
+   * its response — null until a response is actually recorded. */
+  responseTimeMinutes: number | null;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -134,6 +143,8 @@ export interface LeadDto {
   next_best_action_urgency: "immediate" | "high" | "medium" | "low" | null;
   ready_to_send_message: string | null;
   auto_action_available: boolean;
+  lead_response_state: "no_response" | "responded" | "interested" | "not_interested";
+  response_time_minutes: number | null;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -169,6 +180,8 @@ export function toLead(dto: LeadDto): Lead {
     nextBestActionUrgency: dto.next_best_action_urgency,
     readyToSendMessage: dto.ready_to_send_message,
     autoActionAvailable: dto.auto_action_available,
+    leadResponseState: dto.lead_response_state,
+    responseTimeMinutes: dto.response_time_minutes,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,
@@ -559,6 +572,30 @@ export async function executeLeadAction(id: string, action: LeadExecutableAction
     });
     if (!data.data) {
       throw new Error("Execute-action request succeeded but returned no data");
+    }
+    return toLead(data.data);
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export type LeadResponseOutcome = "responded" | "interested" | "not_interested";
+
+/** POST /api/v1/leads/{id}/record-response — feedback-loop-of-outcomes
+ * round. Closes the loop execute-action opened: records a real reply so
+ * leadResponseState/the response-rate metrics/compute_lead_score
+ * (scoring.py) all learn from real outcomes instead of assumptions.
+ * Returns the lead's fresh state, same shape as executeLeadAction() above. */
+export async function recordLeadResponse(
+  id: string,
+  responseOutcome: LeadResponseOutcome
+): Promise<Lead> {
+  try {
+    const { data } = await apiClient.post<ApiResponse<LeadDto>>(`/leads/${id}/record-response`, {
+      response: responseOutcome,
+    });
+    if (!data.data) {
+      throw new Error("Record-response request succeeded but returned no data");
     }
     return toLead(data.data);
   } catch (error) {

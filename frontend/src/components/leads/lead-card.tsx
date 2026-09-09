@@ -64,6 +64,31 @@ const RISK_BADGE_STYLE: Record<"critical" | "high" | "medium", { className: stri
   },
 };
 
+/** Feedback-loop-of-outcomes round — leadResponseState's visual treatment.
+ * "no_response" is deliberately absent (no badge): it's the default,
+ * nothing-happened-yet state for most leads, and badging every card with
+ * it would be pure noise. "responded" gets its own blue rather than
+ * reusing an existing variant — Badge has no built-in blue, so this
+ * layers custom classes over "outline" the same way RISK_BADGE_STYLE's
+ * "high" tier already does. */
+const RESPONSE_BADGE_STYLE: Record<
+  "responded" | "interested" | "not_interested",
+  { className: string; label: string }
+> = {
+  responded: {
+    className: "border-transparent bg-blue-500/15 text-blue-600 dark:text-blue-400",
+    label: "💬 Respondeu",
+  },
+  interested: {
+    className: "border-transparent bg-success/15 text-success",
+    label: "✅ Interessado",
+  },
+  not_interested: {
+    className: "border-transparent bg-destructive/15 text-destructive",
+    label: "❌ Sem interesse",
+  },
+};
+
 /** Native browser tooltip (no tooltip component in this UI kit yet, and one
  * factor list on hover doesn't warrant building one) — one line per factor,
  * signed impact so positive/negative reads at a glance. */
@@ -207,6 +232,19 @@ export function LeadCard({
             title={lead.dealRiskReason ?? undefined}
           >
             {RISK_BADGE_STYLE[lead.dealRiskLevel].label}
+          </Badge>
+        )}
+        {lead.leadResponseState !== "no_response" && (
+          <Badge
+            variant="outline"
+            className={RESPONSE_BADGE_STYLE[lead.leadResponseState].className}
+            title={
+              lead.responseTimeMinutes !== null
+                ? `Respondeu em ${lead.responseTimeMinutes} minutos`
+                : undefined
+            }
+          >
+            {RESPONSE_BADGE_STYLE[lead.leadResponseState].label}
           </Badge>
         )}
         <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>
