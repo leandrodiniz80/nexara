@@ -401,6 +401,7 @@ export default function DashboardPage() {
               forecast={revenueForecast}
               target={workdayTarget}
               performance={workdayPerformance}
+              summary={workdaySummary}
             />
 
             {revenueSummary && (

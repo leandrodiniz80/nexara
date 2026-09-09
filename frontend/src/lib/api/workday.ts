@@ -98,6 +98,14 @@ export interface WorkdaySummary {
   topRevenueAction: string | null;
   topRevenueIndustry: string | null;
   topRevenueCompanySize: string | null;
+  /** Revenue-maximization round — "Oportunidade perdida hoje": sum of
+   * opportunityCost (LeadResponse) across leads not touched today. */
+  lostOpportunityToday: number;
+  /** "Top padrão de receita" — the single "action | industry |
+   * company_size" combination generating the most real revenue org-wide
+   * (compute_revenue_attribution()'s own top_combination, backend). Null
+   * until there's a real signal. */
+  topRevenueCombination: string | null;
 }
 
 interface WorkdaySummaryDto {
@@ -121,6 +129,8 @@ interface WorkdaySummaryDto {
   top_revenue_action: string | null;
   top_revenue_industry: string | null;
   top_revenue_company_size: string | null;
+  lost_opportunity_today: number;
+  top_revenue_combination: string | null;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -153,6 +163,8 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       topRevenueAction: data.data.top_revenue_action,
       topRevenueIndustry: data.data.top_revenue_industry,
       topRevenueCompanySize: data.data.top_revenue_company_size,
+      lostOpportunityToday: data.data.lost_opportunity_today,
+      topRevenueCombination: data.data.top_revenue_combination,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -365,6 +377,10 @@ export interface WorkdayTarget {
   currentExpected: number;
   /** dailyTargetRevenue - currentExpected. Positive means behind target. */
   gap: number;
+  /** Revenue Acceleration Mode (Task 3, revenue-maximization round) —
+   * true whenever gap > R$5,000. Drives the dashboard's red "Modo
+   * Aceleração Ativado" banner. */
+  accelerationMode: boolean;
 }
 
 interface WorkdayTargetDto {
@@ -375,6 +391,7 @@ interface WorkdayTargetDto {
   daily_target_revenue: number;
   current_expected: number;
   gap: number;
+  acceleration_mode: boolean;
 }
 
 /** GET /api/v1/workday/target — the daily gamification target: a fixed
@@ -395,6 +412,7 @@ export async function getWorkdayTarget(): Promise<WorkdayTarget> {
       dailyTargetRevenue: data.data.daily_target_revenue,
       currentExpected: data.data.current_expected,
       gap: data.data.gap,
+      accelerationMode: data.data.acceleration_mode,
     };
   } catch (error) {
     throw toApiClientError(error);

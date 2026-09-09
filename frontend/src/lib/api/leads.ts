@@ -117,6 +117,11 @@ export interface Lead {
   enrichmentData: EnrichmentData | null;
   createdAt: string;
   updatedAt: string;
+  /** Revenue-maximization round — this org's single highest expectedValue
+   * among the batch this lead was last scored alongside, minus this
+   * lead's own expectedValue. Always >= 0. Powers LeadCard's own "⚠️
+   * Perdendo R$ X" badge. */
+  opportunityCost: number;
 }
 
 interface EnrichmentDataDto {
@@ -168,6 +173,7 @@ export interface LeadDto {
   enrichment_data: EnrichmentDataDto | null;
   created_at: string;
   updated_at: string;
+  opportunity_cost: number;
 }
 
 export function toLead(dto: LeadDto): Lead {
@@ -216,6 +222,7 @@ export function toLead(dto: LeadDto): Lead {
       : null,
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
+    opportunityCost: dto.opportunity_cost,
   };
 }
 

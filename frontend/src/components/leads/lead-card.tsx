@@ -56,6 +56,13 @@ function isHighRevenueOpportunity(lead: Lead): boolean {
   );
 }
 
+// Revenue-maximization round — Opportunity Cost Engine's own badge bar
+// (Task 6): same >3000 threshold the prompt's own example ("Perdendo R$
+// 8.000") implies, distinct from the backend's own >5000 score-penalty bar
+// (scoring.py's _OPPORTUNITY_COST_THRESHOLD) — this is a lighter, purely
+// visual heads-up, not the same "you're actively being penalized" signal.
+const OPPORTUNITY_COST_BADGE_THRESHOLD = 3000;
+
 /** AI Deal Coach round — dealRiskLevel's visual treatment. "low" and null
  * are deliberately absent (no entry, no badge rendered): a quiet lead
  * competing for attention against real risk badges would defeat the point.
@@ -316,6 +323,14 @@ export function LeadCard({
         {isHighRevenueOpportunity(lead) && (
           <Badge variant="outline" className="border-transparent bg-success/15 text-success">
             💰 Alta geração de receita
+          </Badge>
+        )}
+        {lead.opportunityCost > OPPORTUNITY_COST_BADGE_THRESHOLD && (
+          <Badge
+            variant="warning"
+            title="Este lead vale bem menos que o lead de maior valor da sua carteira agora"
+          >
+            ⚠️ Perdendo R$ {formatBRL(lead.opportunityCost)}
           </Badge>
         )}
         {(lead.status === "new" || lead.status === "contacted") && (
