@@ -20,9 +20,44 @@ class RevenueSimulationResponse(BaseModel):
 class ExecInsightResponse(BaseModel):
     """GET /intelligence/exec-insight — generate_exec_insight()'s own
     ready-to-render sentence (app/services/leads/intelligence.py),
-    combining today's lost opportunity with the Revenue Simulation
-    Engine's own optimistic delta. Same "the backend writes the sentence"
-    rule build_priority_reason()/focus_message/accountability_message
-    already follow elsewhere in this codebase."""
+    combining today's lost opportunity, the Revenue Simulation Engine's
+    own optimistic delta, the current aggression level, the global
+    strategy's focus, and any revenue leak count (final round). Same "the
+    backend writes the sentence" rule build_priority_reason()/
+    focus_message/accountability_message already follow elsewhere in this
+    codebase."""
 
     message: str
+
+
+class GlobalStrategyResponse(BaseModel):
+    """GET /intelligence/global-strategy — compute_global_strategy()'s own
+    {focus, reason, confidence} shape (scoring.py), typed for the API
+    contract. focus is always one of "calls"/"messages"/"meetings";
+    confidence is 0-100, not a probability in the statistical sense — a
+    plain "how strong is this rule's own signal" indicator."""
+
+    focus: str
+    reason: str
+    confidence: int = 0
+
+
+class AggressionLevelResponse(BaseModel):
+    """GET /intelligence/aggression-level — compute_aggression_level()'s
+    own return value (scoring.py), one of "low"/"medium"/"high"/
+    "extreme"."""
+
+    level: str
+
+
+class RevenueLeaksResponse(BaseModel):
+    """GET /intelligence/revenue-leaks — detect_revenue_leaks()'s own
+    shape (scoring.py): three independent leak-pattern counts plus
+    total_leak_value, the summed expected_value across every lead caught
+    by at least one of the three patterns (no double-counting a lead
+    caught by more than one)."""
+
+    leads_ignored_over_24h: int = 0
+    high_value_leads_without_action: int = 0
+    leads_stuck_same_stage: int = 0
+    total_leak_value: int = 0

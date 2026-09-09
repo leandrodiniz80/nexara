@@ -11,7 +11,7 @@ from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.services.leads.enrichment import format_brl
-from app.services.leads.scoring import follow_up_sequence_for_state
+from app.services.leads.scoring import follow_up_sequence_for_state, update_adaptive_weights_realtime
 
 # The execution-assistance round's own UserNotification message prefix —
 # kept (not removed) purely so historical rows already written under it
@@ -94,6 +94,11 @@ async def execute_lead_action(
         )
         lead.next_action = None
         lead.next_action_due_at = None
+        # Real-Time Learning Engine (Task 1, final round) — the one place
+        # both manual (POST /leads/{id}/execute-action) and automated
+        # (auto_execute_engine()) message_sent writes go through, so this
+        # covers both without a second hook. Synchronous, in-memory.
+        update_adaptive_weights_realtime({"type": "message_sent", "organization_id": organization_id})
     elif action == "call_now":
         db.add(
             LeadActivityLog(

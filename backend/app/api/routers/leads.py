@@ -42,11 +42,14 @@ from app.services.leads.enrichment import generate_first_contact_message, simula
 from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
 from app.services.leads.scoring import (
     ACTION_ATTRIBUTION_MARKER,
+    ACTION_EVENT_TYPE_TO_ACTION_TYPE,
     LOSS_REASON_MARKER,
     RESPONSE_EVENT_TYPE_BY_STATE,
     compute_conversion_insights,
+    get_last_action_event_type,
     get_last_action_label,
     score_leads,
+    update_adaptive_weights_realtime,
 )
 
 logger = logging.getLogger("app.api.routers.leads")
@@ -894,6 +897,24 @@ async def update_lead_status(
                     )
                 )
 
+        # Real-Time Learning Engine (Task 1, final round) — nudges the
+        # in-memory realtime weights cache the moment a win/loss is
+        # recorded, rather than waiting for compute_adaptive_weights()'s
+        # own next 30-day batch recompute. Synchronous, in-memory; the one
+        # extra get_last_action_event_type() query for the lost branch is
+        # the same lightweight lookup the won branch's own action_label
+        # line above already pays for.
+        last_action_event_type = await get_last_action_event_type(db, lead.id)
+        update_adaptive_weights_realtime(
+            {
+                "type": "lead_won" if lead.status == "converted" else "lead_lost",
+                "organization_id": organization_id,
+                "industry": lead.enrichment_data.get("industry") if lead.enrichment_data else None,
+                "company_size": lead.enrichment_data.get("company_size") if lead.enrichment_data else None,
+                "action_type": ACTION_EVENT_TYPE_TO_ACTION_TYPE.get(last_action_event_type),
+            }
+        )
+
     await db.commit()
     await db.refresh(lead)
 
@@ -1128,6 +1149,20 @@ async def record_lead_response(
         )
     )
     await db.commit()
+
+    # Real-Time Learning Engine (Task 1, final round) — nudges the
+    # in-memory realtime weights cache (scoring.py) the moment a lead
+    # shows real interest, rather than waiting for compute_adaptive_
+    # weights()'s own next 30-day batch recompute. Synchronous, in-memory,
+    # no extra query.
+    if body.response == "interested":
+        update_adaptive_weights_realtime(
+            {
+                "type": "lead_interested",
+                "organization_id": organization_id,
+                "response_time_minutes": response_time_minutes,
+            }
+        )
 
     (scored_lead,) = await score_leads(db, [lead])
 

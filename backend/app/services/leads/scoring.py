@@ -17,6 +17,7 @@ from app.schemas.leads.lead import (
     RevenueAttributionResponse,
     ScoreBreakdownItem,
 )
+from app.schemas.performance import UserPerformanceResponse
 from app.services.leads.enrichment import (
     ACTION_ATTEMPT_CLOSE_DEAL,
     ACTION_AWAIT_RESPONSE,
@@ -1284,15 +1285,27 @@ _ACTION_EVENT_LABEL_PT = {
     "action_message": "mensagem",
     "action_meeting": "reunião",
 }
+# Reverse of ACTION_EFFECTIVENESS_EVENT_TYPE_BY_ACTION (execution_engine.py)
+# — that module already imports FROM this one, so the reverse import would
+# be circular (same precedent _RISK_LEVEL_ORDER's own comment already
+# explains for a different pair of constants). Used by
+# get_last_action_event_type()'s own callers that need the action_type
+# vocabulary ("call_now"/"send_message"/"schedule_meeting") rather than
+# this module's own PT display label.
+ACTION_EVENT_TYPE_TO_ACTION_TYPE = {
+    "action_call": "call_now",
+    "action_message": "send_message",
+    "action_meeting": "schedule_meeting",
+}
 
 
-async def get_last_action_label(db: AsyncSession, lead_id) -> str | None:
-    """Performance Feedback Loop (Task 9) — the most recent action_call/
-    action_message/action_meeting LeadActivityLog entry for this lead, in
-    plain Portuguese, for PATCH /leads/{id}/status to attribute a
-    conversion/loss to whichever channel was used last. Same "no FK, infer
-    by timestamp" approximation compute_action_effectiveness() already
-    discloses. None when this lead never had any action_* entry logged."""
+async def get_last_action_event_type(db: AsyncSession, lead_id) -> str | None:
+    """Shared query half of get_last_action_label() below — the raw
+    action_call/action_message/action_meeting event_type itself, for a
+    caller that needs ACTION_EVENT_TYPE_TO_ACTION_TYPE's own action_type
+    vocabulary (update_adaptive_weights_realtime()'s own "action:
+    {action_type}" key format, this module) rather than a PT display
+    label. None when this lead never had any action_* entry logged."""
     stmt = (
         select(LeadActivityLog.event_type)
         .where(
@@ -1302,7 +1315,17 @@ async def get_last_action_label(db: AsyncSession, lead_id) -> str | None:
         .order_by(LeadActivityLog.created_at.desc())
         .limit(1)
     )
-    event_type = (await db.execute(stmt)).scalar_one_or_none()
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def get_last_action_label(db: AsyncSession, lead_id) -> str | None:
+    """Performance Feedback Loop (Task 9) — the most recent action_call/
+    action_message/action_meeting LeadActivityLog entry for this lead, in
+    plain Portuguese, for PATCH /leads/{id}/status to attribute a
+    conversion/loss to whichever channel was used last. Same "no FK, infer
+    by timestamp" approximation compute_action_effectiveness() already
+    discloses. None when this lead never had any action_* entry logged."""
+    event_type = await get_last_action_event_type(db, lead_id)
     return _ACTION_EVENT_LABEL_PT.get(event_type) if event_type else None
 
 
@@ -1707,6 +1730,101 @@ async def compute_adaptive_weights(
                 weights[f"action:{action_type}"] = _clamp_adaptive_weight(rate, action_baseline)
 
     return weights
+
+
+# Real-Time Learning Engine (Task 1, final round) — a process-local,
+# in-memory companion to compute_adaptive_weights()'s own 30-day DB-backed
+# batch computation, keyed by organization_id then by the same signal keys
+# that function already produces ("industry:X", "action:X", "fast_response",
+# ...). Deliberately NOT a database table: the prompt's own ask is "store
+# in-memory or cache (no DB required)" for a fast, incremental nudge on
+# every relevant event, not a durable record. Disclosed limitation: this
+# dict is per-process (a multi-worker deployment has each worker learning
+# independently, and a restart clears it entirely) — compute_adaptive_
+# weights() remains the actual source of truth compute_lead_score() reads
+# every request; this cache is merged on top of (not instead of) that
+# batch result in score_leads() below, so a worker that hasn't seen an
+# event yet still falls back to the real, DB-backed figure.
+_REALTIME_WEIGHTS_CACHE: dict[str, dict[str, float]] = {}
+
+# The prompt's own literal EMA split (new = old*0.9 + observed*0.1) — a
+# small alpha so one single event nudges a weight rather than swinging it,
+# consistent with compute_adaptive_weights()'s own _ADAPTIVE_WEIGHTS_
+# MIN_SAMPLE_SIZE guard against over-reacting to one data point.
+_REALTIME_EMA_ALPHA = 0.1
+# observed_value inputs for each event type's own nudge — landing inside
+# the same [_ADAPTIVE_WEIGHT_MIN, _ADAPTIVE_WEIGHT_MAX] range those
+# weights are clamped to, so the EMA converges toward a sensible steady
+# state rather than an arbitrary one.
+_REALTIME_OBSERVED_WON = 1.5
+_REALTIME_OBSERVED_LOST = 0.8
+_REALTIME_OBSERVED_INTERESTED = 1.3
+_REALTIME_OBSERVED_ACTIVITY = 1.0
+
+
+def get_realtime_adaptive_weights(organization_id: str) -> dict[str, float]:
+    """Read-side of the Real-Time Learning Engine (Task 1) — whatever this
+    process has nudged for this org so far via update_adaptive_weights_
+    realtime() below. {} for an org this process hasn't seen an event for
+    yet (not an error — just "no realtime signal, fall back to the batch
+    figure")."""
+    return dict(_REALTIME_WEIGHTS_CACHE.get(organization_id, {}))
+
+
+def update_adaptive_weights_realtime(event: dict) -> None:
+    """Real-Time Learning Engine (Task 1, final round) — incrementally
+    nudges the in-memory realtime weights cache via a plain exponential
+    moving average (see _REALTIME_EMA_ALPHA's own comment for the exact
+    formula), instead of compute_adaptive_weights()'s own full 30-day
+    batch recompute. Synchronous and pure in-memory — no DB access, no
+    await needed, safe to call directly from any request handler that
+    just logged one of the four trigger events.
+
+    `event` is a plain dict (not a schema — this never crosses a network
+    boundary) with at least `type` (one of "lead_won"/"lead_lost"/
+    "lead_interested"/"message_sent") and `organization_id`; a call
+    missing either is silently a no-op. Each event type nudges whichever
+    keys it actually has signal for — a caller with no enrichment_data on
+    hand, say, simply omits `industry`/`company_size` and only the keys it
+    does supply get touched:
+      lead_won / lead_lost — nudges industry:{industry}, company_size:
+        {company_size}, action:{action_type} (whichever of the three are
+        present in `event`) toward _REALTIME_OBSERVED_WON/_LOST.
+      lead_interested — nudges "fast_response" toward _REALTIME_OBSERVED_
+        INTERESTED when `event["response_time_minutes"]` is under
+        _FAST_RESPONSE_MINUTES, and action:{action_type} the same way if
+        present.
+      message_sent — nudges action:send_message toward the neutral
+        _REALTIME_OBSERVED_ACTIVITY (1.0): a message going out is real
+        activity but carries no win/loss verdict of its own yet."""
+    event_type = event.get("type")
+    organization_id = event.get("organization_id")
+    if not event_type or not organization_id:
+        return
+
+    cache = _REALTIME_WEIGHTS_CACHE.setdefault(organization_id, {})
+
+    def nudge(key: str, observed_value: float) -> None:
+        old_weight = cache.get(key, 1.0)
+        new_weight = old_weight * (1 - _REALTIME_EMA_ALPHA) + observed_value * _REALTIME_EMA_ALPHA
+        cache[key] = round(max(_ADAPTIVE_WEIGHT_MIN, min(_ADAPTIVE_WEIGHT_MAX, new_weight)), 4)
+
+    if event_type in ("lead_won", "lead_lost"):
+        observed = _REALTIME_OBSERVED_WON if event_type == "lead_won" else _REALTIME_OBSERVED_LOST
+        if event.get("industry"):
+            nudge(f"industry:{event['industry']}", observed)
+        if event.get("company_size"):
+            nudge(f"company_size:{event['company_size']}", observed)
+        if event.get("action_type"):
+            nudge(f"action:{event['action_type']}", observed)
+    elif event_type == "lead_interested":
+        response_time_minutes = event.get("response_time_minutes")
+        if response_time_minutes is not None and response_time_minutes < _FAST_RESPONSE_MINUTES:
+            nudge("fast_response", _REALTIME_OBSERVED_INTERESTED)
+        if event.get("action_type"):
+            nudge(f"action:{event['action_type']}", _REALTIME_OBSERVED_INTERESTED)
+    elif event_type == "message_sent":
+        nudge("action:send_message", _REALTIME_OBSERVED_ACTIVITY)
 
 
 # Revenue-loop round — the same three action_* event types
@@ -2146,6 +2264,8 @@ def compute_action_type_and_urgency(
     acceleration_mode: bool = False,
     win_probability: int = 0,
     hunter_mode: bool = False,
+    aggression_level: str | None = None,
+    global_strategy_focus: str | None = None,
 ) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
@@ -2194,12 +2314,32 @@ def compute_action_type_and_urgency(
     behind on today's actionable revenue) and, unlike that check, scoped to
     new leads specifically: the whole point of Hunter Mode is chasing fresh
     high-value opportunities before the pipeline runs any drier, not
-    re-routing leads already being worked."""
+    re-routing leads already being worked.
+
+    Action Override Engine (Task 4, final round): aggression_level ==
+    "extreme" (compute_aggression_level(), this module) forces call_now on
+    every remaining non-terminal lead, checked right after the "critical"
+    tier's own call_now — an org-wide emergency still outranks it, same
+    "blanket policy beats a per-lead preference" precedent Acceleration
+    Mode/Hunter Mode already established above, but this one outranks even
+    those two: "extreme" is this system's own worst-case reading of the
+    whole pipeline, a stronger signal than either. Both new params default
+    to None — every existing caller that doesn't pass them (score_leads()'s
+    own internal call included) gets 100% unchanged behavior; only a
+    caller that has actually computed these two org-wide signals opts in.
+    global_strategy_focus (compute_global_strategy()) biases the channel
+    choice the same way the older top_revenue_action-based shift below
+    already does, just checked first since it's the more holistic signal
+    (revenue + response rate + win probability together, not revenue
+    alone) — "meetings" isn't handled here (only calls/messages), so it
+    falls through to the existing logic below unchanged."""
     if lead.status == "lost":
         return "drop_lead", "low"
     if lead.status == "converted":
         return None, None
     if risk_level == "critical":
+        return "call_now", "immediate"
+    if aggression_level == "extreme":
         return "call_now", "immediate"
     if acceleration_mode and win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
         return "call_now", "high"
@@ -2207,6 +2347,11 @@ def compute_action_type_and_urgency(
         return "call_now", "high"
 
     urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
+
+    if global_strategy_focus == "calls":
+        return "call_now", urgency
+    if global_strategy_focus == "messages":
+        return "send_message", urgency
 
     if top_revenue_action == "call":
         return "call_now", urgency
@@ -2218,6 +2363,64 @@ def compute_action_type_and_urgency(
     if risk_level == "medium":
         return "schedule_meeting", urgency
     return "monitor", urgency
+
+
+def apply_strategy_override(
+    response: LeadResponse,
+    *,
+    aggression_level: str | None = None,
+    global_strategy_focus: str | None = None,
+    top_revenue_action: str | None = None,
+) -> LeadResponse:
+    """Action Override Engine (Task 4, final round) — re-applies
+    compute_action_type_and_urgency() to an already-scored LeadResponse
+    with the two new org-wide signals filled in. Exists because
+    compute_global_strategy()/compute_aggression_level() both need an
+    already-scored `leads` list (plus response-rate/simulation figures)
+    as their own inputs — they can't run *inside* score_leads() without a
+    circular dependency — so this lets their result feed back into the
+    recommendation as a deliberate second pass a caller opts into, rather
+    than baking it into score_leads() itself (which stays 100% unchanged:
+    its own internal call to compute_action_type_and_urgency() never
+    passes these two params, so every existing reader of score_leads()
+    keeps getting the exact same recommendation as before this function
+    existed).
+
+    Passing `response` itself as compute_action_type_and_urgency()'s own
+    `lead` argument works even though that parameter is typed `Lead`:
+    the function only ever reads `.status` off it, a field LeadResponse
+    carries too. Reuses response.acceleration_mode/hunter_mode (both
+    already on LeadResponse) rather than requiring them as new params.
+
+    Returns a new LeadResponse (next_best_action_type/urgency updated,
+    ready_to_send_message/auto_action_available re-derived to match) —
+    never mutates its input, and returns the same object unchanged
+    whenever neither override signal actually changes the recommendation
+    (idempotent: calling this twice with the same inputs is a no-op the
+    second time)."""
+    action_type, action_urgency = compute_action_type_and_urgency(
+        response,
+        response.deal_risk_level,
+        expected_value=response.expected_value,
+        top_revenue_action=top_revenue_action,
+        acceleration_mode=response.acceleration_mode,
+        win_probability=response.win_probability,
+        hunter_mode=response.hunter_mode,
+        aggression_level=aggression_level,
+        global_strategy_focus=global_strategy_focus,
+    )
+    if action_type == response.next_best_action_type and action_urgency == response.next_best_action_urgency:
+        return response
+
+    is_ready_to_send = action_type == "send_message" and response.suggested_message is not None
+    return response.model_copy(
+        update={
+            "next_best_action_type": action_type,
+            "next_best_action_urgency": action_urgency,
+            "ready_to_send_message": response.suggested_message if is_ready_to_send else None,
+            "auto_action_available": is_ready_to_send,
+        }
+    )
 
 
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
@@ -2255,6 +2458,13 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     adaptive_weights = await compute_adaptive_weights(
         db, organization_id, action_effectiveness=action_effectiveness
     )
+    # Real-Time Learning Engine (Task 1, final round) — the process-local
+    # realtime cache overrides the batch figure key-for-key wherever it has
+    # a fresher opinion (an event since the last 30-day recompute), and
+    # falls back to the batch value everywhere else. See
+    # _REALTIME_WEIGHTS_CACHE's own comment for why this, not a DB write,
+    # is the source for the realtime half.
+    adaptive_weights = {**adaptive_weights, **get_realtime_adaptive_weights(organization_id)}
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -2707,3 +2917,253 @@ def simulate_revenue_if_all_actions_executed(leads: list[LeadResponse]) -> dict:
         "optimized_expected": optimized_expected,
         "delta": optimized_expected - current_expected,
     }
+
+
+# Global Strategy Engine's own thresholds (Task 2, final round) — the
+# prompt's own literal signals, each checked highest-priority first: a
+# structural communication problem (rule 1) outranks even a hot pipeline
+# (rule 2), which in turn outranks a merely-learned channel preference
+# (rule 3).
+_GLOBAL_STRATEGY_LOW_RESPONSE_RATE = 20.0
+_GLOBAL_STRATEGY_HIGH_WIN_PROBABILITY = 70
+
+
+def compute_global_strategy(
+    leads: list[LeadResponse],
+    *,
+    response_rate: float,
+    top_revenue_action: str | None,
+    team_performance: list[UserPerformanceResponse] | None = None,
+) -> dict:
+    """Global Strategy Engine (Task 2, final round) — one recommended
+    channel to focus effort on right now, plain deterministic rules (no
+    ML), highest-priority rule first:
+      1. response_rate below _GLOBAL_STRATEGY_LOW_RESPONSE_RATE
+         (compute_response_metrics()'s own all-time figure, same one the
+         Command Center's "X% das suas mensagens recebem resposta" line
+         already shows) — a structural communication problem outranks any
+         learned preference; focus messages until it's fixed. When
+         `team_performance` is also given, the team's own average
+         response_rate is folded in too (the lower of the two wins) — not
+         its own separate rule, since the prompt lists exactly three
+         focus signals, not four.
+      2. the open pipeline's own average win_probability >=
+         _GLOBAL_STRATEGY_HIGH_WIN_PROBABILITY — this close to closing is
+         worth pushing toward meetings.
+      3. top_revenue_action == "call" (compute_revenue_attribution()'s own
+         org-wide learned highest-earning channel, reused rather than
+         recomputed here) — lean into what's already proven to work.
+      4. Default: messages, the safest, lowest-commitment channel when no
+         signal points anywhere specific.
+
+    Pure, no DB access — `leads`/`response_rate`/`top_revenue_action`/
+    `team_performance` are all already-computed inputs a caller assembles
+    from score_leads()/compute_response_metrics()/compute_revenue_
+    attribution()/compute_user_performance(), the same "accept already-
+    computed aggregates, don't refetch them" style
+    simulate_revenue_if_all_actions_executed() just above already uses."""
+    if team_performance:
+        team_response_rates = [performance.response_rate for performance in team_performance]
+        team_avg_response_rate = sum(team_response_rates) / len(team_response_rates)
+        response_rate = min(response_rate, team_avg_response_rate)
+
+    if response_rate < _GLOBAL_STRATEGY_LOW_RESPONSE_RATE:
+        return {
+            "focus": "messages",
+            "reason": f"Taxa de resposta em {response_rate:.0f}% — abaixo do saudável, foque em reconectar.",
+            "confidence": 80,
+        }
+
+    open_leads = [lead for lead in leads if lead.status not in ("converted", "lost")]
+    avg_win_probability = (
+        sum(lead.win_probability for lead in open_leads) / len(open_leads) if open_leads else 0
+    )
+    if avg_win_probability >= _GLOBAL_STRATEGY_HIGH_WIN_PROBABILITY:
+        return {
+            "focus": "meetings",
+            "reason": f"Probabilidade média de fechamento em {avg_win_probability:.0f}% — hora de agendar reuniões.",
+            "confidence": 85,
+        }
+
+    if top_revenue_action == "call":
+        return {
+            "focus": "calls",
+            "reason": "Ligações são o canal que historicamente mais gera receita real.",
+            "confidence": 75,
+        }
+
+    return {
+        "focus": "messages",
+        "reason": "Sem sinal dominante no momento — mensagens são o canal mais seguro agora.",
+        "confidence": 50,
+    }
+
+
+# Dynamic Aggression Mode's own thresholds (Task 3, final round) — the
+# prompt's own literal percentages, read against the Revenue Simulation
+# Engine's own current_expected/delta (simulate_revenue_if_all_actions_
+# executed(), just above) rather than a separate daily-target/gap figure
+# (GET /workday/target's own WorkdayTargetResponse): that would need a
+# third data source this function's own two-signal ask doesn't call for,
+# where current_expected/delta already answer the same question — "how
+# much upside is on the table relative to what's already expected" reads
+# as exactly the "gap" the prompt's own English description points at.
+_AGGRESSION_HIGH_LOST_RATIO = 0.2
+_AGGRESSION_EXTREME_GAP_RATIO = 0.5
+
+
+def compute_aggression_level(*, lost_opportunity_today: int, current_expected: int, delta: int) -> str:
+    """Dynamic Aggression Mode (Task 3, final round) — "low"/"medium"/
+    "high"/"extreme", worst-condition-first (same severity-ordering
+    precedent compute_deal_risk() already sets):
+      extreme — delta (the Revenue Simulation Engine's own optimistic
+        upside) is more than _AGGRESSION_EXTREME_GAP_RATIO (50%) of
+        current_expected: over half of what's already expected is still
+        sitting there uncaptured.
+      high — lost_opportunity_today (compute_lost_opportunity_today(),
+        workday_engine.py) is more than _AGGRESSION_HIGH_LOST_RATIO (20%)
+        of current_expected.
+      low — current_expected is 0 with nothing lost today either, or
+        there's no real upside left (delta <= 0) and nothing lost today —
+        pipeline genuinely under control.
+      medium — everything else (some real signal, but below both harsher
+        bars).
+
+    Pure, no DB access — current_expected/delta come straight from
+    simulate_revenue_if_all_actions_executed()'s own return dict."""
+    if current_expected <= 0:
+        return "high" if lost_opportunity_today > 0 else "low"
+
+    gap_ratio = delta / current_expected
+    lost_ratio = lost_opportunity_today / current_expected
+
+    if gap_ratio > _AGGRESSION_EXTREME_GAP_RATIO:
+        return "extreme"
+    if lost_ratio > _AGGRESSION_HIGH_LOST_RATIO:
+        return "high"
+    if delta <= 0 and lost_opportunity_today <= 0:
+        return "low"
+    return "medium"
+
+
+# Revenue Leak Detector's own thresholds (Task 5, final round) —
+# _REVENUE_LEAK_IGNORED_MINUTES reuses the same 24h bar the sales-
+# operating-system round's own pending-response penalty already uses
+# (_PENDING_RESPONSE_DELAY_MINUTES_HIGH), rather than a second, separately-
+# tuned "ignored" threshold that could silently drift from it.
+_REVENUE_LEAK_IGNORED_MINUTES = _PENDING_RESPONSE_DELAY_MINUTES_HIGH
+_REVENUE_LEAK_STUCK_DAYS = 7
+
+
+def detect_revenue_leaks(leads: list[LeadResponse]) -> dict:
+    """Revenue Leak Detector (Task 5, final round) — three independent
+    leak patterns over an already-scored `leads` list, no DB access:
+      leads_ignored_over_24h — has_pending_response and
+        response_delay_minutes over _REVENUE_LEAK_IGNORED_MINUTES: a
+        message sent, nobody's followed up on the silence.
+      high_value_leads_without_action — still-open, expected_value >=
+        HIGH_VALUE_LEAD_THRESHOLD, and next_best_action_type is either
+        unset or "monitor" — a big deal with no concrete next step.
+      leads_stuck_same_stage — still in "new"/"contacted" (never
+        progressed) and days_since_last_activity over
+        _REVENUE_LEAK_STUCK_DAYS.
+
+    total_leak_value sums expected_value across the union of all three
+    (a lead counted under more than one pattern isn't double-counted)."""
+    ignored = [
+        lead
+        for lead in leads
+        if lead.has_pending_response
+        and lead.response_delay_minutes is not None
+        and lead.response_delay_minutes > _REVENUE_LEAK_IGNORED_MINUTES
+    ]
+    high_value_no_action = [
+        lead
+        for lead in leads
+        if lead.status not in ("converted", "lost")
+        and lead.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+        and lead.next_best_action_type in (None, "monitor")
+    ]
+    stuck = [
+        lead
+        for lead in leads
+        if lead.status in ("new", "contacted")
+        and lead.days_since_last_activity > _REVENUE_LEAK_STUCK_DAYS
+    ]
+
+    leaking_lead_ids = (
+        {lead.id for lead in ignored}
+        | {lead.id for lead in high_value_no_action}
+        | {lead.id for lead in stuck}
+    )
+    total_leak_value = sum(
+        lead.expected_value for lead in leads if lead.id in leaking_lead_ids
+    )
+
+    return {
+        "leads_ignored_over_24h": len(ignored),
+        "high_value_leads_without_action": len(high_value_no_action),
+        "leads_stuck_same_stage": len(stuck),
+        "total_leak_value": total_leak_value,
+    }
+
+
+# Auto-Correction Engine's own thresholds (Task 6, final round).
+_AUTO_CORRECT_NEGLECT_DAYS = 3
+_AUTO_CORRECT_COLD_WIN_PROBABILITY = 15
+
+
+def auto_correct_pipeline(leads: list[LeadResponse]) -> list[LeadResponse]:
+    """Auto-Correction Engine (Task 6, final round) — a pure, in-memory
+    second pass over an already-scored/ranked `leads` list: no DB write,
+    no mutation of anything persisted, just a corrected copy of the list
+    a caller can render instead of the raw one.
+      escalate neglected leads — still open, idle over
+        _AUTO_CORRECT_NEGLECT_DAYS days, and not cold (see below):
+        next_best_action_urgency bumped to "high" (never above
+        "immediate" — an escalation, not a false emergency).
+      downgrade cold leads — win_probability under
+        _AUTO_CORRECT_COLD_WIN_PROBABILITY AND idle over
+        _AUTO_CORRECT_NEGLECT_DAYS: urgency dropped to "low". Checked
+        *before* the escalation rule above (a lead matching both reads as
+        "genuinely dead," not "neglected but still worth chasing" — same
+        "worse condition wins, conditions don't stack" precedent
+        compute_deal_risk()'s own severity ordering already sets).
+      re-prioritize queue — the corrected list is re-sorted by the exact
+        same revenue-first key rank_leads_by_priority() already uses
+        (risk tier, expected_value, win_probability, opportunity_cost,
+        score, momentum_score), so a caller sees a freshly-corrected
+        order without a second DB round-trip.
+
+    Idempotent: running this twice on its own output is a no-op the
+    second time (nothing left to escalate/downgrade differently) other
+    than the sort itself, which is already stable at that point too."""
+    corrected: list[LeadResponse] = []
+    for lead in leads:
+        urgency = lead.next_best_action_urgency
+        if lead.status not in ("converted", "lost"):
+            is_cold = (
+                lead.win_probability < _AUTO_CORRECT_COLD_WIN_PROBABILITY
+                and lead.days_since_last_activity > _AUTO_CORRECT_NEGLECT_DAYS
+            )
+            if is_cold:
+                urgency = "low"
+            elif lead.days_since_last_activity > _AUTO_CORRECT_NEGLECT_DAYS and urgency != "immediate":
+                urgency = "high"
+
+        corrected.append(
+            lead if urgency == lead.next_best_action_urgency
+            else lead.model_copy(update={"next_best_action_urgency": urgency})
+        )
+
+    corrected.sort(
+        key=lambda response: (
+            -_RISK_LEVEL_ORDER.get(response.deal_risk_level, 0),
+            -response.expected_value,
+            -response.win_probability,
+            -response.opportunity_cost,
+            -response.score,
+            -response.momentum_score,
+        )
+    )
+    return corrected
