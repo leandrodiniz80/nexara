@@ -9,16 +9,21 @@ from app.core.config import settings
 from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
-from app.schemas.leads.lead import LeadResponse, ScoreBreakdownItem
+from app.schemas.leads.lead import ConversionInsightsResponse, LeadResponse, ScoreBreakdownItem
 from app.services.leads.enrichment import (
+    ACTION_CLOSE_DEAL,
     ACTION_FIRST_CONTACT,
     ACTION_FOLLOW_UP,
+    ACTION_MAXIMUM_URGENCY_FOLLOW_UP,
+    ACTION_NURTURE_OR_DISCARD,
     ACTION_URGENT_FOLLOW_UP,
     COMPANY_SIZE_PT,
     COMPANY_SIZE_SCORE_IMPACT,
     HIGH_VALUE_INDUSTRIES,
+    HIGH_VALUE_LEAD_THRESHOLD,
     INDUSTRY_PT,
     LARGE_COMPANY_SIZES,
+    format_brl,
     generate_lead_message_by_action,
     get_lead_estimated_value,
 )
@@ -46,6 +51,28 @@ _HIGH_WIN_PROBABILITY_THRESHOLD = 70
 # codebase's other secondary signals (Recent automation activity,
 # High-value sector, Larger company all use +10 too).
 _HIGH_WIN_PROBABILITY_SCORE_BONUS = 10
+# compute_next_best_action()'s "low probability" cutoff (feedback-loop
+# round) — same <40 red-badge threshold the frontend's own
+# getWinProbabilityVariant (lead-card.tsx) already uses, so a lead reading
+# as "red" there is exactly the one nurture-or-discard picks out here.
+_LOW_WIN_PROBABILITY_THRESHOLD = 40
+# compute_lead_score()'s "no activity" cutoff for the smart follow-up
+# escalation penalty (feedback-loop round) — deliberately > (not >=) the
+# existing "Contacted with no recent follow-up" line's own 3-day cutoff
+# just below, so day 3 gets the original mild warning and day 4+ stacks
+# this harsher one on top, same "layers stack additively" precedent this
+# function's own docstring already documents for the overdue/idle lines.
+_FOLLOW_UP_ESCALATION_IDLE_DAYS = 3
+# compute_lead_score()'s adaptive-scoring bonuses (feedback-loop round) —
+# rewarding a lead that matches the org's own real-world highest-converting
+# profile (compute_conversion_insights()). Industry counts for more than
+# company size since it's historically the stronger conversion signal in
+# this codebase's own high-value groupings (HIGH_VALUE_INDUSTRIES already
+# outweighs LARGE_COMPANY_SIZES the same way in compute_lead_score's
+# existing enrichment section: +10 vs. the size line's own smaller
+# contribution).
+_CONVERSION_PROFILE_INDUSTRY_BONUS = 10
+_CONVERSION_PROFILE_COMPANY_SIZE_BONUS = 8
 
 
 def compute_win_probability(
@@ -88,18 +115,48 @@ def compute_win_probability(
     return max(0, min(100, probability))
 
 
-def compute_next_best_action(lead: Lead, *, is_overdue: bool) -> str | None:
+def compute_next_best_action(
+    lead: Lead, *, is_overdue: bool, now: datetime, win_probability: int
+) -> str | None:
     """"What should I do about this lead right now" — a plain rule table on
     status (+ overdue), no ML/LLM involved. Converted (and any other status
     outside new/contacted, e.g. lost) has nothing left to act on. Builds on
-    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP
-    (enrichment.py) rather than its own string literals, since
-    generate_lead_message_by_action() matches on those same prefixes to
-    pick a message tone for suggested_message."""
+    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP/
+    ACTION_MAXIMUM_URGENCY_FOLLOW_UP/ACTION_CLOSE_DEAL/
+    ACTION_NURTURE_OR_DISCARD (enrichment.py) rather than its own string
+    literals, since generate_lead_message_by_action() matches on those same
+    prefixes to pick a message tone for suggested_message.
+
+    Next Best Action 2.0 (feedback-loop round): for a "contacted" lead,
+    win_probability and days since last activity (recomputed here from
+    lead.updated_at, same "cheap, pure, independently derived" precedent as
+    compute_win_probability's own is_overdue/days_idle) now refine the plain
+    overdue check into one ordered decision tree, highest-priority rule
+    first:
+      1. No activity in over _FOLLOW_UP_ESCALATION_IDLE_DAYS days — stop
+         being passive, regardless of anything else (this is also
+         compute_lead_score's -30 escalation-penalty trigger).
+      2. Its next_action is overdue — the original urgent-follow-up case.
+      3. High win_probability (and, by rule 1 not having fired, recent
+         activity) — the deal is warm, go close it.
+      4. Low win_probability — not worth aggressive chasing; nurture or
+         let it go cold on its own.
+      5. Otherwise — the original plain follow-up.
+    """
     if lead.status == "new":
         action = ACTION_FIRST_CONTACT
     elif lead.status == "contacted":
-        action = ACTION_URGENT_FOLLOW_UP if is_overdue else ACTION_FOLLOW_UP
+        days_idle = (now - lead.updated_at).days
+        if days_idle > _FOLLOW_UP_ESCALATION_IDLE_DAYS:
+            action = ACTION_MAXIMUM_URGENCY_FOLLOW_UP
+        elif is_overdue:
+            action = ACTION_URGENT_FOLLOW_UP
+        elif win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
+            action = ACTION_CLOSE_DEAL
+        elif win_probability < _LOW_WIN_PROBABILITY_THRESHOLD:
+            action = ACTION_NURTURE_OR_DISCARD
+        else:
+            action = ACTION_FOLLOW_UP
     else:
         return None
 
@@ -118,6 +175,7 @@ def compute_lead_score(
     has_recent_automation: bool,
     has_recent_manual_activity: bool,
     task_completed_recently: bool,
+    insights: ConversionInsightsResponse,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem], int]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -191,6 +249,19 @@ def compute_lead_score(
         )
         total += contacted_impact
 
+    # Smart follow-up escalation (feedback-loop round) — stacks on top of
+    # the -15 line just above rather than replacing it, same "layers
+    # compound, they don't override" precedent as the overdue lines below.
+    if lead.status == "contacted" and days_idle > _FOLLOW_UP_ESCALATION_IDLE_DAYS:
+        escalation_impact = -30
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="Follow-up overdue — escalating to maximum urgency",
+                impact=escalation_impact,
+            )
+        )
+        total += escalation_impact
+
     if lead.next_action_due_at is not None and lead.next_action_due_at < now:
         overdue_impact = -30
         label = f"Overdue task: {lead.next_action}" if lead.next_action else "Overdue task"
@@ -249,6 +320,32 @@ def compute_lead_score(
                 ScoreBreakdownItem(reason="High revenue potential", impact=revenue_impact)
             )
             total += revenue_impact
+
+        # Adaptive scoring (feedback-loop round) — reward matching the
+        # org's own real, learned highest-converting profile
+        # (compute_conversion_insights()), on top of (not instead of) the
+        # static high-value-industry/larger-company lines above, which
+        # reward a fixed, hardcoded notion of "good" rather than a learned
+        # one.
+        if insights.best_industry and industry == insights.best_industry:
+            profile_industry_impact = _CONVERSION_PROFILE_INDUSTRY_BONUS
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Matches high-conversion profile: top-converting industry",
+                    impact=profile_industry_impact,
+                )
+            )
+            total += profile_industry_impact
+
+        if insights.best_company_size and company_size == insights.best_company_size:
+            profile_size_impact = _CONVERSION_PROFILE_COMPANY_SIZE_BONUS
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Matches high-conversion profile: top-converting company size",
+                    impact=profile_size_impact,
+                )
+            )
+            total += profile_size_impact
     else:
         unenriched_impact = -5
         breakdown.append(
@@ -273,19 +370,152 @@ def compute_lead_score(
     return max(0, min(100, total)), breakdown, win_probability
 
 
+# Prefix compute_conversion_insights() writes into LeadActivityLog.message
+# for a lost-lead outcome entry (see PATCH /leads/{id}/status, leads.py) and
+# reads back to aggregate top_loss_reason. There's no metadata/JSONB column
+# on LeadActivityLog to carry the reason as structured data (see that
+# model's own docstring), so it's encoded in the message behind this fixed
+# marker instead — the same "structured info via string matching" technique
+# generate_lead_message_by_action() already uses for next_best_action.
+LOSS_REASON_MARKER = "Motivo: "
+
+
+async def compute_conversion_insights(
+    db: AsyncSession, organization_id: str
+) -> ConversionInsightsResponse:
+    """Mines the org's own real outcomes for what actually converts — no
+    ML, three plain aggregations over already-recorded data. Every field is
+    None until there's enough real signal to say something, rather than a
+    misleading default. Exactly two queries regardless of org size (a
+    converted-leads row scan, an outcome-log row scan), same "one shared
+    query per batch" precedent as score_leads()'s own two queries below —
+    called once per score_leads() batch, not per lead.
+
+    best_industry/best_company_size: the most frequent enrichment_data
+    value among this org's *converted* leads — "what wins" isn't about
+    every lead, only the ones that actually closed.
+
+    avg_time_to_close_days/top_loss_reason: read from LeadActivityLog's
+    "lead_won"/"lead_lost" outcome entries (PATCH /leads/{id}/status writes
+    these — see leads.py), not LeadStatusHistory: the exact elapsed time is
+    already captured per-event on duration_seconds at the moment of the
+    transition, which is both simpler and more precise than re-deriving it
+    from created_at/a status-history timestamp after the fact.
+    """
+    converted_stmt = select(Lead.enrichment_data).where(
+        Lead.organization_id == organization_id,
+        Lead.status == "converted",
+        Lead.deleted_at.is_(None),
+        Lead.enrichment_data.is_not(None),
+    )
+    converted_rows = (await db.execute(converted_stmt)).scalars().all()
+
+    industry_counts: dict[str, int] = {}
+    company_size_counts: dict[str, int] = {}
+    for enrichment_data in converted_rows:
+        industry = enrichment_data.get("industry")
+        if industry:
+            industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        company_size = enrichment_data.get("company_size")
+        if company_size:
+            company_size_counts[company_size] = company_size_counts.get(company_size, 0) + 1
+
+    best_industry = max(industry_counts, key=industry_counts.get) if industry_counts else None
+    best_company_size = (
+        max(company_size_counts, key=company_size_counts.get) if company_size_counts else None
+    )
+
+    outcomes_stmt = select(
+        LeadActivityLog.event_type, LeadActivityLog.message, LeadActivityLog.duration_seconds
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type.in_(["lead_won", "lead_lost"]),
+    )
+    outcome_rows = (await db.execute(outcomes_stmt)).all()
+
+    close_days = [
+        row.duration_seconds / 86400
+        for row in outcome_rows
+        if row.event_type == "lead_won" and row.duration_seconds is not None
+    ]
+    avg_time_to_close_days = round(sum(close_days) / len(close_days)) if close_days else None
+
+    loss_reason_counts: dict[str, int] = {}
+    for row in outcome_rows:
+        if row.event_type != "lead_lost" or LOSS_REASON_MARKER not in row.message:
+            continue
+        reason = row.message.split(LOSS_REASON_MARKER, 1)[1].strip()
+        if reason:
+            loss_reason_counts[reason] = loss_reason_counts.get(reason, 0) + 1
+    top_loss_reason = (
+        max(loss_reason_counts, key=loss_reason_counts.get) if loss_reason_counts else None
+    )
+
+    return ConversionInsightsResponse(
+        best_industry=best_industry,
+        best_company_size=best_company_size,
+        avg_time_to_close_days=avg_time_to_close_days,
+        top_loss_reason=top_loss_reason,
+    )
+
+
+def build_priority_reason(
+    lead: Lead,
+    *,
+    estimated_value: int,
+    win_probability: int,
+    days_idle: int,
+    is_overdue: bool,
+) -> str:
+    """"Why this lead?" (feedback-loop round) — one ready-to-render
+    sentence explaining the same signals score_leads() already computed for
+    this lead, composed from whichever of them are actually notable rather
+    than always listing every factor. Pure/no DB access, same reasoning
+    style as compute_next_best_action()."""
+    if lead.status == "converted":
+        return "Lead convertido — nada a fazer."
+    if lead.status == "lost":
+        return "Lead perdido — nada a fazer."
+
+    clauses: list[str] = []
+    if estimated_value >= HIGH_VALUE_LEAD_THRESHOLD:
+        clauses.append(f"lead de alto valor (R$ {format_brl(estimated_value)})")
+    if win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
+        clauses.append(f"alta probabilidade ({win_probability}%)")
+    elif win_probability < _LOW_WIN_PROBABILITY_THRESHOLD:
+        clauses.append(f"baixa probabilidade ({win_probability}%)")
+    if is_overdue:
+        clauses.append("com tarefa atrasada")
+    elif days_idle > _FOLLOW_UP_ESCALATION_IDLE_DAYS:
+        clauses.append(f"sem atividade há {days_idle} dias")
+
+    if not clauses:
+        return "Lead em acompanhamento normal, sem sinais fortes de prioridade no momento."
+
+    sentence = clauses[0] if len(clauses) == 1 else ", ".join(clauses[:-1]) + f" e {clauses[-1]}"
+    return sentence[0].upper() + sentence[1:] + "."
+
+
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
     LeadResponse.model_validate(lead) every lead-returning endpoint used
-    before this. Exactly two extra queries total (recent automation
-    activity, recent manual activity) for the whole batch, regardless of
-    how many leads are passed in — no N+1."""
+    before this. Four extra queries total (recent automation activity,
+    recent manual activity, plus compute_conversion_insights()'s own two)
+    for the whole batch, regardless of how many leads are passed in — no
+    N+1."""
     if not leads:
         return []
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=_RECENT_AUTOMATION_DAYS)
     lead_ids = [lead.id for lead in leads]
+
+    # Every call site scopes `leads` to a single organization already (the
+    # same invariant the automation/manual-activity queries below rely on
+    # by filtering only on lead_id, not organization_id) — so the first
+    # lead's organization_id is this whole batch's.
+    insights = await compute_conversion_insights(db, leads[0].organization_id)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -325,12 +555,16 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             has_recent_automation=lead.id in recent_lead_ids,
             has_recent_manual_activity=lead.id in recent_manual_activity_ids,
             task_completed_recently=lead.id in recent_task_completed_ids,
+            insights=insights,
             now=now,
         )
         is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
         days_overdue = (now - lead.next_action_due_at).days if is_overdue else None
+        days_idle = (now - lead.updated_at).days
 
-        next_best_action = compute_next_best_action(lead, is_overdue=is_overdue)
+        next_best_action = compute_next_best_action(
+            lead, is_overdue=is_overdue, now=now, win_probability=win_probability
+        )
         suggested_message = (
             generate_lead_message_by_action(lead, next_best_action, lead.owner_email or "the team")
             if next_best_action is not None and settings.AI_ENABLED
@@ -345,6 +579,14 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
         estimated_value = get_lead_estimated_value(lead)
         expected_value = round(estimated_value * win_probability / 100)
 
+        priority_reason = build_priority_reason(
+            lead,
+            estimated_value=round(estimated_value),
+            win_probability=win_probability,
+            days_idle=days_idle,
+            is_overdue=is_overdue,
+        )
+
         response = LeadResponse.model_validate(lead)
         responses.append(
             response.model_copy(
@@ -358,6 +600,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "win_probability": win_probability,
                     "estimated_value": round(estimated_value),
                     "expected_value": expected_value,
+                    "priority_reason": priority_reason,
                 }
             )
         )

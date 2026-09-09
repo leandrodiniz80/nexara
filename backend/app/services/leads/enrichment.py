@@ -92,6 +92,19 @@ ACTION_FIRST_CONTACT = "Fazer primeiro contato"
 ACTION_URGENT_FOLLOW_UP = "Fazer follow-up urgente"
 ACTION_FOLLOW_UP = "Acompanhar lead"
 
+# Feedback-loop round's Next Best Action 2.0 (scoring.py) — three more
+# labels on top of the original three above, same "generate_lead_message_by_
+# action() matches on the prefix" contract.
+ACTION_MAXIMUM_URGENCY_FOLLOW_UP = "Fazer follow-up com urgência máxima"
+ACTION_CLOSE_DEAL = "Fechar negócio agora"
+ACTION_NURTURE_OR_DISCARD = "Nutrir lead ou descartar"
+
+# "High-value lead" for build_priority_reason()/compute_lead_score's adaptive-
+# scoring line (scoring.py) and workday_engine.py's per-lead alert — one
+# shared threshold (a médio/grande-porte deal, COMPANY_SIZE_REVENUE_ESTIMATE)
+# instead of two separately-maintained copies of the same 5000.0 constant.
+HIGH_VALUE_LEAD_THRESHOLD = 5000.0
+
 
 def _seeded_choice(seed: str, salt: str, options: list[str]) -> str:
     """Deterministic pick keyed on the lead's own id — the same lead always
@@ -129,6 +142,15 @@ def simulate_enrichment(lead: Lead) -> None:
         ),
         "enriched_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def format_brl(value: float) -> str:
+    """1234567.0 -> '1.234.567' — pt-BR thousands separator, no decimals.
+    Duplicated from workday_engine.py's own format_brl() rather than
+    imported from there: workday_engine.py already imports FROM this
+    module's sibling scoring.py, so the reverse import would be circular.
+    Same rounding-estimate rationale as that copy — not exact currency."""
+    return f"{value:,.0f}".replace(",", ".")
 
 
 def get_lead_estimated_value(lead: Lead) -> float:
@@ -218,6 +240,23 @@ def generate_lead_message_by_action(
             f"Passando para ver se faz sentido continuarmos a conversa sobre como ajudar "
             f"a {company}.{context}\n\n"
             "Sem pressa nenhuma — qualquer retorno é bem-vindo quando for conveniente para você."
+        )
+    elif action.startswith(ACTION_MAXIMUM_URGENCY_FOLLOW_UP):
+        body = (
+            "Preciso muito falar com você antes que essa conversa esfrie de vez — já faz alguns "
+            f"dias desde nosso último contato.{context}\n\n"
+            "Consigo me adaptar completamente à sua agenda: qual o melhor horário ainda essa semana?"
+        )
+    elif action.startswith(ACTION_CLOSE_DEAL):
+        body = (
+            f"Pelo nosso histórico de conversa, acredito que já temos tudo alinhado para a {company} "
+            f"seguir em frente.{context}\n\n"
+            "Podemos fechar os detalhes finais ainda hoje?"
+        )
+    elif action.startswith(ACTION_NURTURE_OR_DISCARD):
+        body = (
+            f"Não quero ser inconveniente — só queria deixar a porta aberta para a {company}.{context}\n\n"
+            "Se em algum momento fizer sentido retomar, é só me chamar."
         )
     else:
         return None

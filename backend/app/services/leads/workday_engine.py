@@ -11,6 +11,7 @@ from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import FailureState
+from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD
 from app.services.leads.scoring import rank_leads_by_priority
 
 # detect_user_failure_state()'s thresholds — see its own docstring.
@@ -25,10 +26,11 @@ _PERFORMANCE_ALERT_DEDUP_HOURS = 6
 # rhythm as the org-wide performance alert above, just keyed per-lead
 # instead of per-user.
 _HIGH_VALUE_ALERT_DEDUP_HOURS = 6
-# "High-value" for the per-lead alert below — a médio/grande-porte deal
-# (COMPANY_SIZE_REVENUE_ESTIMATE), the same bucket compute_lead_score's own
-# "High revenue potential" line rewards.
-_HIGH_VALUE_ALERT_THRESHOLD = 5000.0
+# "High-value" for the per-lead alert below — same shared threshold
+# build_priority_reason() (scoring.py) now also uses, consolidated into
+# enrichment.py (feedback-loop round) instead of two separately-maintained
+# copies of the same 5000.0 constant.
+_HIGH_VALUE_ALERT_THRESHOLD = HIGH_VALUE_LEAD_THRESHOLD
 # "No activity" for the per-lead alert — same 7-day window
 # compute_win_probability's own idle penalty and compute_lead_score's "Idle
 # for over a week" line already use.

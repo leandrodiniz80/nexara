@@ -19,6 +19,12 @@ class LeadCreate(BaseModel):
 
 class LeadUpdateStatus(BaseModel):
     status: str = Field(pattern="^(new|contacted|converted|lost)$")
+    # Only meaningful on a transition to "lost" (why it was lost) — the
+    # frontend's dedicated "Mark as lost" flow always sends one of a fixed
+    # set of options ("Preço alto"/"Sem resposta"/"Sem interesse"/"Timing"),
+    # but this stays a plain string rather than a Literal so a future reason
+    # doesn't require a schema change. Ignored for every other status.
+    reason: str | None = None
 
 
 class ScoreBreakdownItem(BaseModel):
@@ -83,6 +89,13 @@ class LeadResponse(BaseModel):
     win_probability: int = 0
     estimated_value: int = 0
     expected_value: int = 0
+    # Learning-layer explainability (feedback-loop round) — one ready-to-
+    # render sentence built by build_priority_reason() (scoring.py) from the
+    # same signals already driving score/win_probability/next_best_action,
+    # same "the backend writes the sentence" rule as focus_message/
+    # accountability_message. Always populated by score_leads(), never
+    # empty — even a quiet lead gets a neutral sentence.
+    priority_reason: str = ""
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None
@@ -198,6 +211,19 @@ class GenerateMessageResponse(BaseModel):
     see generate_first_contact_message() in enrichment.py."""
 
     message: str
+
+
+class ConversionInsightsResponse(BaseModel):
+    """GET /leads/insights — org-wide patterns mined from real outcomes
+    (compute_conversion_insights(), scoring.py), backing the dashboard's
+    Learning Panel. Every field is None until there's enough real outcome
+    data to say something (e.g. no lead converted yet), rather than a
+    misleading default value."""
+
+    best_industry: str | None = None
+    best_company_size: str | None = None
+    avg_time_to_close_days: int | None = None
+    top_loss_reason: str | None = None
 
 
 class LeadActivityFeedEntry(BaseModel):

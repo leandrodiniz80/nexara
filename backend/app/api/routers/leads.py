@@ -15,9 +15,11 @@ from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.leads.lead_status_history import LeadStatusHistory
+from app.models.notifications.user_notification import UserNotification
 from app.models.platform_auth.user import PlatformUser
 from app.models.platform_auth.user_organization import PlatformUserOrganization
 from app.schemas.leads.lead import (
+    ConversionInsightsResponse,
     GenerateMessageResponse,
     LeadActivityFeedEntry,
     LeadCreate,
@@ -35,7 +37,7 @@ from app.schemas.leads.lead import (
 )
 from app.services.leads.automation_engine import fire_stale_lead_automations, run_automations
 from app.services.leads.enrichment import generate_first_contact_message, simulate_enrichment
-from app.services.leads.scoring import score_leads
+from app.services.leads.scoring import LOSS_REASON_MARKER, compute_conversion_insights, score_leads
 
 logger = logging.getLogger("app.api.routers.leads")
 
@@ -420,6 +422,32 @@ async def get_leads_activity_feed(
     )
 
 
+@router.get("/insights", response_model=ApiResponse[ConversionInsightsResponse])
+async def get_leads_insights(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[ConversionInsightsResponse]:
+    """Feedback-loop round — backs the dashboard's Learning Panel: what's
+    actually converting for this org (best_industry/best_company_size),
+    how long it typically takes (avg_time_to_close_days), and what's
+    costing the most deals (top_loss_reason). See
+    compute_conversion_insights() (scoring.py) for how each is derived —
+    same two org-scoped queries score_leads() already runs on every
+    request, exposed here as its own read for the dashboard."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    insights = await compute_conversion_insights(db, organization_id)
+
+    return ApiResponse(
+        success=True,
+        data=insights,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
 @router.post("", response_model=ApiResponse[LeadCreateResponse])
 async def create_lead(
     body: LeadCreate,
@@ -787,6 +815,58 @@ async def update_lead_status(
         lead.in_focus = False
         lead.focused_at = None
         lead.focused_by_email = None
+
+    # Close the loop (feedback-loop round) — an outcome entry is what
+    # compute_conversion_insights() (scoring.py) later mines for what
+    # actually converts and why leads are lost. LeadActivityLog has no
+    # metadata/JSONB column (see that model's own docstring), so
+    # time-to-close lives on the existing duration_seconds column and the
+    # loss reason is encoded in `message` behind LOSS_REASON_MARKER — the
+    # same fixed marker compute_conversion_insights() parses back out.
+    if from_status != lead.status and lead.status in ("converted", "lost"):
+        time_to_close_seconds = int((datetime.now(timezone.utc) - lead.created_at).total_seconds())
+        if lead.status == "converted":
+            db.add(
+                LeadActivityLog(
+                    organization_id=organization_id,
+                    lead_id=lead.id,
+                    lead_name=lead.name,
+                    event_type="lead_won",
+                    message=f"Lead convertido em {max(time_to_close_seconds // 86400, 0)} dias.",
+                    user_email=session.get("email"),
+                    duration_seconds=time_to_close_seconds,
+                )
+            )
+        else:
+            loss_message = (
+                f"Lead perdido. {LOSS_REASON_MARKER}{body.reason}"
+                if body.reason
+                else "Lead perdido. Motivo não informado."
+            )
+            db.add(
+                LeadActivityLog(
+                    organization_id=organization_id,
+                    lead_id=lead.id,
+                    lead_name=lead.name,
+                    event_type="lead_lost",
+                    message=loss_message,
+                    user_email=session.get("email"),
+                    duration_seconds=time_to_close_seconds,
+                )
+            )
+            if lead.owner_email:
+                db.add(
+                    UserNotification(
+                        organization_id=organization_id,
+                        user_email=lead.owner_email,
+                        lead_id=lead.id,
+                        message=(
+                            f"Você perdeu um lead. Motivo: {body.reason}"
+                            if body.reason
+                            else "Você perdeu um lead."
+                        ),
+                    )
+                )
 
     await db.commit()
     await db.refresh(lead)
