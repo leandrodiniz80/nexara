@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RevenueSummaryResponse(BaseModel):
@@ -16,6 +16,14 @@ class RevenueSummaryResponse(BaseModel):
     # potential_revenue above (which is every non-lost lead's raw
     # estimated_value, un-adjusted for how likely it is to actually close).
     expected_pipeline_revenue: float = 0.0
+    # Revenue-loop round — the Revenue Panel's own "breakdown por ação":
+    # compute_revenue_attribution()'s revenue_by_action (scoring.py), the
+    # same call/message/meeting attribution GET /workday/summary's
+    # top_revenue_action is derived from, just exposed here in full rather
+    # than collapsed to a single winner.
+    revenue_by_action: dict[str, float] = Field(
+        default_factory=lambda: {"call": 0.0, "message": 0.0, "meeting": 0.0}
+    )
 
 
 class RevenueTrendDay(BaseModel):

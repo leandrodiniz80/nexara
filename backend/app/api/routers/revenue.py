@@ -13,7 +13,7 @@ from app.models.leads.lead import Lead
 from app.models.leads.lead_status_history import LeadStatusHistory
 from app.schemas.revenue import RevenueSummaryResponse, RevenueTrendDay
 from app.services.leads.enrichment import get_lead_estimated_value
-from app.services.leads.scoring import score_leads
+from app.services.leads.scoring import compute_revenue_attribution, score_leads
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/revenue", tags=["Revenue"])
 
@@ -53,12 +53,14 @@ async def get_revenue_summary(
     expected_pipeline_revenue is score_leads()'s own probability-weighted
     expected_value, summed over new+contacted leads.
 
-    Five queries total, none per-row: one capped row-fetch (needed for
-    per-lead enrichment_data — potential/converted/lost/at_risk are all
+    Up to seven queries total, none per-row: one capped row-fetch (needed
+    for per-lead enrichment_data — potential/converted/lost/at_risk are all
     derived from this single pass over the same rows), two plain COUNTs for
     conversion_rate (accurate regardless of scale, unlike the capped
-    revenue pool), and score_leads()'s own two queries — reused on the same
-    `leads` list already fetched, not a second row-fetch."""
+    revenue pool), score_leads()'s own two queries — reused on the same
+    `leads` list already fetched, not a second row-fetch — and
+    compute_revenue_attribution()'s own two queries (Revenue-loop round)
+    for revenue_by_action, the Revenue Panel's own "breakdown por ação"."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
     now = datetime.now(timezone.utc)
@@ -109,6 +111,10 @@ async def get_revenue_summary(
         response.expected_value for response in scored if response.status in ("new", "contacted")
     )
 
+    # Revenue-loop round — the Revenue Panel's own call/message/meeting
+    # breakdown (compute_revenue_attribution(), scoring.py).
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
+
     return ApiResponse(
         success=True,
         data=RevenueSummaryResponse(
@@ -118,6 +124,7 @@ async def get_revenue_summary(
             at_risk_revenue=at_risk_revenue,
             conversion_rate=conversion_rate,
             expected_pipeline_revenue=expected_pipeline_revenue,
+            revenue_by_action=revenue_attribution.revenue_by_action,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

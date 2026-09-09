@@ -93,6 +93,19 @@ class WorkdaySummaryResponse(BaseModel):
     # and non-converted/non-lost) — the frontend hides the section instead
     # of rendering a null lead.
     next_mandatory_lead_id: uuid.UUID | None = None
+    # Revenue-loop round — the Command Center's "O que mais gera dinheiro
+    # hoje": the single highest-earning bucket in each of
+    # compute_revenue_attribution()'s three breakdowns (scoring.py),
+    # reduced from a full dict to just its winner via top_revenue_bucket()
+    # — this endpoint needs one headline answer per dimension, not the
+    # full numbers (see RevenueSummaryResponse.revenue_by_action for the
+    # full call/message/meeting breakdown instead). All three are None
+    # until at least one lead has actually converted with real attributed
+    # revenue behind it, same "no signal yet" rule this codebase's other
+    # learned fields already follow.
+    top_revenue_action: str | None = None
+    top_revenue_industry: str | None = None
+    top_revenue_company_size: str | None = None
 
 
 class ActionQueueItem(BaseModel):
@@ -180,6 +193,18 @@ class WorkdayPerformanceResponse(BaseModel):
     # compute_response_metrics()'s own avg_response_time_minutes follows.
     avg_response_time_today: float | None = None
     fast_responses_today: int = 0
+    # Revenue-loop round. revenue_generated_today sums estimated_value for
+    # every lead with a "lead_won" LeadActivityLog entry (the precise
+    # conversion-moment marker PATCH /leads/{id}/status writes) created
+    # today — the accountability layer's own "here's the money you actually
+    # closed today," distinct from money_saved_today above (a proxy for
+    # deals worked on, not deals won). avg_revenue_per_conversion is the
+    # all-time mean estimated_value across every converted lead this org
+    # has ever had (not today-scoped, same "steadier, not noisy" rationale
+    # response_rate/avg_time_to_close_days already follow elsewhere) — None
+    # until at least one lead has ever converted.
+    revenue_generated_today: float = 0.0
+    avg_revenue_per_conversion: float | None = None
 
 
 class WorkdayTargetResponse(BaseModel):

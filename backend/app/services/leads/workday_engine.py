@@ -83,6 +83,15 @@ _MONEY_FIRST_TOP_SLOTS = 3
 # for one plain number neither module needs to share via code.
 _MANDATORY_PENDING_RESPONSE_MINUTES = 60
 
+# Revenue-loop round — maybe_notify_high_revenue_opportunity()'s own
+# trigger, the prompt's own numbers: a probability-weighted deal this big,
+# this likely to close, is worth a proactive nudge rather than waiting for
+# the user to notice it in a list. Same 6h per-lead dedup rhythm as
+# maybe_notify_high_value_leads()/maybe_notify_critical_deals() above.
+_HIGH_REVENUE_OPPORTUNITY_THRESHOLD = 10000.0
+_HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY = 70
+_HIGH_REVENUE_OPPORTUNITY_ALERT_DEDUP_HOURS = 6
+
 
 def build_action_queue(leads: list[LeadResponse]) -> list[LeadResponse]:
     """Execution-engine round — the deterministic "what do I do next, in
@@ -506,6 +515,63 @@ async def maybe_notify_critical_deals(
                 user_email=lead.owner_email,
                 lead_id=lead.id,
                 message=f"Você pode perder R$ {format_brl(lead.expected_value)} hoje.",
+            )
+        )
+        notified += 1
+    return notified
+
+
+async def maybe_notify_high_revenue_opportunity(
+    db: AsyncSession, *, organization_id: str, leads: list[LeadResponse], now: datetime
+) -> int:
+    """Revenue-loop round — proactively flags a lead that's both a big deal
+    (expected_value >= _HIGH_REVENUE_OPPORTUNITY_THRESHOLD — already
+    probability-weighted, so on its own this could still fire on a huge but
+    only-somewhat-likely deal) AND a real bet to close (win_probability >=
+    _HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY): the two together read as
+    "close this one, don't just watch it," distinct from
+    maybe_notify_high_value_leads() above (which triggers on size plus
+    neglect, not size plus likelihood) and maybe_notify_critical_deals()
+    (which triggers on risk, the opposite signal — a deal already going
+    well). Same already-scored-list, no-new-candidate-query, per-lead
+    dedup, no-owner-skip shape as those two, and shares their same plain
+    lead_id+created_at dedup check (not scoped to its own message, by the
+    same design those two already accept — see IGNORED_LEADS_ALERT_MARKER's
+    own comment for why only the *org-wide* alerts needed a distinct
+    marker). Caller commits; returns how many notifications were actually
+    staged."""
+    candidates = [
+        lead
+        for lead in leads
+        if lead.owner_email is not None
+        and lead.expected_value >= _HIGH_REVENUE_OPPORTUNITY_THRESHOLD
+        and lead.win_probability >= _HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY
+    ]
+    if not candidates:
+        return 0
+
+    cutoff = now - timedelta(hours=_HIGH_REVENUE_OPPORTUNITY_ALERT_DEDUP_HOURS)
+    lead_ids = [lead.id for lead in candidates]
+    already_notified_stmt = select(UserNotification.lead_id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.lead_id.in_(lead_ids),
+        UserNotification.created_at >= cutoff,
+    )
+    already_notified_ids = set((await db.execute(already_notified_stmt)).scalars().all())
+
+    notified = 0
+    for lead in candidates:
+        if lead.id in already_notified_ids:
+            continue
+        db.add(
+            UserNotification(
+                organization_id=organization_id,
+                user_email=lead.owner_email,
+                lead_id=lead.id,
+                message=(
+                    f"Você tem uma oportunidade de R$ {format_brl(lead.expected_value)} "
+                    "com alta chance de fechar."
+                ),
             )
         )
         notified += 1

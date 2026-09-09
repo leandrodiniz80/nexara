@@ -14,6 +14,7 @@ from app.schemas.leads.lead import (
     ConversionInsightsResponse,
     LeadResponse,
     ResponseMetricsResponse,
+    RevenueAttributionResponse,
     ScoreBreakdownItem,
 )
 from app.services.leads.enrichment import (
@@ -190,6 +191,26 @@ _ATTEMPT_CLOSE_WIN_PROBABILITY = 80
 # to-teens bonuses too).
 _ACTION_LEARNING_BONUS = 5
 
+# Revenue-loop round — compute_lead_score()'s "real money" bonus: whichever
+# action type compute_revenue_attribution() shows has generated the most
+# confirmed revenue org-wide earns this when it's also this lead's own
+# recommended action_type. Deliberately its own, larger constant than
+# _ACTION_LEARNING_BONUS above (5): that one rewards a channel that closes
+# more *often* (a success rate); this one rewards a channel that closes for
+# more *money* — a stronger, harder signal (actual attributed R$, not a
+# percentage), so it outweighs the softer one rather than matching it.
+_REVENUE_LEARNING_BONUS = 10
+# Maps compute_action_type_and_urgency()'s own machine-readable action_type
+# vocabulary to compute_revenue_attribution()'s revenue_by_action keys —
+# the two use different words for the same three channels ("call_now" vs.
+# "call", etc.) since one is an API-facing action identifier and the other
+# is a plain-noun breakdown key a chart/label can render directly.
+ACTION_TYPE_TO_REVENUE_LABEL = {
+    "call_now": "call",
+    "send_message": "message",
+    "schedule_meeting": "meeting",
+}
+
 
 def compute_win_probability(
     lead: Lead, *, has_recent_manual_activity: bool, task_completed_recently: bool, now: datetime
@@ -346,6 +367,7 @@ def compute_lead_score(
     action_type: str | None,
     call_success_rate: float | None,
     message_success_rate: float | None,
+    top_revenue_action: str | None,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -676,6 +698,25 @@ def compute_lead_score(
             )
             total += _ACTION_LEARNING_BONUS
 
+    # Revenue-loop round — reinforces whichever channel compute_revenue_
+    # attribution() shows has actually generated the most real, confirmed
+    # money org-wide, additive on top of (not a replacement for) the
+    # success-rate-based _ACTION_LEARNING_BONUS above: a channel can close
+    # more often while still generating less money overall (a smaller
+    # average deal size), or vice versa — both are worth rewarding
+    # separately. Same "only on top of this lead's own already-recommended
+    # action_type" scoping as that bonus, and silent until
+    # top_revenue_action is real (not None, i.e. at least one lead has
+    # actually converted with attributed revenue behind it).
+    if top_revenue_action is not None and ACTION_TYPE_TO_REVENUE_LABEL.get(action_type) == top_revenue_action:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason=f"Ação com maior histórico de receita real: {top_revenue_action}",
+                impact=_REVENUE_LEARNING_BONUS,
+            )
+        )
+        total += _REVENUE_LEARNING_BONUS
+
     return max(0, min(100, total)), breakdown
 
 
@@ -948,6 +989,167 @@ async def compute_action_effectiveness(
     )
 
 
+# Revenue-loop round — the same three action_* event types
+# compute_action_effectiveness() above reads, just relabeled to
+# compute_revenue_attribution()'s own plain-noun vocabulary (its
+# revenue_by_action keys) instead of that function's raw event_type
+# strings.
+REVENUE_ACTION_LABEL_BY_EVENT_TYPE = {
+    "action_call": "call",
+    "action_message": "message",
+    "action_meeting": "meeting",
+}
+
+
+async def compute_revenue_attribution(
+    db: AsyncSession, organization_id: str
+) -> RevenueAttributionResponse:
+    """Execution-engine round's compute_action_effectiveness() answers "does
+    this action tend to work" (a success *rate*, out of 100); this closes
+    the loop the rest of the way — ACTION -> RESPONSE -> CONVERSION ->
+    MONEY — by answering "how much actual revenue came from it" (a real R$
+    total).
+
+    For every converted lead, credits its *entire* estimated_value
+    (get_lead_estimated_value(), enrichment.py — no partial split across
+    several actions, no ML) to exactly one bucket: the action type of the
+    LAST action_call/action_message/action_meeting event logged for that
+    lead at or before its own conversion. There's no converted_at column
+    (see Lead's own docstring), so "before conversion" is approximated by
+    updated_at — the same disclosed proxy compute_action_effectiveness()
+    already uses for its own "before/after" comparisons, not a new
+    approximation invented here. A converted lead with no qualifying
+    action_* event at all (e.g. converted through a flow this round
+    doesn't instrument) simply isn't credited to any action bucket — a real
+    gap, not something to fake an attribution for; its value still counts
+    toward revenue_by_industry/revenue_by_company_size below, since those
+    two don't depend on the action link at all.
+
+    Two queries regardless of org size: one Lead scan (converted, this
+    org), one LeadActivityLog scan scoped to just those leads' ids."""
+    converted_stmt = select(Lead).where(
+        Lead.organization_id == organization_id,
+        Lead.status == "converted",
+        Lead.deleted_at.is_(None),
+    )
+    converted_leads = (await db.execute(converted_stmt)).scalars().all()
+
+    revenue_by_action = {"call": 0.0, "message": 0.0, "meeting": 0.0}
+    revenue_by_industry: dict[str, float] = {}
+    revenue_by_company_size: dict[str, float] = {}
+
+    if not converted_leads:
+        return RevenueAttributionResponse(
+            revenue_by_action=revenue_by_action,
+            revenue_by_industry=revenue_by_industry,
+            revenue_by_company_size=revenue_by_company_size,
+        )
+
+    lead_ids = [lead.id for lead in converted_leads]
+    actions_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.lead_id.in_(lead_ids),
+        LeadActivityLog.event_type.in_(ACTION_EVENT_TYPES),
+    )
+    action_rows = (await db.execute(actions_stmt)).all()
+
+    leads_by_id = {lead.id: lead for lead in converted_leads}
+    last_action_event_type: dict = {}
+    last_action_at: dict = {}
+    for row in action_rows:
+        lead = leads_by_id[row.lead_id]
+        if row.created_at > lead.updated_at:
+            continue  # logged after conversion — not what led to it
+        current = last_action_at.get(row.lead_id)
+        if current is None or row.created_at > current:
+            last_action_at[row.lead_id] = row.created_at
+            last_action_event_type[row.lead_id] = row.event_type
+
+    for lead in converted_leads:
+        value = get_lead_estimated_value(lead)
+        if value <= 0:
+            continue
+
+        event_type = last_action_event_type.get(lead.id)
+        if event_type is not None:
+            label = REVENUE_ACTION_LABEL_BY_EVENT_TYPE[event_type]
+            revenue_by_action[label] += value
+
+        if lead.enrichment_data:
+            industry = lead.enrichment_data.get("industry")
+            if industry:
+                revenue_by_industry[industry] = revenue_by_industry.get(industry, 0.0) + value
+            company_size = lead.enrichment_data.get("company_size")
+            if company_size:
+                revenue_by_company_size[company_size] = (
+                    revenue_by_company_size.get(company_size, 0.0) + value
+                )
+
+    return RevenueAttributionResponse(
+        revenue_by_action=revenue_by_action,
+        revenue_by_industry=revenue_by_industry,
+        revenue_by_company_size=revenue_by_company_size,
+    )
+
+
+def top_revenue_bucket(revenue_by_bucket: dict[str, float]) -> str | None:
+    """The single highest-revenue key in any of
+    RevenueAttributionResponse's three breakdown dicts (revenue_by_action/
+    revenue_by_industry/revenue_by_company_size) — None while every bucket
+    is still 0.0 (or the dict is empty), so compute_lead_score()'s revenue
+    bonus, compute_action_type_and_urgency()'s strategy shift, and GET
+    /workday/summary's own top_revenue_* fields all stay silent until
+    there's real attributed money to point to, rather than an arbitrary
+    tie-break on an empty signal."""
+    if not revenue_by_bucket or not any(revenue_by_bucket.values()):
+        return None
+    return max(revenue_by_bucket, key=revenue_by_bucket.get)
+
+
+async def compute_revenue_summary(
+    db: AsyncSession, organization_id: str, *, today_start: datetime
+) -> tuple[float, float | None]:
+    """(revenue_generated_today, avg_revenue_per_conversion) — the two
+    GET /workday/performance asks for that compute_revenue_attribution()
+    doesn't itself carry (that function's own shape is a fixed three-bucket
+    breakdown, not a running total or an average). revenue_generated_today
+    sums estimated_value for every lead with a "lead_won" LeadActivityLog
+    entry (the precise conversion-moment marker PATCH /leads/{id}/status
+    writes, leads.py — the same event compute_conversion_insights() already
+    reads for avg_time_to_close_days) created today. avg_revenue_per_
+    conversion is the all-time mean estimated_value across every converted
+    lead this org has ever had (None, not 0.0, when there isn't one yet —
+    same "no signal" rule this file's other aggregates already follow),
+    regardless of whether the conversion happened today.
+
+    Two queries: one full converted-leads scan (all time, reused for both
+    the average and revenue_generated_today's own value lookups), one
+    lead_won id scan (today only)."""
+    converted_stmt = select(Lead).where(
+        Lead.organization_id == organization_id,
+        Lead.status == "converted",
+        Lead.deleted_at.is_(None),
+    )
+    converted_leads = (await db.execute(converted_stmt)).scalars().all()
+    if not converted_leads:
+        return 0.0, None
+
+    values_by_lead_id = {lead.id: get_lead_estimated_value(lead) for lead in converted_leads}
+    avg_revenue_per_conversion = round(sum(values_by_lead_id.values()) / len(values_by_lead_id), 2)
+
+    won_today_stmt = select(LeadActivityLog.lead_id).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type == "lead_won",
+        LeadActivityLog.created_at >= today_start,
+    )
+    won_today_ids = set((await db.execute(won_today_stmt)).scalars().all())
+    revenue_generated_today = sum(values_by_lead_id.get(lead_id, 0.0) for lead_id in won_today_ids)
+
+    return revenue_generated_today, avg_revenue_per_conversion
+
+
 def build_priority_reason(
     lead: Lead,
     *,
@@ -1042,7 +1244,13 @@ def compute_deal_risk(
     return "low", "Sob controle por enquanto."
 
 
-def compute_action_type_and_urgency(lead: Lead, risk_level: str) -> tuple[str | None, str | None]:
+def compute_action_type_and_urgency(
+    lead: Lead,
+    risk_level: str,
+    *,
+    expected_value: int = 0,
+    top_revenue_action: str | None = None,
+) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
     the frontend's call-to-action button (LeadCard), distinct from
@@ -1050,31 +1258,57 @@ def compute_action_type_and_urgency(lead: Lead, risk_level: str) -> tuple[str | 
     a lost lead always gets "drop_lead" regardless of risk (compute_deal_risk
     already returns "low" for it, so risk_level alone can't distinguish
     "lost" from "healthy"); a converted lead gets no action at all, same
-    "nothing left to do" rule next_best_action already follows."""
+    "nothing left to do" rule next_best_action already follows.
+
+    Revenue-loop round's strategy shift (Task 3): once compute_revenue_
+    attribution() shows one channel is actually generating the most real
+    money org-wide, the recommendation leans toward repeating it —
+    expressed here (not in compute_next_best_action's own text-sentence
+    tree, which never deals in "call_now"/"schedule_meeting" literals to
+    begin with) since this is the one function whose entire job is picking
+    between those exact three action types. The shift never touches the
+    "critical" tier's own call_now above — that is an emergency escalation,
+    not a channel preference, so it stays absolute. Below it: if "call" is
+    the top earner, every remaining lead is pushed toward call_now
+    regardless of what risk_level alone would have picked; if "meeting" is
+    the top earner, the same push toward schedule_meeting applies, but only
+    for a lead already worth >= HIGH_VALUE_LEAD_THRESHOLD (the prompt's own
+    "for high-value leads" qualifier — a small deal doesn't warrant the
+    extra weight of booking a meeting just because meetings convert well
+    elsewhere). Urgency is left exactly as risk_level would have set it in
+    every case: this shift changes WHICH channel to use, never how urgently."""
     if lead.status == "lost":
         return "drop_lead", "low"
     if lead.status == "converted":
         return None, None
     if risk_level == "critical":
         return "call_now", "immediate"
+
+    urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
+
+    if top_revenue_action == "call":
+        return "call_now", urgency
+    if top_revenue_action == "meeting" and expected_value >= HIGH_VALUE_LEAD_THRESHOLD:
+        return "schedule_meeting", urgency
+
     if risk_level == "high":
-        return "send_message", "high"
+        return "send_message", urgency
     if risk_level == "medium":
-        return "schedule_meeting", "medium"
-    return "monitor", "low"
+        return "schedule_meeting", urgency
+    return "monitor", urgency
 
 
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
     LeadResponse.model_validate(lead) every lead-returning endpoint used
-    before this. Nine extra queries total (recent automation activity,
-    recent manual activity, compute_conversion_insights()'s own two,
-    compute_response_metrics()'s own one, compute_action_effectiveness()'s
-    own two, one covering both lead_response_state and
-    has_pending_response/response_delay_minutes, plus one for
-    days_since_last_activity) for the whole batch, regardless of how many
-    leads are passed in — no N+1."""
+    before this. Up to eleven extra queries total (recent automation
+    activity, recent manual activity, compute_conversion_insights()'s own
+    two, compute_response_metrics()'s own one, compute_action_effectiveness()'s
+    own two, compute_revenue_attribution()'s own two, one covering both
+    lead_response_state and has_pending_response/response_delay_minutes,
+    plus one for days_since_last_activity) for the whole batch, regardless
+    of how many leads are passed in — no N+1."""
     if not leads:
         return []
 
@@ -1090,6 +1324,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     insights = await compute_conversion_insights(db, organization_id)
     response_metrics = await compute_response_metrics(db, organization_id)
     action_effectiveness = await compute_action_effectiveness(db, organization_id)
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
+    top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -1218,7 +1454,12 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             is_overdue=is_overdue,
             now=now,
         )
-        action_type, action_urgency = compute_action_type_and_urgency(lead, deal_risk_level)
+        action_type, action_urgency = compute_action_type_and_urgency(
+            lead,
+            deal_risk_level,
+            expected_value=expected_value,
+            top_revenue_action=top_revenue_action,
+        )
 
         score, breakdown = compute_lead_score(
             lead,
@@ -1238,6 +1479,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             action_type=action_type,
             call_success_rate=action_effectiveness.call_success_rate,
             message_success_rate=action_effectiveness.message_success_rate,
+            top_revenue_action=top_revenue_action,
             now=now,
         )
 

@@ -25,7 +25,14 @@ from app.schemas.workday import (
 )
 from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
 from app.services.leads.execution_engine import AUTO_EXECUTION_NOTIFICATION_PREFIX, maybe_auto_execute
-from app.services.leads.scoring import compute_response_metrics, rank_leads_by_priority, score_leads
+from app.services.leads.scoring import (
+    compute_response_metrics,
+    compute_revenue_attribution,
+    compute_revenue_summary,
+    rank_leads_by_priority,
+    score_leads,
+    top_revenue_bucket,
+)
 from app.services.leads.workday_engine import (
     build_action_queue,
     complete_lead_task,
@@ -35,6 +42,7 @@ from app.services.leads.workday_engine import (
     get_next_actionable_lead,
     get_next_mandatory_lead,
     maybe_notify_critical_deals,
+    maybe_notify_high_revenue_opportunity,
     maybe_notify_high_value_leads,
     maybe_notify_ignored_leads,
     maybe_notify_performance_alert,
@@ -516,11 +524,12 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Seven queries total, none per-row (up to 5 more, conditional: one dedup
+    Nine queries total, none per-row (up to 6 more, conditional: one dedup
     check each for maybe_notify_high_value_leads()/maybe_notify_critical_deals()/
-    maybe_notify_ignored_leads()/maybe_notify_pipeline_risk(), one Lead
-    row-fetch for _maybe_auto_execute_critical_deals() — all five only when
-    there's an actual candidate/threshold breach, and the last only when
+    maybe_notify_ignored_leads()/maybe_notify_pipeline_risk()/
+    maybe_notify_high_revenue_opportunity(), one Lead row-fetch for
+    _maybe_auto_execute_critical_deals() — all six only when there's an
+    actual candidate/threshold breach, and the last only when
     settings.AUTO_MODE_ENABLED is even on, which it isn't by default):
     pending_responses_count/high_value_at_risk_count/pipeline_expected_value
     (_compute_response_and_pipeline_pressure) also reuse `ranked`, zero
@@ -534,7 +543,10 @@ async def get_workday_summary(
     reuse the one rank_leads_by_priority() call (candidate query +
     score_leads' own one extra query) — the same cost GET /leads/priority
     already pays elsewhere on this same dashboard; the 7th, unconditional,
-    is auto_actions_executed_today's own count (_count_auto_actions_today)."""
+    is auto_actions_executed_today's own count (_count_auto_actions_today);
+    the 8th and 9th are compute_revenue_attribution()'s own two-query pass
+    (Revenue-loop round) for top_revenue_action/top_revenue_industry/
+    top_revenue_company_size."""
     start = time.perf_counter()
     organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -618,6 +630,11 @@ async def get_workday_summary(
         revenue_at_risk=revenue_at_risk,
         now=now,
     )
+    # Revenue-loop round — proactive "close this one" nudge for a big,
+    # likely-to-close deal, reusing the same `ranked` list.
+    notified_count += await maybe_notify_high_revenue_opportunity(
+        db, organization_id=organization_id, leads=ranked, now=now
+    )
     if notified_count or auto_executed_count:
         await db.commit()
 
@@ -628,6 +645,14 @@ async def get_workday_summary(
     # this same `ranked` list, zero extra query.
     action_queue = build_action_queue(ranked)
     mandatory_lead = get_next_mandatory_lead(action_queue)
+
+    # Revenue-loop round — the Command Center's "O que mais gera dinheiro
+    # hoje" — reduces compute_revenue_attribution()'s own three breakdowns
+    # down to one winner each.
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
+    top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
+    top_revenue_industry = top_revenue_bucket(revenue_attribution.revenue_by_industry)
+    top_revenue_company_size = top_revenue_bucket(revenue_attribution.revenue_by_company_size)
 
     return ApiResponse(
         success=True,
@@ -649,6 +674,9 @@ async def get_workday_summary(
             high_value_at_risk_count=high_value_at_risk_count,
             pipeline_expected_value=pipeline_expected_value,
             next_mandatory_lead_id=mandatory_lead.id if mandatory_lead is not None else None,
+            top_revenue_action=top_revenue_action,
+            top_revenue_industry=top_revenue_industry,
+            top_revenue_company_size=top_revenue_company_size,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -766,16 +794,19 @@ async def get_workday_performance(
     completion) is, by definition, still unresolved from at least
     yesterday — a strict subset of overdue_tasks.
 
-    Eleven queries total (two inside _workday_stats, two counts, one
+    Thirteen queries total (two inside _workday_stats, two counts, one
     ignored-leads row fetch for the revenue estimate, two inside
     rank_leads_by_priority for revenue_at_risk/critical_deals, one dedup
     check for the performance-alert notification, two inside
     _compute_money_saved_today for the AI Deal Coach round's money_saved_today,
-    one for auto_actions_executed_today's own count), none per-row. Reuses
-    _count_overdue_tasks and _workday_stats (both already used by /next and
-    /summary), plus the same rank_leads_by_priority()/_compute_revenue_at_risk()/
-    _compute_deal_risk_summary() pairing GET /workday/summary already uses,
-    instead of re-deriving any of this a third time."""
+    one for auto_actions_executed_today's own count, two inside
+    compute_revenue_summary() for the Revenue-loop round's
+    revenue_generated_today/avg_revenue_per_conversion), none per-row.
+    Reuses _count_overdue_tasks and _workday_stats (both already used by
+    /next and /summary), plus the same rank_leads_by_priority()/
+    _compute_revenue_at_risk()/_compute_deal_risk_summary() pairing GET
+    /workday/summary already uses, instead of re-deriving any of this a
+    third time."""
     start = time.perf_counter()
     organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -825,6 +856,11 @@ async def get_workday_performance(
     ) = await _compute_response_metrics_today(
         db, organization_id, today_start
     )
+    # Revenue-loop round — the accountability layer's own "here's the money
+    # you actually closed today" plus the all-time average deal size.
+    revenue_generated_today, avg_revenue_per_conversion = await compute_revenue_summary(
+        db, organization_id, today_start=today_start
+    )
 
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks
@@ -869,6 +905,8 @@ async def get_workday_performance(
             responses_received_today=responses_received_today,
             avg_response_time_today=avg_response_time_today,
             fast_responses_today=fast_responses_today,
+            revenue_generated_today=revenue_generated_today,
+            avg_revenue_per_conversion=avg_revenue_per_conversion,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

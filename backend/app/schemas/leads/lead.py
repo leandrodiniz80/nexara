@@ -307,6 +307,27 @@ class ActionEffectivenessResponse(BaseModel):
     meeting_success_rate: float | None = None
 
 
+class RevenueAttributionResponse(BaseModel):
+    """compute_revenue_attribution() (scoring.py) — "what actually generated
+    the money," a step beyond ActionEffectivenessResponse's own "what's
+    likely to work" success-rate view. For each converted lead, the LAST
+    action_call/action_message/action_meeting event logged before that
+    lead's own conversion (approximated by its updated_at — no separate
+    converted_at column, same "known approximation" spirit
+    compute_action_effectiveness() already discloses) is credited with the
+    lead's *entire* estimated_value — no partial split across several
+    actions, no ML. revenue_by_action's three keys always exist (0.0
+    default, not absent) since "no revenue from calls yet" is itself a
+    useful, real answer; revenue_by_industry/revenue_by_company_size only
+    carry keys that actually have at least one converted lead behind them."""
+
+    revenue_by_action: dict[str, float] = Field(
+        default_factory=lambda: {"call": 0.0, "message": 0.0, "meeting": 0.0}
+    )
+    revenue_by_industry: dict[str, float] = Field(default_factory=dict)
+    revenue_by_company_size: dict[str, float] = Field(default_factory=dict)
+
+
 class ResponseMetricsResponse(BaseModel):
     """compute_response_metrics() (scoring.py) — org-wide messaging
     effectiveness mined from the last 30 days of message_sent/lead_responded/
