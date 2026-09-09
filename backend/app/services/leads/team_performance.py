@@ -72,11 +72,14 @@ async def compute_user_performance(
     owned isn't a combatant in this leaderboard — see that schema's own
     docstring). Reuses score_leads() over the org's full lead pool (every
     status, capped at _TEAM_PERFORMANCE_POOL_SIZE) for revenue_converted/
-    revenue_at_risk, plus three LeadActivityLog aggregates (response-rate/
-    response-time, actions-executed-today, streak) grouped by user_email in
-    Python — five queries total regardless of team size, none per-user."""
+    revenue_at_risk/pipeline_value, plus four LeadActivityLog aggregates
+    (response-rate/response-time, actions-executed-today, streak, won-at
+    dates for revenue_today/revenue_this_week — Elite round, Task 5)
+    grouped by user_email in Python — six queries total regardless of team
+    size, none per-user."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
     streak_window_start = now - timedelta(days=_STREAK_LOOKBACK_DAYS)
 
     leads_stmt = (
@@ -151,6 +154,24 @@ async def compute_user_performance(
     for user_email, won_date in streak_rows:
         dates_by_user.setdefault(user_email, set()).add(won_date)
 
+    # Revenue Per User real-time (Elite round, Task 5) — this lead's own
+    # most recent "lead_won" timestamp, keyed by lead_id (not user_email,
+    # unlike every other aggregate above) so it can be matched against each
+    # owner's own `owned` responses below. Windowed to the last 7 days —
+    # this week's own window already covers today's, so one query serves
+    # both revenue_today and revenue_this_week.
+    won_at_stmt = select(LeadActivityLog.lead_id, LeadActivityLog.created_at).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type == "lead_won",
+        LeadActivityLog.created_at >= week_start,
+    )
+    won_at_rows = (await db.execute(won_at_stmt)).all()
+    won_at_by_lead: dict = {}
+    for lead_id, won_created_at in won_at_rows:
+        current = won_at_by_lead.get(lead_id)
+        if current is None or won_created_at > current:
+            won_at_by_lead[lead_id] = won_created_at
+
     today = now.date()
     results: list[UserPerformanceResponse] = []
     for owner_email in sorted(leads_by_owner):
@@ -164,6 +185,23 @@ async def compute_user_performance(
             response.expected_value
             for response in owned
             if response.deal_risk_level in ("high", "critical")
+        )
+        revenue_today = sum(
+            response.estimated_value
+            for response in owned
+            if response.status == "converted"
+            and (won_at := won_at_by_lead.get(response.id)) is not None
+            and won_at >= today_start
+        )
+        revenue_this_week = sum(
+            response.estimated_value
+            for response in owned
+            if response.status == "converted" and response.id in won_at_by_lead
+        )
+        pipeline_value = sum(
+            response.expected_value
+            for response in owned
+            if response.status not in ("converted", "lost")
         )
 
         sent = sent_by_user.get(owner_email, 0)
@@ -191,6 +229,9 @@ async def compute_user_performance(
                 deals_closed=deals_closed,
                 revenue_converted=revenue_converted,
                 revenue_at_risk=revenue_at_risk,
+                revenue_today=revenue_today,
+                revenue_this_week=revenue_this_week,
+                pipeline_value=pipeline_value,
                 response_rate=response_rate,
                 avg_response_time_minutes=avg_response_time_minutes,
                 actions_executed_today=actions_today_by_user.get(owner_email, 0),

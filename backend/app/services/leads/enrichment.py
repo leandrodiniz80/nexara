@@ -222,22 +222,13 @@ def _enrichment_context_sentence(lead: Lead) -> str:
     return f" Vi que vocês são do setor de {industry_label}."
 
 
-def generate_lead_message_by_action(
-    lead: Lead, action: str | None, sender_email: str
-) -> str | None:
-    """One template per next_best_action case instead of always writing as
-    if this were the first time reaching out — a follow-up that reads like
-    an introduction breaks trust. `action` is next_best_action's own value
-    (compute_next_best_action(), scoring.py); matched by prefix since that
-    function appends its own enrichment-context suffix on top of one of
-    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP. None
-    (converted/lost — nothing left to act on) returns None, same as
-    next_best_action itself."""
-    if action is None:
-        return None
-
+def _action_body(lead: Lead, action: str, context: str) -> str | None:
+    """The per-next_best_action-case template body shared by
+    generate_lead_message_by_action() and generate_smart_message()
+    (Elite round, Task 2) — factored out of the former unchanged (same
+    exact strings, same prefix-matching) so the latter can wrap the same
+    content with its own tone/context layer instead of re-templating it."""
     company = lead.company_name or "sua empresa"
-    context = _enrichment_context_sentence(lead)
 
     if action.startswith(ACTION_FIRST_CONTACT):
         body = (
@@ -283,4 +274,83 @@ def generate_lead_message_by_action(
     else:
         return None
 
+    return body
+
+
+def generate_lead_message_by_action(
+    lead: Lead, action: str | None, sender_email: str
+) -> str | None:
+    """One template per next_best_action case instead of always writing as
+    if this were the first time reaching out — a follow-up that reads like
+    an introduction breaks trust. `action` is next_best_action's own value
+    (compute_next_best_action(), scoring.py); matched by prefix since that
+    function appends its own enrichment-context suffix on top of one of
+    ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP. None
+    (converted/lost — nothing left to act on) returns None, same as
+    next_best_action itself."""
+    if action is None:
+        return None
+    body = _action_body(lead, action, _enrichment_context_sentence(lead))
+    if body is None:
+        return None
     return f"Olá {lead.name},\n\n{body}\n\nAtenciosamente,\n{sender_email}"
+
+
+# Smart Message Generator's own tone table (Elite round, Task 2) — the
+# prompt's own literal mapping: a critical/high-risk deal reads as urgent,
+# a medium-risk one as consultive (still exploring, no reason to rush), and
+# everything else (low risk — i.e. a healthy, likely-to-close deal) as
+# direct, confident, ready to ask for the close.
+_SMART_MESSAGE_TONE_OPENERS = {
+    "urgent": "Sei que o momento é sensível e não queria deixar essa conversa esfriar.",
+    "consultive": "Antes de qualquer próximo passo, queria entender melhor o momento de vocês.",
+    "direct": "Acho que já temos o que precisamos para avançar rápido.",
+}
+
+
+def _smart_message_tone(deal_risk_level: str | None) -> str:
+    if deal_risk_level in ("critical", "high"):
+        return "urgent"
+    if deal_risk_level == "medium":
+        return "consultive"
+    return "direct"
+
+
+def generate_smart_message(
+    lead: Lead,
+    action: str | None,
+    sender_email: str,
+    *,
+    deal_risk_level: str | None,
+    lead_response_state: str,
+    matches_top_combination: bool,
+) -> str | None:
+    """Adaptive version of generate_lead_message_by_action() (Elite round,
+    Task 2) — same per-action template body (_action_body(), shared with
+    that function unchanged) plus a layer generate_lead_message_by_action()
+    never had: a tone-setting opener driven by deal_risk_level
+    (_smart_message_tone(): urgent for critical/high risk, consultive for
+    medium, direct for a healthy deal), and a closing line or two reacting
+    to response_state/top_combination — industry and company_size already
+    shape the body itself via _enrichment_context_sentence(). Deterministic
+    string composition, no LLM/external AI call, same as every other
+    message-generating function in this module. None wherever the base
+    function would also return None (no action, or an unrecognized one)."""
+    if action is None:
+        return None
+    body = _action_body(lead, action, _enrichment_context_sentence(lead))
+    if body is None:
+        return None
+
+    opener = _SMART_MESSAGE_TONE_OPENERS[_smart_message_tone(deal_risk_level)]
+
+    closing = ""
+    if matches_top_combination:
+        closing += (
+            "\n\nEsse é exatamente o perfil de empresa com quem mais temos fechado negócio "
+            "ultimamente."
+        )
+    if lead_response_state == "interested":
+        closing += "\n\nFico feliz com seu interesse — vamos avançar?"
+
+    return f"Olá {lead.name},\n\n{opener} {body}{closing}\n\nAtenciosamente,\n{sender_email}"

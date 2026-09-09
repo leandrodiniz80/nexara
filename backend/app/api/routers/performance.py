@@ -81,6 +81,9 @@ async def get_leaderboard(
                 commission_estimate=performance.commission_estimate,
                 badges=performance.badges,
                 deals_closed=performance.deals_closed,
+                revenue_today=performance.revenue_today,
+                revenue_this_week=performance.revenue_this_week,
+                pipeline_value=performance.pipeline_value,
             )
             for position, performance in enumerate(ranked, start=1)
         ],

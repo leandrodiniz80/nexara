@@ -34,7 +34,7 @@ from app.services.leads.enrichment import (
     INDUSTRY_PT,
     LARGE_COMPANY_SIZES,
     format_brl,
-    generate_lead_message_by_action,
+    generate_smart_message,
     get_lead_estimated_value,
 )
 
@@ -211,6 +211,35 @@ ACTION_TYPE_TO_REVENUE_LABEL = {
     "schedule_meeting": "meeting",
 }
 
+
+def _matches_top_revenue_action(action_type: str | None, top_revenue_action: str | None) -> bool:
+    """Shared by compute_lead_score()'s own revenue-learning-bonus block and
+    compute_close_probability_boost() (Elite round, Task 1) — both need the
+    exact same "is this lead's recommended action the org's own top-earning
+    channel" check, previously only inlined once; factored out so the two
+    callers can't silently drift apart."""
+    return top_revenue_action is not None and ACTION_TYPE_TO_REVENUE_LABEL.get(action_type) == top_revenue_action
+
+
+def _matches_top_combination(lead: Lead, action_type: str | None, top_combination: str | None) -> bool:
+    """Shared by compute_lead_score()'s own winner-pattern-bonus block and
+    compute_close_probability_boost() (Elite round, Task 1) — both need the
+    exact same "does this lead's own (action, industry, company_size) match
+    the org's single best-proven combination" check
+    (compute_revenue_attribution()'s top_combination), previously only
+    inlined once inside the winner-pattern block; factored out so the two
+    callers can't silently drift apart. Same " | "-delimited key format
+    compute_revenue_attribution() itself builds (see that function's own
+    comment for why not a literal "|")."""
+    if top_combination is None or not lead.enrichment_data:
+        return False
+    industry = lead.enrichment_data.get("industry")
+    company_size = lead.enrichment_data.get("company_size")
+    action_label = ACTION_TYPE_TO_REVENUE_LABEL.get(action_type)
+    if not (action_label and industry and company_size):
+        return False
+    return f"{action_label} | {industry} | {company_size}" == top_combination
+
 # Autonomous-sales-OS round — compute_lead_score()'s "intelligent pipeline
 # pruning" bar: all three conditions must hold (a lead that's merely low-
 # probability but still big, or small but idle only briefly, isn't pruned)
@@ -293,6 +322,185 @@ _ACCELERATION_HIGH_PROBABILITY_BONUS = 20
 # specific signal than any of the broader "matches a learned dimension"
 # bonuses above.
 _WINNER_PATTERN_BONUS = 25
+
+# Elite round — "IA de Fechamento" (Task 1): compute_close_probability_boost()'s
+# own deltas, the prompt's own literal numbers. Each condition here overlaps,
+# by design, with an existing narrower bonus/penalty elsewhere in this
+# function (interested-response, fast-response, winner-pattern,
+# revenue-learning, pending-response) — this is a second, closing-probability-
+# specific lens on the same underlying signals, not a replacement for them;
+# same "layers compound, they don't override" precedent this function's own
+# docstring already establishes for every other pair of related bonuses.
+_CLOSE_BOOST_INTERESTED_BONUS = 20
+_CLOSE_BOOST_FAST_RESPONSE_BONUS = 15
+_CLOSE_BOOST_TOP_COMBINATION_BONUS = 10
+_CLOSE_BOOST_TOP_REVENUE_ACTION_BONUS = 10
+_CLOSE_BOOST_IGNORED_PENALTY = -20
+
+# Elite round — Speed-to-Lead Engine (Task 3): a second, harsher lens on the
+# same has_pending_response/response_delay_minutes signal the sales-
+# operating-system round's own tiered pending-response penalty already
+# reads (_PENDING_RESPONSE_PENALTY_LOW/_HIGH above) — deliberately its own,
+# larger penalty past one hour, plus a brand-new reward for a message still
+# fresh (under 10 minutes old, no reason to worry yet).
+_SPEED_TO_LEAD_SLOW_MINUTES = 60
+_SPEED_TO_LEAD_SLOW_PENALTY = -25
+_SPEED_TO_LEAD_FAST_MINUTES = 10
+_SPEED_TO_LEAD_FAST_BONUS = 15
+
+# Elite round — Deal Momentum Score (Task 4): compute_momentum()'s own
+# points table, a 0-100 "how much is this deal actually moving right now"
+# gauge distinct from score (which blends revenue/risk/momentum together).
+_MOMENTUM_RECENT_ACTIVITY_POINTS = 30
+_MOMENTUM_RECENT_RESPONSE_POINTS = 40
+_MOMENTUM_TASK_COMPLETED_POINTS = 20
+_MOMENTUM_IDLE_DECAY_PER_DAY = 5
+_MOMENTUM_MAX = 100
+
+# Elite round — Hunter Mode (Task 7): fires on a much lower bar than
+# Revenue Acceleration Mode's own gap check — not "today's actionable
+# revenue is behind pace" but "the entire open pipeline is structurally too
+# thin," worth less than half a single day's own revenue target.
+_HUNTER_MODE_PIPELINE_RATIO_THRESHOLD = 0.5
+_HUNTER_MODE_NEW_LEAD_BONUS = 25
+
+# Elite round — Auto Drop Inteligente refinement (Task 9): a second,
+# value-agnostic pruning trigger alongside the autonomous-sales-OS round's
+# original three-condition one (_PRUNE_WIN_PROBABILITY_THRESHOLD/
+# _PRUNE_EXPECTED_VALUE_THRESHOLD/_PRUNE_IDLE_DAYS_THRESHOLD above) — a
+# lead this unlikely to close and this neglected gets dropped regardless of
+# its own expected_value, catching a big-looking but effectively dead deal
+# the value-gated rule alone would keep protecting.
+_PRUNE_HARD_WIN_PROBABILITY_THRESHOLD = 15
+_PRUNE_HARD_IDLE_DAYS_THRESHOLD = 10
+
+
+def compute_close_probability_boost(
+    lead: Lead,
+    *,
+    lead_response_state: str,
+    response_time_minutes: int | None,
+    has_pending_response: bool,
+    response_delay_minutes: int | None,
+    matches_top_combination: bool,
+    matches_top_revenue_action: bool,
+) -> tuple[int, list[ScoreBreakdownItem]]:
+    """"IA de Fechamento" (Elite round, Task 1) — a dedicated closing-
+    probability lens, called from inside compute_lead_score() and added on
+    top of its own running total. Pure, no DB access, same style as every
+    other compute_*() helper compute_lead_score() already calls. See the
+    _CLOSE_BOOST_* constants' own comment for why this intentionally
+    overlaps with several already-existing, narrower bonuses elsewhere in
+    compute_lead_score() rather than replacing them."""
+    delta = 0
+    breakdown: list[ScoreBreakdownItem] = []
+
+    if lead_response_state == "interested":
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="IA de Fechamento: já respondeu e demonstrou interesse",
+                impact=_CLOSE_BOOST_INTERESTED_BONUS,
+            )
+        )
+        delta += _CLOSE_BOOST_INTERESTED_BONUS
+
+    if response_time_minutes is not None and response_time_minutes < _FAST_RESPONSE_MINUTES:
+        # <30min — reuses the same fast-response reading response_time_
+        # minutes already gives compute_lead_score()'s own _FAST_RESPONSE_*
+        # bonus above (same 30-minute bar, _FAST_RESPONSE_MINUTES), just as
+        # its own IA-de-Fechamento line item rather than folded into that
+        # one.
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="IA de Fechamento: respondeu rápido (menos de 30 minutos)",
+                impact=_CLOSE_BOOST_FAST_RESPONSE_BONUS,
+            )
+        )
+        delta += _CLOSE_BOOST_FAST_RESPONSE_BONUS
+
+    if matches_top_combination:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="IA de Fechamento: combina com o padrão que mais converte",
+                impact=_CLOSE_BOOST_TOP_COMBINATION_BONUS,
+            )
+        )
+        delta += _CLOSE_BOOST_TOP_COMBINATION_BONUS
+
+    if matches_top_revenue_action:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="IA de Fechamento: ação recomendada é a que mais gera receita",
+                impact=_CLOSE_BOOST_TOP_REVENUE_ACTION_BONUS,
+            )
+        )
+        delta += _CLOSE_BOOST_TOP_REVENUE_ACTION_BONUS
+
+    if (
+        has_pending_response
+        and response_delay_minutes is not None
+        and response_delay_minutes > _PENDING_RESPONSE_DELAY_MINUTES_HIGH
+    ):
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="IA de Fechamento: ignorou a última mensagem há mais de 24h",
+                impact=_CLOSE_BOOST_IGNORED_PENALTY,
+            )
+        )
+        delta += _CLOSE_BOOST_IGNORED_PENALTY
+
+    return delta, breakdown
+
+
+def compute_momentum(
+    lead: Lead,
+    *,
+    has_recent_manual_activity: bool,
+    lead_response_state: str,
+    task_completed_recently: bool,
+    days_since_last_activity: int,
+) -> int:
+    """Deal Momentum Score (Elite round, Task 4) — 0-100 "how hot is this
+    deal right now" gauge: purely about recent motion (a real touch, a real
+    reply, a task just closed), decayed by how many days it's sat idle
+    since — distinct from `score`, which blends this together with
+    revenue/risk/enrichment signals this function never looks at. Not
+    persisted; computed fresh every score_leads() pass like every other
+    derived LeadResponse field. "not_interested" doesn't count as momentum
+    even though it's a real reply — a rejection isn't forward motion."""
+    momentum = 0
+    if has_recent_manual_activity:
+        momentum += _MOMENTUM_RECENT_ACTIVITY_POINTS
+    if lead_response_state not in ("no_response", "not_interested"):
+        momentum += _MOMENTUM_RECENT_RESPONSE_POINTS
+    if task_completed_recently:
+        momentum += _MOMENTUM_TASK_COMPLETED_POINTS
+
+    decay_days = min(days_since_last_activity, _MOMENTUM_MAX // _MOMENTUM_IDLE_DECAY_PER_DAY)
+    momentum -= decay_days * _MOMENTUM_IDLE_DECAY_PER_DAY
+
+    return max(0, min(_MOMENTUM_MAX, momentum))
+
+
+def compute_close_date_prediction(
+    lead: Lead, *, avg_time_to_close_days: int | None, win_probability: int
+) -> datetime | None:
+    """Individual close-date forecast (Elite round, Task 8) —
+    lead.created_at plus the org's own avg_time_to_close_days
+    (compute_conversion_insights(), read once per score_leads() batch),
+    weighted by how far along this lead's own win_probability suggests it
+    already is: a lead more likely to close is assumed nearer the end of
+    that typical window, one less likely nearer the start (floored at 1 day
+    so this is never the exact same instant as created_at). None whenever
+    there's no org history to predict from yet (avg_time_to_close_days is
+    None/0) or the lead is already converted/lost — nothing left to
+    predict."""
+    if lead.status in ("converted", "lost"):
+        return None
+    if not avg_time_to_close_days:
+        return None
+    days_out = max(1, round(avg_time_to_close_days * (1 - win_probability / 100)))
+    return lead.created_at + timedelta(days=days_out)
 
 
 def compute_win_probability(
@@ -457,6 +665,7 @@ def compute_lead_score(
     acceleration_mode: bool,
     top_combination: str | None,
     deal_risk_level: str,
+    hunter_mode: bool,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -573,6 +782,28 @@ def compute_lead_score(
                 )
             )
             total += pending_impact
+
+        # Speed-to-Lead Engine (Elite round, Task 3) — a second, harsher
+        # reading of the same pending-delay signal just above (own,
+        # distinct constants; see their own comment for why this stacks
+        # rather than replaces the tiered penalty above), plus a reward for
+        # a message still fresh enough that nobody should be worried yet.
+        if response_delay_minutes > _SPEED_TO_LEAD_SLOW_MINUTES:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Speed-to-Lead: demorando para responder",
+                    impact=_SPEED_TO_LEAD_SLOW_PENALTY,
+                )
+            )
+            total += _SPEED_TO_LEAD_SLOW_PENALTY
+        elif response_delay_minutes < _SPEED_TO_LEAD_FAST_MINUTES:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Speed-to-Lead: mensagem recém-enviada",
+                    impact=_SPEED_TO_LEAD_FAST_BONUS,
+                )
+            )
+            total += _SPEED_TO_LEAD_FAST_BONUS
 
     # A response, however slow, already earned its own +25/-30 below via
     # lead_response_state — this is an additional stack on top when it was
@@ -797,7 +1028,8 @@ def compute_lead_score(
     # action_type" scoping as that bonus, and silent until
     # top_revenue_action is real (not None, i.e. at least one lead has
     # actually converted with attributed revenue behind it).
-    if top_revenue_action is not None and ACTION_TYPE_TO_REVENUE_LABEL.get(action_type) == top_revenue_action:
+    matches_top_revenue_action = _matches_top_revenue_action(action_type, top_revenue_action)
+    if matches_top_revenue_action:
         breakdown.append(
             ScoreBreakdownItem(
                 reason=f"Ação com maior histórico de receita real: {top_revenue_action}",
@@ -865,22 +1097,39 @@ def compute_lead_score(
 
     # Winner Pattern Replication (Task 4) — compute_revenue_attribution()'s
     # own top_combination (whichever action+industry+company_size has
-    # generated the most real revenue org-wide). Rebuilt here from this
-    # lead's own action_type argument plus lead.enrichment_data rather than
-    # passed in pre-built, since only this function has both at once.
-    if top_combination is not None and lead.enrichment_data:
-        industry = lead.enrichment_data.get("industry")
-        company_size = lead.enrichment_data.get("company_size")
-        action_label = ACTION_TYPE_TO_REVENUE_LABEL.get(action_type)
-        if action_label and industry and company_size:
-            lead_combination = f"{action_label} | {industry} | {company_size}"
-            if lead_combination == top_combination:
-                breakdown.append(
-                    ScoreBreakdownItem(
-                        reason="Segue padrão que mais gera receita", impact=_WINNER_PATTERN_BONUS
-                    )
-                )
-                total += _WINNER_PATTERN_BONUS
+    # generated the most real revenue org-wide).
+    matches_top_combination = _matches_top_combination(lead, action_type, top_combination)
+    if matches_top_combination:
+        breakdown.append(
+            ScoreBreakdownItem(reason="Segue padrão que mais gera receita", impact=_WINNER_PATTERN_BONUS)
+        )
+        total += _WINNER_PATTERN_BONUS
+
+    # "IA de Fechamento" (Elite round, Task 1) — a dedicated closing-
+    # probability lens, on top of (not instead of) every bonus above it
+    # overlaps with; see compute_close_probability_boost()'s own docstring.
+    close_boost_delta, close_boost_breakdown = compute_close_probability_boost(
+        lead,
+        lead_response_state=lead_response_state,
+        response_time_minutes=response_time_minutes,
+        has_pending_response=has_pending_response,
+        response_delay_minutes=response_delay_minutes,
+        matches_top_combination=matches_top_combination,
+        matches_top_revenue_action=matches_top_revenue_action,
+    )
+    breakdown.extend(close_boost_breakdown)
+    total += close_boost_delta
+
+    # Hunter Mode (Elite round, Task 7) — when the org's whole open
+    # pipeline is running structurally thin (compute_hunter_mode()), fresh
+    # ("new") leads get an extra push so they surface above older,
+    # already-being-worked ones: exactly the leads worth chasing when the
+    # pipeline itself needs refilling, not just today's queue.
+    if hunter_mode and lead.status == "new":
+        breakdown.append(
+            ScoreBreakdownItem(reason="Modo caçador: lead novo priorizado", impact=_HUNTER_MODE_NEW_LEAD_BONUS)
+        )
+        total += _HUNTER_MODE_NEW_LEAD_BONUS
 
     # Autonomous-sales-OS round — intelligent pipeline pruning: a lead
     # this unlikely to close (win_probability), this small even if it did
@@ -1352,6 +1601,33 @@ async def compute_revenue_summary(
     return revenue_generated_today, avg_revenue_per_conversion
 
 
+async def _compute_daily_target_revenue(db: AsyncSession, organization_id: str, now: datetime) -> float:
+    """Shared by compute_acceleration_mode() and compute_hunter_mode()
+    (Elite round, Task 7) — the same 7-day "lead_won" average GET
+    /workday/target's own _compute_daily_target_revenue() (workday.py)
+    computes, kept as its own independent copy in this module for the same
+    reason _RISK_LEVEL_ORDER is duplicated rather than imported (see that
+    constant's own comment): workday_engine.py imports FROM scoring.py, so
+    the reverse import would be circular. One lead_won id scan (7-day
+    window) plus its leads' own row-fetch."""
+    target_cutoff = now - timedelta(days=_ACCELERATION_MODE_TARGET_WINDOW_DAYS)
+    won_ids_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type == "lead_won",
+            LeadActivityLog.created_at >= target_cutoff,
+        )
+    )
+    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
+    if not won_ids:
+        return 0.0
+    won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
+    won_leads = (await db.execute(won_leads_stmt)).scalars().all()
+    return sum(get_lead_estimated_value(lead) for lead in won_leads) / _ACCELERATION_MODE_TARGET_WINDOW_DAYS
+
+
 async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> bool:
     """Revenue Acceleration Mode's own trigger (Task 3, revenue-
     maximization round; formula tightened in the Ultimate-Sales-OS round,
@@ -1384,26 +1660,8 @@ async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> b
     fetch for current_expected."""
     now = datetime.now(timezone.utc)
     today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    target_cutoff = now - timedelta(days=_ACCELERATION_MODE_TARGET_WINDOW_DAYS)
 
-    won_ids_stmt = (
-        select(LeadActivityLog.lead_id)
-        .distinct()
-        .where(
-            LeadActivityLog.organization_id == organization_id,
-            LeadActivityLog.event_type == "lead_won",
-            LeadActivityLog.created_at >= target_cutoff,
-        )
-    )
-    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
-    daily_target_revenue = 0.0
-    if won_ids:
-        won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
-        won_leads = (await db.execute(won_leads_stmt)).scalars().all()
-        daily_target_revenue = (
-            sum(get_lead_estimated_value(lead) for lead in won_leads)
-            / _ACCELERATION_MODE_TARGET_WINDOW_DAYS
-        )
+    daily_target_revenue = await _compute_daily_target_revenue(db, organization_id, now)
 
     due_stmt = select(Lead).where(
         Lead.organization_id == organization_id,
@@ -1423,6 +1681,43 @@ async def compute_acceleration_mode(db: AsyncSession, organization_id: str) -> b
     if daily_target_revenue <= 0:
         return False
     return current_expected < daily_target_revenue * _ACCELERATION_MODE_RATIO_THRESHOLD
+
+
+async def compute_hunter_mode(db: AsyncSession, organization_id: str) -> bool:
+    """Hunter Mode (Elite round, Task 7) — a much lower bar than Revenue
+    Acceleration Mode's own gap check above: true whenever the org's
+    entire open pipeline (every non-terminal lead's own win_probability-
+    weighted expected_value, summed) is worth less than half a single
+    day's own revenue target (_HUNTER_MODE_PIPELINE_RATIO_THRESHOLD,
+    reusing the same daily_target_revenue calculation compute_acceleration_
+    mode() already does). This fires only when there's structurally not
+    enough in the pipeline at all — a distinct, complementary signal from
+    Acceleration Mode's own "today's leads are behind pace." Deliberately
+    a cheap approximation, same "close enough to act on" bar every other
+    org-wide flag in this module already accepts. Returns False whenever
+    there's no won-lead history yet to set a target from (same "no
+    signal, no false alarm" rule compute_acceleration_mode() follows).
+    Two queries: the shared daily-target-revenue calculation, plus one
+    full open-pipeline row-fetch."""
+    now = datetime.now(timezone.utc)
+    daily_target_revenue = await _compute_daily_target_revenue(db, organization_id, now)
+    if daily_target_revenue <= 0:
+        return False
+
+    pipeline_stmt = select(Lead).where(
+        Lead.organization_id == organization_id,
+        Lead.deleted_at.is_(None),
+        Lead.status.notin_(("converted", "lost")),
+    )
+    pipeline_leads = (await db.execute(pipeline_stmt)).scalars().all()
+    pipeline_value = 0
+    for lead in pipeline_leads:
+        win_probability = compute_win_probability(
+            lead, has_recent_manual_activity=False, task_completed_recently=False, now=now
+        )
+        pipeline_value += round(get_lead_estimated_value(lead) * win_probability / 100)
+
+    return pipeline_value < daily_target_revenue * _HUNTER_MODE_PIPELINE_RATIO_THRESHOLD
 
 
 def build_priority_reason(
@@ -1449,7 +1744,17 @@ def build_priority_reason(
     is_high_opportunity_cost (revenue-maximization round's Opportunity Cost
     Engine, Task 1) is checked next, same "outright override" treatment —
     it's a stronger, more actionable signal than any of the composed
-    clauses below."""
+    clauses below.
+
+    "Priority Explanation" humanization (Elite round, Task 10): whenever
+    there's a real revenue signal (estimated_value > 0 — i.e. the lead has
+    at least been enriched), value and win_probability are always narrated
+    together as one sentence ("Esse lead pode gerar R$ X com Y% de
+    chance...") rather than only mentioned past a "high value" threshold
+    the way the old clause-list style did — the prompt's own literal
+    example. An idle/overdue clause is appended with "mas" when present.
+    Falls back to the previous terse clause-list style only when there's no
+    value signal to narrate at all (an unenriched lead)."""
     if lead.status == "converted":
         return "Lead convertido — nada a fazer."
     if lead.status == "lost":
@@ -1459,17 +1764,25 @@ def build_priority_reason(
     if is_high_opportunity_cost:
         return "Você está deixando de focar em leads que podem gerar mais R$."
 
+    idle_clause: str | None = None
+    if is_overdue:
+        idle_clause = "está com uma tarefa atrasada"
+    elif days_idle > _FOLLOW_UP_ESCALATION_IDLE_DAYS:
+        idle_clause = f"está parado há {days_idle} dias"
+
+    if estimated_value > 0:
+        narrative = f"Esse lead pode gerar R$ {format_brl(estimated_value)} com {win_probability}% de chance"
+        if idle_clause:
+            return f"{narrative}, mas {idle_clause}."
+        return f"{narrative}."
+
     clauses: list[str] = []
-    if estimated_value >= HIGH_VALUE_LEAD_THRESHOLD:
-        clauses.append(f"lead de alto valor (R$ {format_brl(estimated_value)})")
     if win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
         clauses.append(f"alta probabilidade ({win_probability}%)")
     elif win_probability < _LOW_WIN_PROBABILITY_THRESHOLD:
         clauses.append(f"baixa probabilidade ({win_probability}%)")
-    if is_overdue:
-        clauses.append("com tarefa atrasada")
-    elif days_idle > _FOLLOW_UP_ESCALATION_IDLE_DAYS:
-        clauses.append(f"sem atividade há {days_idle} dias")
+    if idle_clause:
+        clauses.append(idle_clause)
 
     if not clauses:
         return "Lead em acompanhamento normal, sem sinais fortes de prioridade no momento."
@@ -1543,6 +1856,7 @@ def compute_action_type_and_urgency(
     top_revenue_action: str | None = None,
     acceleration_mode: bool = False,
     win_probability: int = 0,
+    hunter_mode: bool = False,
 ) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
@@ -1581,7 +1895,17 @@ def compute_action_type_and_urgency(
     "critical" tier's own call_now above (still absolute: an emergency
     escalation outranks a blanket policy) but before the revenue-
     attribution strategy shift, since "call everything now, we're behind"
-    is a stronger, more urgent signal than a learned channel preference."""
+    is a stronger, more urgent signal than a learned channel preference.
+
+    Hunter Mode (Elite round, Task 7): once compute_hunter_mode() reports
+    the org's whole open pipeline is running structurally thin, a fresh
+    ("new") lead already worth >= HIGH_VALUE_LEAD_THRESHOLD is forced to
+    call_now too — checked right after Acceleration Mode's own forced
+    call_now (a thin pipeline is a real but less urgent problem than being
+    behind on today's actionable revenue) and, unlike that check, scoped to
+    new leads specifically: the whole point of Hunter Mode is chasing fresh
+    high-value opportunities before the pipeline runs any drier, not
+    re-routing leads already being worked."""
     if lead.status == "lost":
         return "drop_lead", "low"
     if lead.status == "converted":
@@ -1589,6 +1913,8 @@ def compute_action_type_and_urgency(
     if risk_level == "critical":
         return "call_now", "immediate"
     if acceleration_mode and win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
+        return "call_now", "high"
+    if hunter_mode and lead.status == "new" and expected_value >= HIGH_VALUE_LEAD_THRESHOLD:
         return "call_now", "high"
 
     urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
@@ -1636,6 +1962,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
     top_combination = revenue_attribution.top_combination
     acceleration_mode = await compute_acceleration_mode(db, organization_id)
+    hunter_mode = await compute_hunter_mode(db, organization_id)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -1782,6 +2109,14 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             win_probability < _PRUNE_WIN_PROBABILITY_THRESHOLD
             and expected_value < _PRUNE_EXPECTED_VALUE_THRESHOLD
             and days_since_last_activity > _PRUNE_IDLE_DAYS_THRESHOLD
+        ) or (
+            # Auto Drop Inteligente refinement (Elite round, Task 9) — a
+            # second, value-agnostic trigger: this unlikely to close and
+            # this neglected is dead regardless of expected_value, catching
+            # a big-looking lead the value-gated rule above would otherwise
+            # keep protecting.
+            win_probability < _PRUNE_HARD_WIN_PROBABILITY_THRESHOLD
+            and days_since_last_activity > _PRUNE_HARD_IDLE_DAYS_THRESHOLD
         )
 
         # Opportunity Cost Engine (Task 1, revenue-maximization round) —
@@ -1816,6 +2151,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             top_revenue_action=top_revenue_action,
             acceleration_mode=acceleration_mode,
             win_probability=win_probability,
+            hunter_mode=hunter_mode,
         )
         if is_low_potential:
             deal_risk_level = "low"
@@ -1848,7 +2184,26 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             acceleration_mode=acceleration_mode,
             top_combination=top_combination,
             deal_risk_level=deal_risk_level,
+            hunter_mode=hunter_mode,
             now=now,
+        )
+
+        # Deal Momentum Score (Elite round, Task 4) — 0-100 "how hot is
+        # this deal right now," distinct from score itself; see
+        # compute_momentum()'s own docstring.
+        momentum_score = compute_momentum(
+            lead,
+            has_recent_manual_activity=lead.id in recent_manual_activity_ids,
+            lead_response_state=lead_response_state,
+            task_completed_recently=lead.id in recent_task_completed_ids,
+            days_since_last_activity=days_since_last_activity,
+        )
+
+        # Individual close-date forecast (Elite round, Task 8).
+        close_date_prediction = compute_close_date_prediction(
+            lead,
+            avg_time_to_close_days=insights.avg_time_to_close_days,
+            win_probability=win_probability,
         )
 
         next_best_action = compute_next_best_action(
@@ -1860,8 +2215,20 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             response_delay_minutes=response_delay_minutes,
             deal_risk_level=deal_risk_level,
         )
+        # Smart Message Generator (Elite round, Task 2) — same template
+        # content generate_lead_message_by_action() already builds, wrapped
+        # with a tone (urgent/consultive/direct) driven by deal_risk_level
+        # plus context from response_state/top_combination; see
+        # generate_smart_message()'s own docstring.
         suggested_message = (
-            generate_lead_message_by_action(lead, next_best_action, lead.owner_email or "the team")
+            generate_smart_message(
+                lead,
+                next_best_action,
+                lead.owner_email or "the team",
+                deal_risk_level=deal_risk_level,
+                lead_response_state=lead_response_state,
+                matches_top_combination=_matches_top_combination(lead, action_type, top_combination),
+            )
             if next_best_action is not None and settings.AI_ENABLED
             else None
         )
@@ -1910,6 +2277,9 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "days_since_last_activity": days_since_last_activity,
                     "opportunity_cost": opportunity_cost,
                     "acceleration_mode": acceleration_mode,
+                    "momentum_score": momentum_score,
+                    "lead_close_date_prediction": close_date_prediction,
+                    "hunter_mode": hunter_mode,
                 }
             )
         )
@@ -1965,6 +2335,10 @@ async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list
             -response.win_probability,
             -response.opportunity_cost,
             -response.score,
+            # Deal Momentum Score (Elite round, Task 4) — the prompt's own
+            # final tiebreaker: among otherwise-equal leads, whichever one
+            # has more recent real motion behind it goes first.
+            -response.momentum_score,
         )
     )
 

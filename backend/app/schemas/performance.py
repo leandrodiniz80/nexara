@@ -35,7 +35,17 @@ class UserPerformanceResponse(BaseModel):
     deals_closed (Ultimate-Sales-OS round, Task 11) is the count of this
     user's own converted leads — distinct from leads_handled, which counts
     every lead they own regardless of status. revenue_converted is the sum
-    of value across the same set deals_closed counts."""
+    of value across the same set deals_closed counts.
+
+    Revenue Per User real-time (Elite round, Task 5): revenue_today/
+    revenue_this_week are the same estimated_value sum as revenue_converted
+    (all-time), just windowed to conversions whose own "lead_won"
+    LeadActivityLog entry landed today/within the last 7 days respectively
+    — revenue_this_week always >= revenue_today, since today is inside this
+    week's own window. pipeline_value is this user's own open (not
+    converted/lost) leads' expected_value summed — the probability-weighted
+    forecast still sitting in their pipeline, distinct from revenue_at_risk
+    above (which only counts their high/critical-risk subset)."""
 
     user_id: str
     name: str
@@ -43,6 +53,9 @@ class UserPerformanceResponse(BaseModel):
     deals_closed: int = 0
     revenue_converted: float = 0.0
     revenue_at_risk: int = 0
+    revenue_today: float = 0.0
+    revenue_this_week: float = 0.0
+    pipeline_value: int = 0
     response_rate: float = 0.0
     avg_response_time_minutes: float | None = None
     actions_executed_today: int = 0
@@ -55,9 +68,11 @@ class LeaderboardEntry(BaseModel):
     """GET /performance/leaderboard's own per-row shape — the prompt's own
     literal field list (user_id/name/revenue_converted/response_rate/
     avg_response_time/position), plus commission_estimate/badges additive
-    on top (Tasks 3/4's own "expose in leaderboard" instruction) and
+    on top (Tasks 3/4's own "expose in leaderboard" instruction),
     deals_closed additive on top of that (Ultimate-Sales-OS round, Task
-    11)."""
+    11), and revenue_today/revenue_this_week/pipeline_value on top of that
+    (Elite round, Task 5) — see UserPerformanceResponse's own docstring for
+    what each means."""
 
     user_id: str
     name: str
@@ -68,6 +83,9 @@ class LeaderboardEntry(BaseModel):
     commission_estimate: float = 0.0
     badges: list[str] = Field(default_factory=list)
     deals_closed: int = 0
+    revenue_today: float = 0.0
+    revenue_this_week: float = 0.0
+    pipeline_value: int = 0
 
 
 class TeamSummaryResponse(BaseModel):

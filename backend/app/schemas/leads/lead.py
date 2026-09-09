@@ -174,6 +174,25 @@ class LeadResponse(BaseModel):
     # same global state score_leads() already computed without a second,
     # redundant DB round-trip.
     acceleration_mode: bool = False
+    # Deal Momentum Score (Elite round, Task 4) — 0-100 "how hot is this
+    # deal right now" gauge (compute_momentum(), scoring.py), purely about
+    # recent motion (a real touch, a real reply, a task just closed),
+    # decayed by idle days — distinct from `score`, which blends this
+    # together with revenue/risk/enrichment signals momentum never looks
+    # at. Never persisted, computed fresh every score_leads() pass.
+    momentum_score: int = 0
+    # Individual close-date forecast (Elite round, Task 8) —
+    # compute_close_date_prediction() (scoring.py): created_at plus the
+    # org's own avg_time_to_close_days, weighted by this lead's own
+    # win_probability. None whenever there's no org history to predict from
+    # yet or the lead is already converted/lost.
+    lead_close_date_prediction: datetime | None = None
+    # Hunter Mode (Elite round, Task 7) — another global, org-wide flag (see
+    # compute_hunter_mode(), scoring.py; same "uniform across the batch,
+    # exposed so a caller already holding scored leads can read it without
+    # a second query" rationale as acceleration_mode above), true whenever
+    # the org's whole open pipeline is running structurally thin.
+    hunter_mode: bool = False
 
 
 class LeadStatusUpdateResponse(BaseModel):

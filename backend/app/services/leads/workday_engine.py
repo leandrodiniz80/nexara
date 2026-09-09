@@ -91,6 +91,12 @@ _MANDATORY_PENDING_RESPONSE_MINUTES = 60
 _HIGH_REVENUE_OPPORTUNITY_THRESHOLD = 10000.0
 _HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY = 70
 _HIGH_REVENUE_OPPORTUNITY_ALERT_DEDUP_HOURS = 6
+# Elite round's "Alerta de Oportunidade Crítica (REAL)" (Task 6) — adds an
+# idle-days gate this alert never had before: value + win_probability alone
+# could already fire on a deal someone is actively working right now, which
+# isn't really "about to lose it." Same days_since_last_activity signal
+# score_leads()'s own neglect-detection bonus already reads (scoring.py).
+_HIGH_REVENUE_OPPORTUNITY_IDLE_DAYS = 2
 
 # Revenue-maximization round — maybe_notify_focus_shift()'s own trigger
 # (Task 5): same opportunity_cost bar Task 1's own score penalty uses
@@ -554,14 +560,20 @@ async def maybe_notify_high_revenue_opportunity(
     lead_id+created_at dedup check (not scoped to its own message, by the
     same design those two already accept — see IGNORED_LEADS_ALERT_MARKER's
     own comment for why only the *org-wide* alerts needed a distinct
-    marker). Caller commits; returns how many notifications were actually
-    staged."""
+    marker).
+
+    Elite round (Task 6) added a third condition on top of the original
+    two: days_since_last_activity > _HIGH_REVENUE_OPPORTUNITY_IDLE_DAYS —
+    without it this could fire on a deal the owner is actively working
+    right now, which isn't really "you're about to lose this." Caller
+    commits; returns how many notifications were actually staged."""
     candidates = [
         lead
         for lead in leads
         if lead.owner_email is not None
         and lead.expected_value >= _HIGH_REVENUE_OPPORTUNITY_THRESHOLD
         and lead.win_probability >= _HIGH_REVENUE_OPPORTUNITY_WIN_PROBABILITY
+        and lead.days_since_last_activity > _HIGH_REVENUE_OPPORTUNITY_IDLE_DAYS
     ]
     if not candidates:
         return 0
