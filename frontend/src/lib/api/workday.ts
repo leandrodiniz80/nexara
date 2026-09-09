@@ -39,3 +39,82 @@ export async function getWorkdayNext(): Promise<WorkdayNext> {
     throw toApiClientError(error);
   }
 }
+
+export interface WorkdaySummary {
+  todayTasks: number;
+  overdueTasks: number;
+  highPriorityLeads: number;
+  leadsAtRisk: number;
+  estimatedRevenueAtRisk: number;
+  /** Ready-to-render sentence — built by the backend, same rule the
+   * timeline/activity feed already follow. Never assembled here. */
+  focusMessage: string;
+}
+
+interface WorkdaySummaryDto {
+  today_tasks: number;
+  overdue_tasks: number;
+  high_priority_leads: number;
+  leads_at_risk: number;
+  estimated_revenue_at_risk: number;
+  focus_message: string;
+}
+
+/** GET /api/v1/workday/summary — the Command Center's "what does today
+ * look like" snapshot: task counts, leads going cold, and a rough
+ * R$-at-risk estimate, plus one backend-written headline sentence. */
+export async function getWorkdaySummary(): Promise<WorkdaySummary> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<WorkdaySummaryDto>>("/workday/summary");
+    if (!data.data) {
+      throw new Error("Workday summary request succeeded but returned no data");
+    }
+    return {
+      todayTasks: data.data.today_tasks,
+      overdueTasks: data.data.overdue_tasks,
+      highPriorityLeads: data.data.high_priority_leads,
+      leadsAtRisk: data.data.leads_at_risk,
+      estimatedRevenueAtRisk: data.data.estimated_revenue_at_risk,
+      focusMessage: data.data.focus_message,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface WorkdayCompleteAndNextResult {
+  completedLeadId: string;
+  completedLead: Lead;
+  nextLead: Lead | null;
+}
+
+interface WorkdayCompleteAndNextDto {
+  completed_lead_id: string;
+  completed_lead: LeadDto;
+  next_lead: LeadDto | null;
+}
+
+/** POST /api/v1/workday/complete-and-next — the Command Center's
+ * continuous-flow step: completes leadId's current task and, in the same
+ * request, hands back whichever lead is most worth working on next (or
+ * null once the queue is empty). Does not touch in_focus the way
+ * getWorkdayNext() does — this is a separate, lighter "what's next"
+ * suggestion, not another entry into that lock. */
+export async function completeAndNext(leadId: string): Promise<WorkdayCompleteAndNextResult> {
+  try {
+    const { data } = await apiClient.post<ApiResponse<WorkdayCompleteAndNextDto>>(
+      "/workday/complete-and-next",
+      { lead_id: leadId }
+    );
+    if (!data.data) {
+      throw new Error("Complete-and-next request succeeded but returned no data");
+    }
+    return {
+      completedLeadId: data.data.completed_lead_id,
+      completedLead: toLead(data.data.completed_lead),
+      nextLead: data.data.next_lead ? toLead(data.data.next_lead) : null,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}

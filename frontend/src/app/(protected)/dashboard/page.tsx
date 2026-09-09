@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { BusinessIntelligence } from "@/components/dashboard/business-intelligence";
+import { CommandCenter } from "@/components/dashboard/command-center";
 import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
 import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
@@ -31,7 +32,7 @@ import {
   type Lead,
   type LeadStatus,
 } from "@/lib/api/leads";
-import { getWorkdayNext } from "@/lib/api/workday";
+import { completeAndNext, getWorkdayNext, getWorkdaySummary } from "@/lib/api/workday";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
@@ -41,6 +42,7 @@ export default function DashboardPage() {
   const queryClient = useQueryClient();
   const [detailsLead, setDetailsLead] = useState<Lead | null>(null);
   const [isWorkdayMode, setIsWorkdayMode] = useState(false);
+  const [isCommandMode, setIsCommandMode] = useState(false);
   const [workdayStats, setWorkdayStats] = useState<{
     tasksCompletedToday: number;
     streakDays: number;
@@ -101,6 +103,14 @@ export default function DashboardPage() {
     refetchInterval: 45000,
   });
 
+  const { data: workdaySummary } = useQuery({
+    queryKey: ["workday-summary"],
+    queryFn: getWorkdaySummary,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
   // "Começar meu dia": fetches the one lead to work on right now, marks it
   // in_focus server-side, and opens its modal. Completing that lead's task
   // (see the modal's onTaskCompleted below) calls this again automatically
@@ -122,6 +132,47 @@ export default function DashboardPage() {
         setIsWorkdayMode(false);
         showToast("You're all caught up — nothing left to work on right now.");
       }
+    },
+  });
+
+  // Command Center's "Começar agora": same entry point as "Começar meu dia"
+  // (GET /workday/next finds the one lead to start with) but flags
+  // isCommandMode instead of isWorkdayMode, so the modal's completion flow
+  // below routes through completeAndNextMutation (get_next_actionable_lead's
+  // overdue -> due-today -> future -> no-action ranking) instead of another
+  // GET /workday/next round-trip per step.
+  const commandStartMutation = useMutation({
+    mutationFn: getWorkdayNext,
+    onSuccess: (result) => {
+      setWorkdayStats({
+        tasksCompletedToday: result.tasksCompletedToday,
+        streakDays: result.streakDays,
+      });
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
+      if (result.lead) {
+        setIsCommandMode(true);
+        setIsWorkdayMode(false);
+        setDetailsLead(result.lead);
+      } else {
+        showToast("Você já está em dia — nada pendente agora.");
+      }
+    },
+  });
+
+  // The Command Center's own continuous-flow step: completes the lead
+  // currently open in the modal and, in the same request, gets back
+  // whichever lead is most worth working on next — see
+  // completeTaskOverride on the modal below for how this replaces its
+  // default plain completeLeadTask() call while isCommandMode is on.
+  const completeAndNextMutation = useMutation({
+    mutationFn: (leadId: string) => completeAndNext(leadId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-attention"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
     },
   });
 
@@ -188,6 +239,15 @@ export default function DashboardPage() {
       >
         {leadsMetrics && (
           <div className="space-y-4">
+            {workdaySummary && (
+              <CommandCenter
+                summary={workdaySummary}
+                tasksCompletedToday={workdayStats?.tasksCompletedToday ?? 0}
+                onStart={() => commandStartMutation.mutate()}
+                isStarting={commandStartMutation.isPending}
+              />
+            )}
+
             <div className="flex flex-col items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-foreground">Ready to focus?</p>
@@ -262,6 +322,7 @@ export default function DashboardPage() {
         onClose={() => {
           setDetailsLead(null);
           setIsWorkdayMode(false);
+          setIsCommandMode(false);
         }}
         onMove={(status) => {
           if (detailsLead && detailsLead.status !== status) {
@@ -269,9 +330,36 @@ export default function DashboardPage() {
           }
           setDetailsLead(null);
           setIsWorkdayMode(false);
+          setIsCommandMode(false);
         }}
-        onTaskCompleted={isWorkdayMode ? () => workdayNextMutation.mutate() : undefined}
-        workdayStats={isWorkdayMode ? (workdayStats ?? undefined) : undefined}
+        onTaskCompleted={
+          isCommandMode
+            ? (nextLead) => {
+                if (nextLead) {
+                  setDetailsLead(nextLead);
+                  setWorkdayStats((prev) => ({
+                    tasksCompletedToday: (prev?.tasksCompletedToday ?? 0) + 1,
+                    streakDays: prev?.streakDays ?? 0,
+                  }));
+                } else {
+                  setIsCommandMode(false);
+                  setDetailsLead(null);
+                  showToast("Dia concluído — não há mais leads para trabalhar agora.");
+                }
+              }
+            : isWorkdayMode
+              ? () => workdayNextMutation.mutate()
+              : undefined
+        }
+        workdayStats={isWorkdayMode || isCommandMode ? (workdayStats ?? undefined) : undefined}
+        completeTaskOverride={
+          isCommandMode
+            ? async (leadId) => {
+                const result = await completeAndNextMutation.mutateAsync(leadId);
+                return { lead: result.completedLead, nextLead: result.nextLead };
+              }
+            : undefined
+        }
       />
     </>
   );

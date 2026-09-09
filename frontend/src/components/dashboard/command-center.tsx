@@ -1,0 +1,79 @@
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import type { WorkdaySummary } from "@/lib/api/workday";
+
+function formatBRL(value: number): string {
+  return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
+}
+
+export function CommandCenter({
+  summary,
+  tasksCompletedToday,
+  onStart,
+  isStarting,
+}: {
+  summary: WorkdaySummary;
+  /** Leads resolved today, from the same workday-stats counter GET
+   * /workday/next already reports — the progress bar's numerator. */
+  tasksCompletedToday: number;
+  onStart: () => void;
+  isStarting: boolean;
+}) {
+  const remaining = summary.overdueTasks + summary.todayTasks;
+  const total = tasksCompletedToday + remaining;
+  const progressPct = total > 0 ? (tasksCompletedToday / total) * 100 : 100;
+
+  return (
+    <Card className="border-primary/40 bg-primary/5">
+      <CardHeader>
+        <CardTitle className="text-foreground">Command Center</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm font-medium text-foreground">{summary.focusMessage}</p>
+
+        <div className="grid grid-cols-3 gap-3 text-center">
+          <div>
+            <p className="text-lg font-semibold text-foreground">{summary.todayTasks}</p>
+            <p className="text-xs text-muted-foreground">Tarefas hoje</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-destructive">{summary.overdueTasks}</p>
+            <p className="text-xs text-muted-foreground">Atrasadas</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-foreground">
+              R$ {formatBRL(summary.estimatedRevenueAtRisk)}
+            </p>
+            <p className="text-xs text-muted-foreground">Em risco</p>
+          </div>
+        </div>
+
+        {total > 0 && (
+          <div>
+            <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
+              <span>
+                {tasksCompletedToday} de {total} ações concluídas
+              </span>
+              <span>{progressPct.toFixed(0)}%</span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-500"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {remaining > 0
+                ? `Faltam ${remaining} ações para zerar seu dia`
+                : "Dia zerado — nenhuma ação pendente."}
+            </p>
+          </div>
+        )}
+
+        <Button size="lg" className="w-full" onClick={onStart} disabled={isStarting}>
+          {isStarting ? "Buscando próximo lead…" : "Começar agora"}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}

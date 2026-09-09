@@ -94,9 +94,17 @@ function LeadActivityTimeline({ leadId }: { leadId: string }) {
 function LeadNotesAndTasks({
   lead,
   onTaskCompleted,
+  completeTaskOverride,
 }: {
   lead: Lead;
-  onTaskCompleted?: () => void;
+  onTaskCompleted?: (nextLead?: Lead | null) => void;
+  /** Command Center's continuous flow supplies this to complete the task
+   * AND fetch the next actionable lead in one request (POST
+   * /workday/complete-and-next) instead of this component's default plain
+   * completeLeadTask() call. Omitted everywhere else — behavior for the
+   * Leads page's modal and the existing "Começar meu dia" flow is
+   * unchanged. */
+  completeTaskOverride?: (leadId: string) => Promise<{ lead: Lead; nextLead?: Lead | null }>;
 }) {
   const queryClient = useQueryClient();
   const [notes, setNotes] = useState(lead.notes ?? "");
@@ -128,8 +136,11 @@ function LeadNotesAndTasks({
   });
 
   const completeTask = useMutation({
-    mutationFn: () => completeLeadTask(lead.id),
-    onSuccess: ({ lead: updated }) => {
+    mutationFn: (): Promise<{ lead: Lead; nextLead?: Lead | null }> =>
+      completeTaskOverride
+        ? completeTaskOverride(lead.id)
+        : completeLeadTask(lead.id).then((result) => ({ lead: result.lead })),
+    onSuccess: ({ lead: updated, nextLead }) => {
       setNextAction("");
       setDueDate("");
       queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
@@ -139,7 +150,7 @@ function LeadNotesAndTasks({
       queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
       queryClient.invalidateQueries({ queryKey: ["lead-timeline", lead.id] });
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
-      onTaskCompleted?.();
+      onTaskCompleted?.(nextLead);
     },
   });
 
@@ -365,15 +376,21 @@ export function LeadDetailsModal({
   onMove,
   onTaskCompleted,
   workdayStats,
+  completeTaskOverride,
 }: {
   lead: Lead | null;
   onClose: () => void;
   onMove: (status: LeadStatus) => void;
-  /** Set only when this modal is being driven by workday mode ("Começar meu
-   * dia") — completing this lead's task calls back into the dashboard to
-   * fetch and open the next one, instead of just refreshing in place. */
-  onTaskCompleted?: () => void;
+  /** Set when this modal is being driven by workday mode ("Começar meu
+   * dia") or the Command Center — completing this lead's task calls back
+   * into the dashboard to fetch and open the next one, instead of just
+   * refreshing in place. The Command Center's nextLead (when
+   * completeTaskOverride is also set) arrives here instead of the caller
+   * needing a separate round-trip. */
+  onTaskCompleted?: (nextLead?: Lead | null) => void;
   workdayStats?: { tasksCompletedToday: number; streakDays: number };
+  /** Command Center only — see LeadNotesAndTasks's own prop doc. */
+  completeTaskOverride?: (leadId: string) => Promise<{ lead: Lead; nextLead?: Lead | null }>;
 }) {
   const [tab, setTab] = useState<ModalTab>("details");
 
@@ -465,7 +482,11 @@ export function LeadDetailsModal({
               </div>
             </div>
 
-            <LeadNotesAndTasks lead={lead} onTaskCompleted={onTaskCompleted} />
+            <LeadNotesAndTasks
+              lead={lead}
+              onTaskCompleted={onTaskCompleted}
+              completeTaskOverride={completeTaskOverride}
+            />
 
             <LeadIntelligence lead={lead} />
           </>
