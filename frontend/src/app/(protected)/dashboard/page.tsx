@@ -28,7 +28,13 @@ import { useToast } from "@/components/ui/toast";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
-import { getAdaptiveWeights, getExecInsight } from "@/lib/api/intelligence";
+import {
+  getAdaptiveWeights,
+  getAggressionLevel,
+  getExecInsight,
+  getGlobalStrategy,
+  getRevenueLeaks,
+} from "@/lib/api/intelligence";
 import { getLeaderboard, getTeamSummary } from "@/lib/api/performance";
 import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
@@ -147,6 +153,29 @@ export default function DashboardPage() {
   const { data: execInsight } = useQuery({
     queryKey: ["intelligence-exec-insight"],
     queryFn: getExecInsight,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  // Final round (Task 9) — the same low-frequency read rhythm as
+  // adaptiveWeights/execInsight above.
+  const { data: aggressionLevel } = useQuery({
+    queryKey: ["intelligence-aggression-level"],
+    queryFn: getAggressionLevel,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: globalStrategy } = useQuery({
+    queryKey: ["intelligence-global-strategy"],
+    queryFn: getGlobalStrategy,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: revenueLeaks } = useQuery({
+    queryKey: ["intelligence-revenue-leaks"],
+    queryFn: getRevenueLeaks,
     enabled: isAuthenticated,
     retry: false,
   });
@@ -469,6 +498,9 @@ export default function DashboardPage() {
                 execInsight={execInsight}
                 adaptiveWeights={adaptiveWeights}
                 hasRecentReassignments={hasRecentReassignments}
+                aggressionLevel={aggressionLevel ?? undefined}
+                globalStrategy={globalStrategy ?? undefined}
+                revenueLeakValue={revenueLeaks?.totalLeakValue}
               />
             )}
 

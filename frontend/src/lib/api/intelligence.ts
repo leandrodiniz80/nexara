@@ -61,3 +61,82 @@ export async function getExecInsight(): Promise<string> {
     throw toApiClientError(error);
   }
 }
+
+export type GlobalStrategyFocus = "calls" | "messages" | "meetings";
+
+export interface GlobalStrategy {
+  focus: GlobalStrategyFocus;
+  reason: string;
+  confidence: number;
+}
+
+interface GlobalStrategyDto {
+  focus: GlobalStrategyFocus;
+  reason: string;
+  confidence: number;
+}
+
+/** GET /api/v1/intelligence/global-strategy — Global Strategy Engine
+ * (final round, Task 2/8): one recommended channel to focus on right now
+ * (calls/messages/meetings), plain deterministic rules. */
+export async function getGlobalStrategy(): Promise<GlobalStrategy | null> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<GlobalStrategyDto>>(
+      "/intelligence/global-strategy"
+    );
+    if (!data.data) return null;
+    return { focus: data.data.focus, reason: data.data.reason, confidence: data.data.confidence };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export type AggressionLevel = "low" | "medium" | "high" | "extreme";
+
+/** GET /api/v1/intelligence/aggression-level — Dynamic Aggression Mode
+ * (final round, Task 3/8): how hard the system should be pushing right
+ * now, derived from today's lost opportunity and the Revenue Simulation
+ * Engine's own gap. */
+export async function getAggressionLevel(): Promise<AggressionLevel | null> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<{ level: AggressionLevel }>>(
+      "/intelligence/aggression-level"
+    );
+    return data.data?.level ?? null;
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface RevenueLeaks {
+  leadsIgnoredOver24h: number;
+  highValueLeadsWithoutAction: number;
+  leadsStuckSameStage: number;
+  totalLeakValue: number;
+}
+
+interface RevenueLeaksDto {
+  leads_ignored_over_24h: number;
+  high_value_leads_without_action: number;
+  leads_stuck_same_stage: number;
+  total_leak_value: number;
+}
+
+/** GET /api/v1/intelligence/revenue-leaks — Revenue Leak Detector (final
+ * round, Task 5/8): three independent leak patterns plus totalLeakValue,
+ * the summed expectedValue across every lead caught by at least one. */
+export async function getRevenueLeaks(): Promise<RevenueLeaks> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<RevenueLeaksDto>>(
+      "/intelligence/revenue-leaks"
+    );
+    return {
+      leadsIgnoredOver24h: data.data?.leads_ignored_over_24h ?? 0,
+      highValueLeadsWithoutAction: data.data?.high_value_leads_without_action ?? 0,
+      leadsStuckSameStage: data.data?.leads_stuck_same_stage ?? 0,
+      totalLeakValue: data.data?.total_leak_value ?? 0,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}

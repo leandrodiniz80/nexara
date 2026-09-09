@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import type { AggressionLevel, GlobalStrategy } from "@/lib/api/intelligence";
 import type { FailureState, WorkdayPerformance, WorkdaySummary } from "@/lib/api/workday";
 
 function formatBRL(value: number): string {
@@ -63,6 +64,27 @@ function topAdaptiveWeightLabel(adaptiveWeights: Record<string, number> | undefi
   return formatAdaptiveWeightKey(topKey);
 }
 
+// Final round (Task 9) — labels for the three new Command Center notices.
+const AGGRESSION_LABEL_PT: Record<AggressionLevel, string> = {
+  low: "BAIXO",
+  medium: "MÉDIO",
+  high: "ALTO",
+  extreme: "EXTREMO",
+};
+
+const AGGRESSION_STYLE: Record<AggressionLevel, string> = {
+  low: "text-success",
+  medium: "text-primary",
+  high: "text-warning",
+  extreme: "text-destructive",
+};
+
+const STRATEGY_FOCUS_LABEL_PT: Record<GlobalStrategy["focus"], string> = {
+  calls: "Ligações",
+  messages: "Mensagens",
+  meetings: "Reuniões",
+};
+
 export function CommandCenter({
   summary,
   performance,
@@ -73,6 +95,9 @@ export function CommandCenter({
   execInsight,
   adaptiveWeights,
   hasRecentReassignments,
+  aggressionLevel,
+  globalStrategy,
+  revenueLeakValue,
 }: {
   summary: WorkdaySummary;
   /** Optional so the card still renders (with its default look) before
@@ -101,6 +126,15 @@ export function CommandCenter({
    * — the Lead Reassignment Engine (Task 4) ran and actually moved
    * something. Backs "⚠️ Leads redistribuídos automaticamente." */
   hasRecentReassignments?: boolean;
+  /** GET /intelligence/aggression-level (final round, Task 9) — backs
+   * "🔥 Modo atual: EXTREMO." */
+  aggressionLevel?: AggressionLevel;
+  /** GET /intelligence/global-strategy (final round, Task 9) — backs
+   * "🎯 Foco do sistema: Ligações." */
+  globalStrategy?: GlobalStrategy;
+  /** GET /intelligence/revenue-leaks' own totalLeakValue (final round,
+   * Task 9) — backs "💸 Vazamento de receita: R$ X." */
+  revenueLeakValue?: number;
 }) {
   const suggestedFocusLabel = topAdaptiveWeightLabel(adaptiveWeights);
   const remaining = summary.overdueTasks + summary.todayTasks;
@@ -215,6 +249,25 @@ export function CommandCenter({
         {hasRecentReassignments && (
           <p className="text-sm font-semibold text-warning">
             ⚠️ Leads redistribuídos automaticamente
+          </p>
+        )}
+
+        {/* Final round (Task 9) — Dynamic Aggression Mode, Global
+            Strategy Engine, Revenue Leak Detector. Same "omit until real
+            data" convention as the three lines just above. */}
+        {aggressionLevel && (
+          <p className={`text-sm font-semibold ${AGGRESSION_STYLE[aggressionLevel]}`}>
+            🔥 Modo atual: {AGGRESSION_LABEL_PT[aggressionLevel]}
+          </p>
+        )}
+        {globalStrategy && (
+          <p className="text-sm font-semibold text-primary">
+            🎯 Foco do sistema: {STRATEGY_FOCUS_LABEL_PT[globalStrategy.focus]}
+          </p>
+        )}
+        {typeof revenueLeakValue === "number" && revenueLeakValue > 0 && (
+          <p className="text-sm font-semibold text-destructive">
+            💸 Vazamento de receita: R$ {formatBRL(revenueLeakValue)}
           </p>
         )}
 
