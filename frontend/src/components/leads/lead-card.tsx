@@ -39,6 +39,23 @@ function formatBRL(value: number): string {
   return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
 }
 
+// Revenue-loop round — "Alta geração de receita"'s own bar: a big deal
+// (same >=5000 threshold HIGH_VALUE_LEAD_THRESHOLD uses backend-side) that
+// is ALSO likely to close (>=70%, same green-badge cutoff
+// getWinProbabilityVariant above already uses) — the same two-condition
+// shape maybe_notify_high_revenue_opportunity() (workday_engine.py) checks
+// server-side for its own proactive alert, just rendered here as a quiet
+// badge instead of a notification.
+const HIGH_REVENUE_VALUE_THRESHOLD = 5000;
+const HIGH_REVENUE_WIN_PROBABILITY = 70;
+
+function isHighRevenueOpportunity(lead: Lead): boolean {
+  return (
+    lead.expectedValue >= HIGH_REVENUE_VALUE_THRESHOLD &&
+    lead.winProbability >= HIGH_REVENUE_WIN_PROBABILITY
+  );
+}
+
 /** AI Deal Coach round — dealRiskLevel's visual treatment. "low" and null
  * are deliberately absent (no entry, no badge rendered): a quiet lead
  * competing for attention against real risk badges would defeat the point.
@@ -295,6 +312,11 @@ export function LeadCard({
         </Badge>
         {lead.expectedValue > 0 && (
           <Badge variant="outline">💰 R$ {formatBRL(lead.expectedValue)}</Badge>
+        )}
+        {isHighRevenueOpportunity(lead) && (
+          <Badge variant="outline" className="border-transparent bg-success/15 text-success">
+            💰 Alta geração de receita
+          </Badge>
         )}
         {(lead.status === "new" || lead.status === "contacted") && (
           <Badge variant={getWinProbabilityVariant(lead.winProbability)}>

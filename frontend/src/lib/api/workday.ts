@@ -90,6 +90,14 @@ export interface WorkdaySummary {
    * itself is empty (nothing next-best-action-eligible and non-converted/
    * non-lost) — the frontend hides that section instead of rendering it. */
   nextMandatoryLeadId: string | null;
+  /** Revenue-loop round — Command Center's "O que mais gera dinheiro
+   * hoje": the single highest-earning bucket in each of the backend's
+   * revenue-attribution breakdowns (action/industry/company size). Null
+   * until at least one lead has converted with real attributed revenue
+   * behind it. */
+  topRevenueAction: string | null;
+  topRevenueIndustry: string | null;
+  topRevenueCompanySize: string | null;
 }
 
 interface WorkdaySummaryDto {
@@ -110,6 +118,9 @@ interface WorkdaySummaryDto {
   high_value_at_risk_count: number;
   pipeline_expected_value: number;
   next_mandatory_lead_id: string | null;
+  top_revenue_action: string | null;
+  top_revenue_industry: string | null;
+  top_revenue_company_size: string | null;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -139,6 +150,9 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       highValueAtRiskCount: data.data.high_value_at_risk_count,
       pipelineExpectedValue: data.data.pipeline_expected_value,
       nextMandatoryLeadId: data.data.next_mandatory_lead_id,
+      topRevenueAction: data.data.top_revenue_action,
+      topRevenueIndustry: data.data.top_revenue_industry,
+      topRevenueCompanySize: data.data.top_revenue_company_size,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -265,6 +279,13 @@ export interface WorkdayPerformance {
    * is null (not 0) when nobody responded today at all. */
   avgResponseTimeToday: number | null;
   fastResponsesToday: number;
+  /** Revenue-loop round — money actually closed today (leads with a
+   * "lead_won" event today), distinct from moneySavedToday above (a proxy
+   * for deals worked on, not deals won). */
+  revenueGeneratedToday: number;
+  /** All-time mean deal size across every converted lead this org has
+   * ever had — null until at least one lead has ever converted. */
+  avgRevenuePerConversion: number | null;
 }
 
 interface WorkdayPerformanceDto {
@@ -285,6 +306,8 @@ interface WorkdayPerformanceDto {
   responses_received_today: number;
   avg_response_time_today: number | null;
   fast_responses_today: number;
+  revenue_generated_today: number;
+  avg_revenue_per_conversion: number | null;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -320,6 +343,8 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       responsesReceivedToday: data.data.responses_received_today,
       avgResponseTimeToday: data.data.avg_response_time_today,
       fastResponsesToday: data.data.fast_responses_today,
+      revenueGeneratedToday: data.data.revenue_generated_today,
+      avgRevenuePerConversion: data.data.avg_revenue_per_conversion,
     };
   } catch (error) {
     throw toApiClientError(error);

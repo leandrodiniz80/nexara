@@ -10,6 +10,12 @@ export interface RevenueSummary {
   /** Probability-weighted forecast of the open (new + contacted) pipeline
    * — unlike potentialRevenue (raw, unadjusted for likelihood to close). */
   expectedPipelineRevenue: number;
+  /** Revenue-loop round — "what actually generated the money," per
+   * channel: for every converted lead, its full estimated value is
+   * credited to whichever action (call/message/meeting) was the last one
+   * logged before it converted. Always has all three keys (0 default),
+   * never absent. */
+  revenueByAction: { call: number; message: number; meeting: number };
 }
 
 interface RevenueSummaryDto {
@@ -19,6 +25,7 @@ interface RevenueSummaryDto {
   at_risk_revenue: number;
   conversion_rate: number;
   expected_pipeline_revenue: number;
+  revenue_by_action: { call: number; message: number; meeting: number };
 }
 
 /** GET /api/v1/revenue/summary — org-wide revenue snapshot: pipeline
@@ -39,6 +46,7 @@ export async function getRevenueSummary(): Promise<RevenueSummary> {
       atRiskRevenue: data.data.at_risk_revenue,
       conversionRate: data.data.conversion_rate,
       expectedPipelineRevenue: data.data.expected_pipeline_revenue,
+      revenueByAction: data.data.revenue_by_action,
     };
   } catch (error) {
     throw toApiClientError(error);

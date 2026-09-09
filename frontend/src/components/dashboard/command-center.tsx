@@ -15,6 +15,18 @@ const STATE_STYLES: Record<FailureState, { border: string; bg: string; text: str
   on_track: { border: "border-success/40", bg: "bg-success/10", text: "text-success" },
 };
 
+// Revenue-loop round — topRevenueAction's own plain-noun values ("call"/
+// "message"/"meeting", same vocabulary RevenuePanel's revenueByAction keys
+// use) translated for display; topRevenueIndustry/topRevenueCompanySize
+// are shown as the backend's own raw enrichment_data strings, same
+// no-translation convention the Learning Panel's bestIndustry already
+// follows.
+const ACTION_LABELS_PT: Record<string, string> = {
+  call: "Ligações",
+  message: "Mensagens",
+  meeting: "Reuniões",
+};
+
 export function CommandCenter({
   summary,
   performance,
@@ -108,6 +120,33 @@ export function CommandCenter({
           <p className="text-sm font-semibold text-primary">
             {summary.responseRate.toFixed(0)}% das suas mensagens recebem resposta
           </p>
+        )}
+
+        {/* Revenue-loop round — "O que mais gera dinheiro hoje": each line
+            omitted individually until that dimension has a real winner
+            (at least one conversion with attributed revenue behind it),
+            and the whole block omitted if none of the three do. */}
+        {(summary.topRevenueAction || summary.topRevenueIndustry || summary.topRevenueCompanySize) && (
+          <div className="rounded-md border border-success/30 bg-success/5 p-3 text-sm">
+            <p className="font-semibold text-success">💡 O que mais gera dinheiro hoje:</p>
+            <ul className="mt-1 space-y-0.5 text-foreground">
+              {summary.topRevenueAction && (
+                <li>
+                  Ação: <span className="font-medium">{ACTION_LABELS_PT[summary.topRevenueAction] ?? summary.topRevenueAction}</span>
+                </li>
+              )}
+              {summary.topRevenueIndustry && (
+                <li>
+                  Segmento: <span className="font-medium">{summary.topRevenueIndustry}</span>
+                </li>
+              )}
+              {summary.topRevenueCompanySize && (
+                <li>
+                  Porte: <span className="font-medium">{summary.topRevenueCompanySize}</span>
+                </li>
+              )}
+            </ul>
+          </div>
         )}
 
         <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
