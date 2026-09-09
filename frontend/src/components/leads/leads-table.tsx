@@ -7,12 +7,14 @@ const STATUS_LABEL: Record<LeadStatus, string> = {
   new: "New",
   contacted: "Contacted",
   converted: "Converted",
+  lost: "Lost",
 };
 
-const STATUS_BADGE: Record<LeadStatus, "secondary" | "warning" | "success"> = {
+const STATUS_BADGE: Record<LeadStatus, "secondary" | "warning" | "success" | "destructive"> = {
   new: "secondary",
   contacted: "warning",
   converted: "success",
+  lost: "destructive",
 };
 
 export function LeadsTable({

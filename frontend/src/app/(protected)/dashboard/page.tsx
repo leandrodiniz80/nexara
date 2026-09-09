@@ -8,6 +8,7 @@ import { CommandCenter } from "@/components/dashboard/command-center";
 import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
 import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
+import { LearningPanel } from "@/components/dashboard/learning-panel";
 import { NeedsAttention } from "@/components/dashboard/needs-attention";
 import { PerformancePanel } from "@/components/dashboard/performance-panel";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
@@ -26,6 +27,7 @@ import { ApiClientError } from "@/lib/api/client";
 import { getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
   completeLeadTask,
+  getLeadInsights,
   getLeadMetrics,
   getLeadsActivityFeed,
   getLeadsNeedingAttention,
@@ -128,6 +130,16 @@ export default function DashboardPage() {
     enabled: isAuthenticated,
     retry: false,
     refetchInterval: 45000,
+  });
+
+  // Feedback-loop round's Learning Panel — no polling (org-wide learned
+  // patterns shift slowly), just invalidated below wherever a lead is
+  // actually won or lost.
+  const { data: conversionInsights } = useQuery({
+    queryKey: ["leads-insights"],
+    queryFn: getLeadInsights,
+    enabled: isAuthenticated,
+    retry: false,
   });
 
   const { data: revenueSummary } = useQuery({
@@ -238,8 +250,8 @@ export default function DashboardPage() {
   });
 
   const updateStatusMutation = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
-      updateLeadStatus(id, status),
+    mutationFn: ({ id, status, reason }: { id: string; status: LeadStatus; reason?: string }) =>
+      updateLeadStatus(id, status, reason),
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
       queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
@@ -248,6 +260,12 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads"] });
       queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
       queryClient.invalidateQueries({ queryKey: ["revenue-trend"] });
+      // A won/lost transition changes what compute_conversion_insights()
+      // (scoring.py) mines from, so the Learning Panel's own read goes
+      // stale the moment this one does.
+      if (result.lead.status === "converted" || result.lead.status === "lost") {
+        queryClient.invalidateQueries({ queryKey: ["leads-insights"] });
+      }
       result.notifications.forEach((message) => showToast(message));
     },
   });
@@ -298,6 +316,8 @@ export default function DashboardPage() {
             )}
 
             {workdayPerformance && <PerformancePanel performance={workdayPerformance} />}
+
+            {conversionInsights && <LearningPanel insights={conversionInsights} />}
 
             <div className="flex flex-col items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
@@ -375,9 +395,9 @@ export default function DashboardPage() {
           setIsWorkdayMode(false);
           setIsCommandMode(false);
         }}
-        onMove={(status) => {
+        onMove={(status, reason) => {
           if (detailsLead && detailsLead.status !== status) {
-            updateStatusMutation.mutate({ id: detailsLead.id, status });
+            updateStatusMutation.mutate({ id: detailsLead.id, status, reason });
           }
           setDetailsLead(null);
           setIsWorkdayMode(false);

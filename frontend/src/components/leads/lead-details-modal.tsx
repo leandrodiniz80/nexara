@@ -36,15 +36,62 @@ const STATUS_LABEL: Record<LeadStatus, string> = {
   new: "New",
   contacted: "Contacted",
   converted: "Converted",
+  lost: "Lost",
 };
 
-const STATUS_BADGE: Record<LeadStatus, "secondary" | "warning" | "success"> = {
+const STATUS_BADGE: Record<LeadStatus, "secondary" | "warning" | "success" | "destructive"> = {
   new: "secondary",
   contacted: "warning",
   converted: "success",
+  lost: "destructive",
 };
 
+// "lost" deliberately excluded — moving a lead there always goes through
+// LeadLossAction below (reason required), never this one-click "Move to"
+// row.
 const STATUS_OPTIONS: LeadStatus[] = ["new", "contacted", "converted"];
+
+/** LeadLossAction's fixed set of reasons — matches PATCH /leads/{id}/status's
+ * `reason` docs (backend/app/schemas/leads/lead.py) exactly, though the
+ * field itself stays a plain string there so a future reason doesn't need a
+ * schema change. */
+const LOSS_REASONS = ["Preço alto", "Sem resposta", "Sem interesse", "Timing"] as const;
+
+/** "Mark as lost" — deliberately its own dedicated block, not a
+ * STATUS_OPTIONS entry: losing a lead always requires picking a reason
+ * first (feedback-loop round's loss-intelligence signal depends on it),
+ * so it can't be a casual one-click action the way New/Contacted/Converted
+ * are. */
+function LeadLossAction({
+  status,
+  onConfirm,
+}: {
+  status: LeadStatus;
+  onConfirm: (reason: string) => void;
+}) {
+  const [reason, setReason] = useState<string>(LOSS_REASONS[0]);
+
+  if (status === "lost") return null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
+      <Select
+        value={reason}
+        onChange={(event) => setReason(event.target.value)}
+        className="w-auto"
+      >
+        {LOSS_REASONS.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </Select>
+      <Button size="sm" variant="destructive" onClick={() => onConfirm(reason)}>
+        Marcar como perdido
+      </Button>
+    </div>
+  );
+}
 
 type ModalTab = "details" | "activity";
 
@@ -383,7 +430,7 @@ export function LeadDetailsModal({
 }: {
   lead: Lead | null;
   onClose: () => void;
-  onMove: (status: LeadStatus) => void;
+  onMove: (status: LeadStatus, reason?: string) => void;
   /** Set when this modal is being driven by workday mode ("Começar meu
    * dia") or the Command Center — completing this lead's task calls back
    * into the dashboard to fetch and open the next one, instead of just
@@ -464,6 +511,13 @@ export function LeadDetailsModal({
               </div>
             </dl>
 
+            {lead.priorityReason && (
+              <p className="mt-3 rounded-md border border-primary/30 bg-primary/5 p-2.5 text-xs text-foreground">
+                <span className="font-medium text-primary">Por que este lead? </span>
+                {lead.priorityReason}
+              </p>
+            )}
+
             <LeadOwnerAssignment lead={lead} />
 
             <div className="mt-5 space-y-2">
@@ -483,6 +537,7 @@ export function LeadDetailsModal({
                   </Button>
                 ))}
               </div>
+              <LeadLossAction status={lead.status} onConfirm={(reason) => onMove("lost", reason)} />
             </div>
 
             <LeadNotesAndTasks

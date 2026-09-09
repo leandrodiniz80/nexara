@@ -24,6 +24,7 @@ const STATUS_FILTERS: { label: string; value: "all" | LeadStatus }[] = [
   { label: "Novos", value: "new" },
   { label: "Contatados", value: "contacted" },
   { label: "Convertidos", value: "converted" },
+  { label: "Perdidos", value: "lost" },
 ];
 
 const VIEW_OPTIONS: { label: string; value: "table" | "kanban" }[] = [
@@ -101,13 +102,19 @@ export default function LeadsPage() {
   });
 
   const updateStatusMutation = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
-      updateLeadStatus(id, status),
+    mutationFn: ({ id, status, reason }: { id: string; status: LeadStatus; reason?: string }) =>
+      updateLeadStatus(id, status, reason),
     onSuccess: (result) => {
       queryClient.setQueryData<Lead[]>(["leads"], (prev) =>
         (prev ?? []).map((lead) => (lead.id === result.lead.id ? result.lead : lead))
       );
       queryClient.invalidateQueries({ queryKey: ["leads-metrics"] });
+      // A won/lost transition changes what compute_conversion_insights()
+      // (scoring.py) mines from, so the Learning Panel's own read goes
+      // stale the moment this one does.
+      if (result.lead.status === "converted" || result.lead.status === "lost") {
+        queryClient.invalidateQueries({ queryKey: ["leads-insights"] });
+      }
       result.notifications.forEach((message) => showToast(message));
     },
   });
@@ -146,10 +153,10 @@ export default function LeadsPage() {
     });
   }, [leads, statusFilter, query]);
 
-  function handleMoveLead(id: string, status: LeadStatus) {
+  function handleMoveLead(id: string, status: LeadStatus, reason?: string) {
     const lead = leads.find((item) => item.id === id);
     if (!lead || lead.status === status) return;
-    updateStatusMutation.mutate({ id, status });
+    updateStatusMutation.mutate({ id, status, reason });
   }
 
   const isAuthError = leadsError instanceof ApiClientError && leadsError.status === 401;
@@ -260,8 +267,8 @@ export default function LeadsPage() {
       <LeadDetailsModal
         lead={detailsLead}
         onClose={() => setDetailsLead(null)}
-        onMove={(status) => {
-          if (detailsLead) handleMoveLead(detailsLead.id, status);
+        onMove={(status, reason) => {
+          if (detailsLead) handleMoveLead(detailsLead.id, status, reason);
           setDetailsLead(null);
         }}
       />

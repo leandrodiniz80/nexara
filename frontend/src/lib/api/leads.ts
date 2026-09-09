@@ -2,13 +2,15 @@ import { apiClient, toApiClientError } from "@/lib/api/client";
 import type { ApiResponse } from "@/lib/api/types";
 
 /**
- * "lost" exists on the backend enum (backend/app/models/leads/lead.py) but
- * nothing in this UI produces it yet (no Kanban column, no dropdown option)
- * — kept out of this type on purpose so Table/Kanban/Card's exhaustive
- * Record<LeadStatus, ...> maps don't need a 4th case for a status the UI
- * never sets.
+ * "lost" exists on the backend enum (backend/app/models/leads/lead.py) and,
+ * as of the feedback-loop round, is reachable from the UI too — but only
+ * through LeadDetailsModal's dedicated "Mark as lost" flow (a reason is
+ * required there), never from the casual Kanban drag or dropdown "Move to"
+ * actions: losing a lead is deliberately kept out of a one-click action.
+ * Table/Kanban/Card's exhaustive Record<LeadStatus, ...> maps (where they
+ * have one) do need a 4th case now.
  */
-export type LeadStatus = "new" | "contacted" | "converted";
+export type LeadStatus = "new" | "contacted" | "converted" | "lost";
 
 export interface ScoreBreakdownItem {
   reason: string;
@@ -58,6 +60,11 @@ export interface Lead {
   /** estimatedValue * winProbability / 100 — the probability-weighted
    * forecast this lead is actually worth right now. */
   expectedValue: number;
+  /** "Why this lead?" — one ready-to-render sentence built by the backend
+   * (build_priority_reason, scoring.py) from the same score/winProbability/
+   * estimatedValue/activity signals already on this object. Never empty —
+   * a quiet lead still gets a neutral sentence. */
+  priorityReason: string;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -99,6 +106,7 @@ export interface LeadDto {
   win_probability: number;
   estimated_value: number;
   expected_value: number;
+  priority_reason: string;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -127,6 +135,7 @@ export function toLead(dto: LeadDto): Lead {
     winProbability: dto.win_probability,
     estimatedValue: dto.estimated_value,
     expectedValue: dto.expected_value,
+    priorityReason: dto.priority_reason,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,
@@ -209,15 +218,19 @@ export interface LeadStatusUpdateResult {
   notifications: string[];
 }
 
-/** PATCH /api/v1/leads/{id}/status */
+/** PATCH /api/v1/leads/{id}/status. `reason` is only meaningful moving to
+ * "lost" (why it was lost) — see LeadLossAction in lead-details-modal.tsx,
+ * the only UI flow that ever passes one. Ignored by the backend for every
+ * other status. */
 export async function updateLeadStatus(
   id: string,
-  status: LeadStatus
+  status: LeadStatus,
+  reason?: string
 ): Promise<LeadStatusUpdateResult> {
   try {
     const { data } = await apiClient.patch<
       ApiResponse<{ lead: LeadDto; notifications: string[] }>
-    >(`/leads/${id}/status`, { status });
+    >(`/leads/${id}/status`, { status, reason });
     if (!data.data) {
       throw new Error("Status update succeeded but returned no data");
     }
@@ -456,6 +469,41 @@ export async function generateLeadMessage(id: string): Promise<string> {
       throw new Error("Message generation succeeded but returned no data");
     }
     return data.data.message;
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+/** GET /api/v1/leads/insights — org-wide learning-layer patterns mined from
+ * real outcomes (compute_conversion_insights, scoring.py). Every field is
+ * null until there's enough real outcome data to say something (e.g. no
+ * lead converted yet). Backs the dashboard's Learning Panel. */
+export interface ConversionInsights {
+  bestIndustry: string | null;
+  bestCompanySize: string | null;
+  avgTimeToCloseDays: number | null;
+  topLossReason: string | null;
+}
+
+interface ConversionInsightsDto {
+  best_industry: string | null;
+  best_company_size: string | null;
+  avg_time_to_close_days: number | null;
+  top_loss_reason: string | null;
+}
+
+export async function getLeadInsights(): Promise<ConversionInsights> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<ConversionInsightsDto>>("/leads/insights");
+    if (!data.data) {
+      throw new Error("Insights request succeeded but returned no data");
+    }
+    return {
+      bestIndustry: data.data.best_industry,
+      bestCompanySize: data.data.best_company_size,
+      avgTimeToCloseDays: data.data.avg_time_to_close_days,
+      topLossReason: data.data.top_loss_reason,
+    };
   } catch (error) {
     throw toApiClientError(error);
   }
