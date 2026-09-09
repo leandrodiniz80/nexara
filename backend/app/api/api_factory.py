@@ -15,6 +15,7 @@ from app.api.routers.billing import router as billing_router
 from app.api.routers.branding import router as branding_router
 from app.api.routers.cdn import router as cdn_router
 from app.api.routers.health import router as health_router
+from app.api.routers.intelligence import router as intelligence_router
 from app.api.routers.internal_jobs import router as internal_jobs_router
 from app.api.routers.leads import router as leads_router
 from app.api.routers.logs import router as logs_router
@@ -114,5 +115,6 @@ def create_app() -> FastAPI:
     app.include_router(workday_router)
     app.include_router(revenue_router)
     app.include_router(performance_router)
+    app.include_router(intelligence_router)
 
     return app

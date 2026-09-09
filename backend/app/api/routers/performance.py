@@ -15,6 +15,8 @@ from app.services.leads.team_performance import (
     compute_user_performance,
     maybe_notify_underperformance,
     rank_user_performance,
+    reassign_leads_if_needed,
+    score_org_leads,
 )
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/performance", tags=["Performance"])
@@ -51,21 +53,27 @@ async def get_leaderboard(
     with at least one lead in this org) ranked by rank_user_performance()
     (team_performance.py): revenue_converted DESC, response_rate DESC,
     avg_response_time_minutes ASC. Also runs maybe_notify_underperformance()
-    (Task 5) over the same already-computed performances, zero extra
-    query — this endpoint doubles as the read AND the trigger for that
-    pressure notification, same "GET also fires side-effect notifications"
-    pattern GET /workday/summary already established."""
+    (Task 5) and, since the Adaptive Intelligence round, reassign_leads_
+    if_needed() (Task 4) over the same already-computed performances/scored
+    leads, zero extra score_leads() pass — this endpoint doubles as the
+    read AND the trigger for both side effects, same "GET also fires
+    side-effect notifications" pattern GET /workday/summary already
+    established."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
     now = datetime.now(timezone.utc)
 
-    performances = await compute_user_performance(db, organization_id)
+    scored_leads = await score_org_leads(db, organization_id)
+    performances = await compute_user_performance(db, organization_id, leads=scored_leads)
     ranked = rank_user_performance(performances)
 
     notified = await maybe_notify_underperformance(
         db, organization_id=organization_id, performances=performances, now=now
     )
-    if notified:
+    reassigned = await reassign_leads_if_needed(
+        db, organization_id=organization_id, leads=scored_leads, user_performance=performances
+    )
+    if notified or reassigned:
         await db.commit()
 
     return ApiResponse(

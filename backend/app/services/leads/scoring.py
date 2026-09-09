@@ -374,6 +374,28 @@ _HUNTER_MODE_NEW_LEAD_BONUS = 25
 _PRUNE_HARD_WIN_PROBABILITY_THRESHOLD = 15
 _PRUNE_HARD_IDLE_DAYS_THRESHOLD = 10
 
+# Adaptive Intelligence round — compute_adaptive_weights()'s own bounds
+# (Task 1): the prompt's own literal range. 1.0 (unweighted) is always the
+# answer for a signal value with too little data to trust yet — see
+# _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE below.
+_ADAPTIVE_WEIGHTS_WINDOW_DAYS = 30
+_ADAPTIVE_WEIGHT_MIN = 0.8
+_ADAPTIVE_WEIGHT_MAX = 1.5
+# Below this many outcomes (won+lost) for a given signal value, its own
+# conversion rate is too noisy to weight anything by — a single won/lost
+# lead swinging a multiplier the full 0.8-1.5 range would be gaming the
+# score off one data point.
+_ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE = 3
+# "high_risk" signal's own proxy (Task 1): no stored deal_risk_level
+# history exists to check against a past outcome (it's computed fresh at
+# read time, current state only — see compute_deal_risk()'s own
+# docstring), so this reuses each outcome's own time-to-close
+# (duration_seconds on its lead_won/lead_lost LeadActivityLog entry,
+# already written by PATCH /leads/{id}/status) as a "this one dragged on
+# and looked risky along the way" stand-in — a disclosed approximation,
+# same spirit as every other proxy this codebase already accepts.
+_ADAPTIVE_HIGH_RISK_DAYS_TO_OUTCOME = 7
+
 
 def compute_close_probability_boost(
     lead: Lead,
@@ -639,6 +661,57 @@ def compute_next_best_action(
     return action
 
 
+# Smart Follow-up Engine's own cadence tables (Task 2, Adaptive
+# Intelligence round) — the prompt's own literal day_offset/action pairs.
+# day_offset is measured from lead.created_at (no separate "sequence
+# started at" column exists — see generate_follow_up_sequence()'s own
+# docstring for why this is the right anchor anyway). Kept as a plain
+# function over a module-level constant so a future "day_offset in
+# business days" refinement doesn't need every caller to change.
+def follow_up_sequence_for_state(lead_response_state: str) -> list[dict]:
+    """The day_offset/action table half of generate_follow_up_sequence()
+    (Task 2) — factored out so a caller holding only a `LeadResponse`
+    (auto_execute_engine(), execution_engine.py — Task 3) can look up the
+    same cadence without needing the full `Lead` ORM row
+    generate_follow_up_sequence() itself requires for its own status
+    short-circuit. Computed on demand every call, nothing stored."""
+    if lead_response_state == "interested":
+        # Escalate: message -> call -> meeting, same cadence spacing as
+        # the no-response track below for consistency.
+        return [
+            {"day_offset": 0, "action": "send_message"},
+            {"day_offset": 1, "action": "call_now"},
+            {"day_offset": 3, "action": "schedule_meeting"},
+        ]
+    return [
+        {"day_offset": 0, "action": "send_message"},
+        {"day_offset": 1, "action": "send_message"},
+        {"day_offset": 3, "action": "call_now"},
+        {"day_offset": 5, "action": "send_message"},
+    ]
+
+
+def generate_follow_up_sequence(
+    lead: Lead, *, lead_response_state: str = "no_response"
+) -> list[dict]:
+    """Smart Follow-up Engine (Task 2, Adaptive Intelligence round) —
+    the fixed, deterministic cadence a lead should be worked on: no-response
+    escalates send_message (day 0) -> send_message (day 1) -> call_now
+    (day 3) -> send_message, last attempt (day 5); an interested lead
+    escalates send_message -> call_now -> schedule_meeting instead (see
+    follow_up_sequence_for_state()'s own table). day_offset is measured
+    from lead.created_at — this codebase has no separate "sequence
+    started" column (see Lead's own docstring), and created_at is already
+    the same anchor compute_close_date_prediction() uses for its own
+    day-based math, so a caller just checks
+    (now - lead.created_at).days against each step's day_offset. Computes
+    fresh every call — store NOTHING, per the prompt's own instruction.
+    [] for a converted/lost lead (nothing left to follow up on)."""
+    if lead.status in ("converted", "lost"):
+        return []
+    return follow_up_sequence_for_state(lead_response_state)
+
+
 def compute_lead_score(
     lead: Lead,
     *,
@@ -666,6 +739,7 @@ def compute_lead_score(
     top_combination: str | None,
     deal_risk_level: str,
     hunter_mode: bool,
+    adaptive_weights: dict[str, float],
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -692,7 +766,18 @@ def compute_lead_score(
     needs win_probability, so the old "compute it here and return it as a
     third tuple element" shape became circular once expected_value also
     became an input here. score_leads() now computes all three once, up
-    front, and passes them to both this function and compute_deal_risk()."""
+    front, and passes them to both this function and compute_deal_risk().
+
+    Adaptive Scoring Weights (Task 1, Adaptive Intelligence round) —
+    adaptive_weights (compute_adaptive_weights(), computed once per
+    score_leads() batch like every other org-wide signal above) rescales a
+    handful of specific, already-existing bonuses below — the ones whose
+    own signal (industry, company_size, action_type, fast-response,
+    deal_risk_level) is exactly what that function measures — by whatever
+    real, learned multiplier applies (0.8-1.5, 1.0 wherever there's no key
+    for that value yet). Every other bonus/penalty in this function is
+    untouched: this is a targeted reweighting of matching components, not
+    a rewrite of the scoring model."""
     if lead.status == "converted":
         impact = 100 - lead.score
         return 100, [ScoreBreakdownItem(reason="Lead converted", impact=impact)]
@@ -813,10 +898,13 @@ def compute_lead_score(
         and response_time_minutes is not None
         and response_time_minutes < _FAST_RESPONSE_MINUTES
     ):
+        # Adaptive Scoring Weights (Task 1) — rescaled by "fast_response"
+        # when compute_adaptive_weights() has real signal for it.
+        fast_response_impact = round(_FAST_RESPONSE_BONUS * adaptive_weights.get("fast_response", 1.0))
         breakdown.append(
-            ScoreBreakdownItem(reason="Fast response from lead", impact=_FAST_RESPONSE_BONUS)
+            ScoreBreakdownItem(reason="Fast response from lead", impact=fast_response_impact)
         )
-        total += _FAST_RESPONSE_BONUS
+        total += fast_response_impact
 
     # Pipeline-value pressure (sales-operating-system round) — a big deal
     # going overdue costs more than a small one; a big deal that's also
@@ -880,7 +968,10 @@ def compute_lead_score(
     if lead.enrichment_data:
         industry = lead.enrichment_data.get("industry")
         if industry in HIGH_VALUE_INDUSTRIES:
-            industry_impact = 10
+            # Adaptive Scoring Weights (Task 1) — rescaled by
+            # "industry:{industry}" when compute_adaptive_weights() has
+            # real signal for this specific industry.
+            industry_impact = round(10 * adaptive_weights.get(f"industry:{industry}", 1.0))
             breakdown.append(
                 ScoreBreakdownItem(reason=f"High-value sector: {industry}", impact=industry_impact)
             )
@@ -888,7 +979,9 @@ def compute_lead_score(
 
         company_size = lead.enrichment_data.get("company_size")
         if company_size in LARGE_COMPANY_SIZES:
-            size_impact = 10
+            # Adaptive Scoring Weights (Task 1) — rescaled by
+            # "company_size:{company_size}" when there's real signal for it.
+            size_impact = round(10 * adaptive_weights.get(f"company_size:{company_size}", 1.0))
             breakdown.append(
                 ScoreBreakdownItem(
                     reason=f"Larger company: {company_size} employees", impact=size_impact
@@ -1001,22 +1094,31 @@ def compute_lead_score(
     # be real (not None) — no comparison, no bonus, until there's enough
     # actual outcome data to learn from.
     if call_success_rate is not None and message_success_rate is not None:
+        # Adaptive Scoring Weights (Task 1) — rescaled by "action:{action_type}"
+        # below, same key compute_adaptive_weights() itself derives from
+        # this same ActionEffectivenessResponse.
         if action_type == "send_message" and message_success_rate > call_success_rate:
+            action_learning_impact = round(
+                _ACTION_LEARNING_BONUS * adaptive_weights.get(f"action:{action_type}", 1.0)
+            )
             breakdown.append(
                 ScoreBreakdownItem(
                     reason="Mensagens historicamente mais eficazes que ligações",
-                    impact=_ACTION_LEARNING_BONUS,
+                    impact=action_learning_impact,
                 )
             )
-            total += _ACTION_LEARNING_BONUS
+            total += action_learning_impact
         elif action_type == "call_now" and call_success_rate > message_success_rate:
+            action_learning_impact = round(
+                _ACTION_LEARNING_BONUS * adaptive_weights.get(f"action:{action_type}", 1.0)
+            )
             breakdown.append(
                 ScoreBreakdownItem(
                     reason="Ligações historicamente mais eficazes que mensagens",
-                    impact=_ACTION_LEARNING_BONUS,
+                    impact=action_learning_impact,
                 )
             )
-            total += _ACTION_LEARNING_BONUS
+            total += action_learning_impact
 
     # Revenue-loop round — reinforces whichever channel compute_revenue_
     # attribution() shows has actually generated the most real, confirmed
@@ -1059,16 +1161,22 @@ def compute_lead_score(
     # Ultimate-Sales-OS round — "PRESSÃO POR RISCO" (Task 1): deal_risk_level
     # is computed once by score_leads() (compute_deal_risk(), earlier in its
     # per-lead loop) and passed straight through here.
+    # Adaptive Scoring Weights (Task 1) — both tiers rescaled by the same
+    # "high_risk" key (compute_adaptive_weights() doesn't distinguish
+    # critical from high — both are "a risky deal that still closed" for
+    # that signal's own purposes).
     if deal_risk_level == "critical":
+        risk_pressure_impact = round(_RISK_PRESSURE_CRITICAL_BONUS * adaptive_weights.get("high_risk", 1.0))
         breakdown.append(
-            ScoreBreakdownItem(reason="Risco crítico de perda do negócio", impact=_RISK_PRESSURE_CRITICAL_BONUS)
+            ScoreBreakdownItem(reason="Risco crítico de perda do negócio", impact=risk_pressure_impact)
         )
-        total += _RISK_PRESSURE_CRITICAL_BONUS
+        total += risk_pressure_impact
     elif deal_risk_level == "high":
+        risk_pressure_impact = round(_RISK_PRESSURE_HIGH_BONUS * adaptive_weights.get("high_risk", 1.0))
         breakdown.append(
-            ScoreBreakdownItem(reason="Risco elevado de perda do negócio", impact=_RISK_PRESSURE_HIGH_BONUS)
+            ScoreBreakdownItem(reason="Risco elevado de perda do negócio", impact=risk_pressure_impact)
         )
-        total += _RISK_PRESSURE_HIGH_BONUS
+        total += risk_pressure_impact
 
     # Revenue Acceleration Mode (Task 3) — when the org is meaningfully
     # behind its daily revenue target (compute_acceleration_mode()), every
@@ -1159,6 +1267,43 @@ def compute_lead_score(
 # marker instead — the same "structured info via string matching" technique
 # generate_lead_message_by_action() already uses for next_best_action.
 LOSS_REASON_MARKER = "Motivo: "
+
+# Performance Feedback Loop (Task 9, Adaptive Intelligence round) — same
+# "structured info via string matching" technique as LOSS_REASON_MARKER
+# just above, this time for which action channel led to a lead_won/
+# lead_lost outcome. Not actually needed by this round's own
+# compute_adaptive_weights() (which infers action-effectiveness straight
+# from action_call/action_message/action_meeting timestamps, the same
+# technique compute_action_effectiveness() already uses — no marker
+# required), but written anyway so a human reading the timeline, or a
+# future single-row consumer, doesn't have to reconstruct it by joining
+# against separate action_* entries.
+ACTION_ATTRIBUTION_MARKER = "Ação: "
+_ACTION_EVENT_LABEL_PT = {
+    "action_call": "ligação",
+    "action_message": "mensagem",
+    "action_meeting": "reunião",
+}
+
+
+async def get_last_action_label(db: AsyncSession, lead_id) -> str | None:
+    """Performance Feedback Loop (Task 9) — the most recent action_call/
+    action_message/action_meeting LeadActivityLog entry for this lead, in
+    plain Portuguese, for PATCH /leads/{id}/status to attribute a
+    conversion/loss to whichever channel was used last. Same "no FK, infer
+    by timestamp" approximation compute_action_effectiveness() already
+    discloses. None when this lead never had any action_* entry logged."""
+    stmt = (
+        select(LeadActivityLog.event_type)
+        .where(
+            LeadActivityLog.lead_id == lead_id,
+            LeadActivityLog.event_type.in_(list(_ACTION_EVENT_LABEL_PT)),
+        )
+        .order_by(LeadActivityLog.created_at.desc())
+        .limit(1)
+    )
+    event_type = (await db.execute(stmt)).scalar_one_or_none()
+    return _ACTION_EVENT_LABEL_PT.get(event_type) if event_type else None
 
 
 async def compute_conversion_insights(
@@ -1418,6 +1563,150 @@ async def compute_action_effectiveness(
         message_success_rate=success_rate("action_message"),
         meeting_success_rate=success_rate("action_meeting"),
     )
+
+
+def _clamp_adaptive_weight(rate: float, baseline: float) -> float:
+    """compute_adaptive_weights()'s own multiplier formula: how much better
+    (or worse) this signal value's own conversion rate is than the
+    baseline it's compared against, clamped to the prompt's own
+    [_ADAPTIVE_WEIGHT_MIN, _ADAPTIVE_WEIGHT_MAX] range. 1.0 (unweighted)
+    whenever the baseline itself is 0 — nothing to meaningfully compare
+    against yet."""
+    if baseline <= 0:
+        return 1.0
+    return round(max(_ADAPTIVE_WEIGHT_MIN, min(_ADAPTIVE_WEIGHT_MAX, rate / baseline)), 2)
+
+
+async def compute_adaptive_weights(
+    db: AsyncSession, organization_id: str, *, action_effectiveness: ActionEffectivenessResponse
+) -> dict[str, float]:
+    """Adaptive Scoring Weights (Task 1, Adaptive Intelligence round) —
+    mines the last _ADAPTIVE_WEIGHTS_WINDOW_DAYS (30) of real lead_won/
+    lead_lost outcomes for which signal VALUES (not just "the one best
+    industry" the way ConversionInsightsResponse's own best_industry
+    already does) actually correlate with winning, and turns each into a
+    multiplier compute_lead_score() applies to its own matching bonus —
+    see that function's own docstring for exactly which ones. No ML: every
+    weight is a plain "this value's own win rate, divided by a baseline
+    win rate" ratio, clamped to a bounded range, same deterministic-rules
+    style as every other compute_*() function in this module.
+
+    Five signal families, each needing _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE
+    real outcomes before it's trusted with its own key at all (a value with
+    too few outcomes is silently omitted, not defaulted to 1.0 — omission
+    IS the "no opinion yet" signal compute_lead_score()'s own dict.get(...,
+    1.0) fallback already reads correctly):
+      industry:{value} / company_size:{value} — this value's own win rate
+        vs. the overall win rate across every outcome in the window.
+      action:{action_type} — reuses the caller's own already-computed
+        ActionEffectivenessResponse (score_leads() computes one per batch
+        regardless) against the mean of whichever rates are real, no
+        second query.
+      fast_response — win rate among outcomes whose own response arrived
+        under _FAST_RESPONSE_MINUTES, vs. the overall win rate.
+      high_risk — win rate among outcomes whose own time-to-close exceeded
+        _ADAPTIVE_HIGH_RISK_DAYS_TO_OUTCOME days (see that constant's own
+        comment for why this, not deal_risk_level itself, is the proxy),
+        vs. the overall win rate.
+
+    Returns {} (compute_lead_score() then rescales nothing — every
+    .get(..., 1.0) falls back to unweighted) whenever the org has no
+    lead_won/lead_lost outcomes at all in the window yet. Three queries of
+    its own regardless of org size: one outcome scan, one Lead row-fetch
+    for enrichment_data, one response-timing scan scoped to just those
+    leads."""
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=_ADAPTIVE_WEIGHTS_WINDOW_DAYS)
+
+    outcomes_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.duration_seconds
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type.in_(("lead_won", "lead_lost")),
+        LeadActivityLog.created_at >= window_start,
+    )
+    outcome_rows = (await db.execute(outcomes_stmt)).all()
+    if not outcome_rows:
+        return {}
+
+    won_ids: set = set()
+    lost_ids: set = set()
+    days_to_outcome_by_lead: dict = {}
+    for row in outcome_rows:
+        bucket = won_ids if row.event_type == "lead_won" else lost_ids
+        bucket.add(row.lead_id)
+        if row.duration_seconds is not None:
+            days_to_outcome_by_lead[row.lead_id] = row.duration_seconds / 86400
+
+    outcome_lead_ids = won_ids | lost_ids
+    baseline_rate = len(won_ids) / len(outcome_lead_ids)
+
+    leads_stmt = select(Lead).where(Lead.id.in_(outcome_lead_ids))
+    outcome_leads = (await db.execute(leads_stmt)).scalars().all()
+
+    response_stmt = select(LeadActivityLog.lead_id, LeadActivityLog.duration_seconds).where(
+        LeadActivityLog.lead_id.in_(outcome_lead_ids),
+        LeadActivityLog.event_type.in_(list(RESPONSE_STATE_BY_EVENT_TYPE)),
+        LeadActivityLog.duration_seconds.isnot(None),
+    )
+    response_rows = (await db.execute(response_stmt)).all()
+    fast_response_lead_ids = {
+        row.lead_id for row in response_rows if row.duration_seconds / 60 < _FAST_RESPONSE_MINUTES
+    }
+
+    won_by_value: dict[str, dict[str, int]] = {"industry": {}, "company_size": {}}
+    total_by_value: dict[str, dict[str, int]] = {"industry": {}, "company_size": {}}
+    high_risk_won = 0
+    high_risk_total = 0
+    for lead in outcome_leads:
+        is_won = lead.id in won_ids
+        if lead.enrichment_data:
+            for dimension in ("industry", "company_size"):
+                value = lead.enrichment_data.get(dimension)
+                if not value:
+                    continue
+                total_by_value[dimension][value] = total_by_value[dimension].get(value, 0) + 1
+                if is_won:
+                    won_by_value[dimension][value] = won_by_value[dimension].get(value, 0) + 1
+
+        days_to_outcome = days_to_outcome_by_lead.get(lead.id)
+        if days_to_outcome is not None and days_to_outcome > _ADAPTIVE_HIGH_RISK_DAYS_TO_OUTCOME:
+            high_risk_total += 1
+            if is_won:
+                high_risk_won += 1
+
+    weights: dict[str, float] = {}
+
+    for dimension in ("industry", "company_size"):
+        for value, total in total_by_value[dimension].items():
+            if total < _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE:
+                continue
+            won = won_by_value[dimension].get(value, 0)
+            weights[f"{dimension}:{value}"] = _clamp_adaptive_weight(won / total, baseline_rate)
+
+    if high_risk_total >= _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE:
+        weights["high_risk"] = _clamp_adaptive_weight(high_risk_won / high_risk_total, baseline_rate)
+
+    fast_response_in_scope = fast_response_lead_ids & outcome_lead_ids
+    if len(fast_response_in_scope) >= _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE:
+        fast_response_won = len(fast_response_in_scope & won_ids)
+        weights["fast_response"] = _clamp_adaptive_weight(
+            fast_response_won / len(fast_response_in_scope), baseline_rate
+        )
+
+    action_rates = {
+        "call_now": action_effectiveness.call_success_rate,
+        "send_message": action_effectiveness.message_success_rate,
+        "schedule_meeting": action_effectiveness.meeting_success_rate,
+    }
+    real_action_rates = [rate for rate in action_rates.values() if rate is not None]
+    if real_action_rates:
+        action_baseline = sum(real_action_rates) / len(real_action_rates)
+        for action_type, rate in action_rates.items():
+            if rate is not None:
+                weights[f"action:{action_type}"] = _clamp_adaptive_weight(rate, action_baseline)
+
+    return weights
 
 
 # Revenue-loop round — the same three action_* event types
@@ -1963,6 +2252,9 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     top_combination = revenue_attribution.top_combination
     acceleration_mode = await compute_acceleration_mode(db, organization_id)
     hunter_mode = await compute_hunter_mode(db, organization_id)
+    adaptive_weights = await compute_adaptive_weights(
+        db, organization_id, action_effectiveness=action_effectiveness
+    )
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -2185,6 +2477,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             top_combination=top_combination,
             deal_risk_level=deal_risk_level,
             hunter_mode=hunter_mode,
+            adaptive_weights=adaptive_weights,
             now=now,
         )
 
@@ -2371,3 +2664,46 @@ def compute_forecast_value(response: LeadResponse) -> float:
     if response.days_since_last_activity > _FORECAST_IDLE_DECAY_DAYS:
         return response.expected_value * _FORECAST_IDLE_DECAY
     return response.expected_value * 1.0
+
+
+# Revenue Simulation Engine's own optimistic boost (Task 5, Adaptive
+# Intelligence round) — the prompt's own +10-20% win_probability range: the
+# larger boost for a lead with a real pending action still outstanding
+# (ready_to_send_message populated, or a message sent with no reply yet —
+# "executing all pending actions" most directly helps exactly these), the
+# smaller one for every other still-open lead (the "reduced response
+# delay" half of the prompt's own assumption still applies generally).
+_SIMULATION_PENDING_ACTION_BOOST = 20
+_SIMULATION_BASELINE_BOOST = 10
+
+
+def simulate_revenue_if_all_actions_executed(leads: list[LeadResponse]) -> dict:
+    """Revenue Simulation Engine (Task 5, Adaptive Intelligence round) — a
+    deterministic "best case" projection, not a forecast: current_expected
+    sums every still-open lead's own already-computed expected_value
+    (score_leads()'s own win_probability-weighted figure); optimized_expected
+    re-weights each one's win_probability upward by _SIMULATION_PENDING_
+    ACTION_BOOST/_SIMULATION_BASELINE_BOOST (see those constants' own
+    comment), capped at 100, and re-derives expected_value from that boosted
+    probability against the lead's own unweighted estimated_value. No ML,
+    no randomness — same fixed-multiplier "what if" style as
+    compute_forecast_value() just above, just optimistic instead of
+    pessimistic. Pure, no DB access — operates on an already-scored
+    `leads` list exactly like that function does."""
+    current_expected = 0
+    optimized_expected = 0
+    for response in leads:
+        if response.status in ("converted", "lost"):
+            continue
+        current_expected += response.expected_value
+
+        has_pending_action = response.has_pending_response or response.ready_to_send_message is not None
+        boost = _SIMULATION_PENDING_ACTION_BOOST if has_pending_action else _SIMULATION_BASELINE_BOOST
+        optimized_win_probability = min(100, response.win_probability + boost)
+        optimized_expected += round(response.estimated_value * optimized_win_probability / 100)
+
+    return {
+        "current_expected": current_expected,
+        "optimized_expected": optimized_expected,
+        "delta": optimized_expected - current_expected,
+    }

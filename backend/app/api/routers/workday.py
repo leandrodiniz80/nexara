@@ -41,6 +41,7 @@ from app.services.leads.scoring import (
 from app.services.leads.workday_engine import (
     build_action_queue,
     complete_lead_task,
+    compute_lost_opportunity_today,
     detect_user_failure_state,
     format_brl,
     generate_accountability_message,
@@ -539,20 +540,6 @@ def _compute_response_and_pipeline_pressure(
     return pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value
 
 
-def _compute_lost_opportunity_today(ranked: list[LeadResponse]) -> int:
-    """"Oportunidade perdida hoje" (Task 6, revenue-maximization round) —
-    sum of opportunity_cost (Task 1, scoring.py) across leads not touched
-    today (days_since_last_activity >= 1): leads sitting idle right now,
-    weighted by how much revenue upside each one represents versus the
-    org's single highest-value lead. Reuses whatever rank_leads_by_priority()
-    already scored, zero extra query."""
-    return sum(
-        response.opportunity_cost
-        for response in ranked
-        if response.days_since_last_activity >= 1 and response.status not in ("converted", "lost")
-    )
-
-
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -707,7 +694,7 @@ async def get_workday_summary(
     # Revenue-maximization round (Task 6) — "Oportunidade perdida hoje"
     # and "Top padrão de receita", both additive/derived at zero extra
     # query cost from data already computed above.
-    lost_opportunity_today = _compute_lost_opportunity_today(ranked)
+    lost_opportunity_today = compute_lost_opportunity_today(ranked)
     top_revenue_combination = revenue_attribution.top_combination
 
     return ApiResponse(

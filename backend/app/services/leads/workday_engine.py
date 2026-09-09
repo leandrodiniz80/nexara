@@ -656,3 +656,21 @@ async def maybe_notify_focus_shift(
         )
     )
     return True
+
+
+def compute_lost_opportunity_today(ranked: list[LeadResponse]) -> int:
+    """"Oportunidade perdida hoje" (Task 6, revenue-maximization round) —
+    sum of opportunity_cost (Task 1, scoring.py) across leads not touched
+    today (days_since_last_activity >= 1): leads sitting idle right now,
+    weighted by how much revenue upside each one represents versus the
+    org's single highest-value lead. Reuses whatever rank_leads_by_priority()
+    already scored, zero extra query. Moved here from workday.py's own
+    router module (Adaptive Intelligence round) — public now (no longer
+    router-private) so the new GET /intelligence/exec-insight endpoint
+    (routers/intelligence.py) can reuse this exact sum too, without a
+    router importing from another router."""
+    return sum(
+        response.opportunity_cost
+        for response in ranked
+        if response.days_since_last_activity >= 1 and response.status not in ("converted", "lost")
+    )

@@ -41,9 +41,11 @@ from app.services.leads.automation_engine import fire_stale_lead_automations, ru
 from app.services.leads.enrichment import generate_first_contact_message, simulate_enrichment
 from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
 from app.services.leads.scoring import (
+    ACTION_ATTRIBUTION_MARKER,
     LOSS_REASON_MARKER,
     RESPONSE_EVENT_TYPE_BY_STATE,
     compute_conversion_insights,
+    get_last_action_label,
     score_leads,
 )
 
@@ -834,13 +836,29 @@ async def update_lead_status(
     if from_status != lead.status and lead.status in ("converted", "lost"):
         time_to_close_seconds = int((datetime.now(timezone.utc) - lead.created_at).total_seconds())
         if lead.status == "converted":
+            # Performance Feedback Loop (Task 9, Adaptive Intelligence
+            # round) — which action channel led to this win, appended
+            # behind ACTION_ATTRIBUTION_MARKER the same way the lost
+            # branch below encodes its own reason behind LOSS_REASON_
+            # MARKER. Only added to the WON message: compute_conversion_
+            # insights()'s own top_loss_reason parsing
+            # (message.split(LOSS_REASON_MARKER, 1)[1]) takes everything
+            # after that marker as the reason, so appending anything after
+            # it on the lost branch would corrupt that aggregation —
+            # the won branch has no such fragile trailing-text parser
+            # depending on it, so it's safe there.
+            action_label = await get_last_action_label(db, lead.id)
+            action_suffix = f" {ACTION_ATTRIBUTION_MARKER}{action_label}." if action_label else ""
             db.add(
                 LeadActivityLog(
                     organization_id=organization_id,
                     lead_id=lead.id,
                     lead_name=lead.name,
                     event_type="lead_won",
-                    message=f"Lead convertido em {max(time_to_close_seconds // 86400, 0)} dias.",
+                    message=(
+                        f"Lead convertido em {max(time_to_close_seconds // 86400, 0)} "
+                        f"dias.{action_suffix}"
+                    ),
                     user_email=session.get("email"),
                     duration_seconds=time_to_close_seconds,
                 )

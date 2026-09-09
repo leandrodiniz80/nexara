@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
+from app.schemas.leads.lead import LeadResponse
 from app.schemas.performance import UserPerformanceResponse
+from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD
 from app.services.leads.execution_engine import ACTION_EFFECTIVENESS_EVENT_TYPE_BY_ACTION
 from app.services.leads.scoring import RESPONSE_STATE_BY_EVENT_TYPE, score_leads
 
@@ -64,8 +66,28 @@ def _consecutive_days_streak(dates: set[date], today: date) -> int:
     return streak
 
 
+async def score_org_leads(db: AsyncSession, organization_id: str) -> list[LeadResponse]:
+    """Shared by compute_user_performance() and reassign_leads_if_needed()'s
+    own caller (Adaptive Intelligence round, Task 4) — the org's full lead
+    pool (every status, capped at _TEAM_PERFORMANCE_POOL_SIZE), scored
+    once. Factored out of compute_user_performance()'s own original body
+    unchanged (same query, same cap) so a caller that needs this same
+    already-scored batch for something else (reassignment) doesn't force a
+    second, redundant score_leads() pass in the same request — see
+    compute_user_performance()'s own `leads` parameter."""
+    leads_stmt = (
+        select(Lead)
+        .where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
+        .limit(_TEAM_PERFORMANCE_POOL_SIZE)
+    )
+    leads = (await db.execute(leads_stmt)).scalars().all()
+    if not leads:
+        return []
+    return await score_leads(db, leads)
+
+
 async def compute_user_performance(
-    db: AsyncSession, organization_id: str
+    db: AsyncSession, organization_id: str, *, leads: list[LeadResponse] | None = None
 ) -> list[UserPerformanceResponse]:
     """Multi-user revenue-war round (Task 1) — one UserPerformanceResponse
     per distinct Lead.owner_email in this org (anyone with zero leads
@@ -76,22 +98,23 @@ async def compute_user_performance(
     (response-rate/response-time, actions-executed-today, streak, won-at
     dates for revenue_today/revenue_this_week — Elite round, Task 5)
     grouped by user_email in Python — six queries total regardless of team
-    size, none per-user."""
+    size, none per-user.
+
+    `leads` (Adaptive Intelligence round, Task 4) lets a caller that
+    already has this same org's own already-scored lead pool (GET
+    /performance/leaderboard, which also needs it for
+    reassign_leads_if_needed()) pass it straight in instead of this
+    function fetching + scoring it a second time. None (every existing
+    caller's own default, unchanged behavior) means "fetch and score it
+    here, exactly like before this parameter existed."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
     streak_window_start = now - timedelta(days=_STREAK_LOOKBACK_DAYS)
 
-    leads_stmt = (
-        select(Lead)
-        .where(Lead.organization_id == organization_id, Lead.deleted_at.is_(None))
-        .limit(_TEAM_PERFORMANCE_POOL_SIZE)
-    )
-    leads = (await db.execute(leads_stmt)).scalars().all()
-    if not leads:
+    scored = leads if leads is not None else await score_org_leads(db, organization_id)
+    if not scored:
         return []
-
-    scored = await score_leads(db, leads)
     leads_by_owner: dict[str, list] = {}
     for response in scored:
         if response.owner_email is None:
@@ -327,3 +350,92 @@ async def maybe_notify_underperformance(
         )
         notified += 1
     return notified
+
+
+# Lead Reassignment Engine's own event type (Task 4, Adaptive Intelligence
+# round) — a new, additive LeadActivityLog vocabulary entry (event_type is
+# a plain String(32) column, no migration needed), same "log it, don't
+# invent a table" pattern every other engine in this codebase already
+# follows.
+LEAD_REASSIGNED_EVENT_TYPE = "lead_reassigned"
+
+
+async def reassign_leads_if_needed(
+    db: AsyncSession,
+    *,
+    organization_id: str,
+    leads: list[LeadResponse],
+    user_performance: list[UserPerformanceResponse],
+) -> int:
+    """Lead Reassignment Engine (Task 4, Adaptive Intelligence round) —
+    moves an underperforming owner's own high-value (expected_value >=
+    HIGH_VALUE_LEAD_THRESHOLD), still-open leads to the org's current top
+    performer (rank_user_performance()'s own #1). "Underperforming" means
+    response_rate below the team average OR zero revenue_this_week (Elite
+    round's own 7-day figure — reused rather than a fresh query, matching
+    the prompt's own "revenue_converted == 0 in 7 days" ask) — either is a
+    real enough signal on its own, so this is an OR, not an AND. A no-op
+    with fewer than two team members (no meaningful "team average"/"top
+    performer" to reassign toward) or when the underperformer IS the top
+    performer (nothing to move away from themselves).
+
+    `leads` is expected to be the exact same already-scored batch
+    `user_performance` was itself computed from (compute_user_performance()'s
+    own `leads` parameter exists for this) — reassignment reads each
+    candidate's owner_email/status/expected_value straight off it, no
+    second score_leads() pass. Idempotent: a lead already reassigned to the
+    top performer on a previous call simply won't match `owner_email in
+    underperformer_emails` again (the top performer is never counted as an
+    underperformer against themselves), so re-running this doesn't
+    reassign it again or log a duplicate entry. Caller commits; returns
+    how many leads were actually reassigned this call."""
+    if len(user_performance) < 2:
+        return 0
+
+    ranked = rank_user_performance(user_performance)
+    top_performer = ranked[0]
+    avg_response_rate = sum(performance.response_rate for performance in user_performance) / len(
+        user_performance
+    )
+
+    underperformer_emails = {
+        performance.user_id
+        for performance in user_performance
+        if performance.user_id != top_performer.user_id
+        and (performance.response_rate < avg_response_rate or performance.revenue_this_week == 0)
+    }
+    if not underperformer_emails:
+        return 0
+
+    candidate_lead_ids = [
+        response.id
+        for response in leads
+        if response.owner_email in underperformer_emails
+        and response.status not in ("converted", "lost")
+        and response.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+    ]
+    if not candidate_lead_ids:
+        return 0
+
+    lead_rows_stmt = select(Lead).where(Lead.id.in_(candidate_lead_ids))
+    lead_rows = (await db.execute(lead_rows_stmt)).scalars().all()
+
+    reassigned = 0
+    for lead_row in lead_rows:
+        previous_owner = lead_row.owner_email
+        lead_row.owner_email = top_performer.user_id
+        db.add(
+            LeadActivityLog(
+                organization_id=organization_id,
+                lead_id=lead_row.id,
+                lead_name=lead_row.name,
+                event_type=LEAD_REASSIGNED_EVENT_TYPE,
+                message=(
+                    f"Lead redistribuído automaticamente de {previous_owner or 'sem dono'} "
+                    f"para {top_performer.user_id} (baixo desempenho)."
+                ),
+                user_email=top_performer.user_id,
+            )
+        )
+        reassigned += 1
+    return reassigned

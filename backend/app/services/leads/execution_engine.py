@@ -11,6 +11,7 @@ from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.services.leads.enrichment import format_brl
+from app.services.leads.scoring import follow_up_sequence_for_state
 
 # The execution-assistance round's own UserNotification message prefix —
 # kept (not removed) purely so historical rows already written under it
@@ -178,6 +179,27 @@ AUTO_ACTION_EVENT_TYPE_BY_ACTION = {
 }
 
 
+def _due_cadence_meeting(response: LeadResponse, now: datetime) -> bool:
+    """Autonomous Cadence Execution (Task 3, Adaptive Intelligence round)
+    — true when generate_follow_up_sequence()'s own cadence table
+    (follow_up_sequence_for_state(), scoring.py) has a schedule_meeting
+    step due *exactly* today, using response.created_at as the same
+    day-0 anchor that function's own docstring establishes (no separate
+    "sequence started" column exists). "Exactly," not "on or after": a
+    dashboard visit on any other day simply misses that one step — same
+    "close enough to act on" bar every other cheap approximation in this
+    codebase already accepts, rather than firing the same step again on
+    every later visit. Never returns true for call_now — the cadence
+    table's own call_now step is structurally excluded here (this function
+    only ever checks for "schedule_meeting"), so this can't be used to
+    accidentally auto-call regardless of how it's wired up."""
+    days_elapsed = (now - response.created_at).days
+    return any(
+        step["day_offset"] == days_elapsed and step["action"] == "schedule_meeting"
+        for step in follow_up_sequence_for_state(response.lead_response_state)
+    )
+
+
 async def auto_execute_engine(
     db: AsyncSession, organization_id: str, leads: list[LeadResponse]
 ) -> int:
@@ -218,8 +240,18 @@ async def auto_execute_engine(
          all) — a deal this close to closing gets its meeting booked
          regardless of how overdue it's become, while the org is behind
          target.
+      3. Autonomous Cadence Execution (Task 3, Adaptive Intelligence
+         round) — schedule_meeting again, independent of win_probability
+         entirely this time: whenever generate_follow_up_sequence()'s own
+         cadence (scoring.py) has a meeting step due *exactly* today (see
+         _due_cadence_meeting()'s own docstring), regardless of how likely
+         the lead looks. Still excludes "critical" risk, same rationale as
+         rule 2.
 
-    call_now is never auto-executed — no rule above ever produces it.
+    call_now is never auto-executed — no rule above ever produces it (rule
+    3 in particular never even evaluates the cadence's own call_now step —
+    see _due_cadence_meeting()'s own docstring for why that's structural,
+    not just a filter this function applies on top).
 
     Gated behind settings.AUTO_MODE_ENABLED, same as the function this
     upgrades (off by default — a no-op, zero extra queries, until an org
@@ -282,6 +314,14 @@ async def auto_execute_engine(
             and is_within_overdue_grace
             and response.win_probability >= _AUTO_EXECUTE_MEETING_WIN_PROBABILITY
         ):
+            candidates.append((response, "schedule_meeting"))
+        # Autonomous Cadence Execution (Task 3, Adaptive Intelligence
+        # round) — a second, independent trigger for schedule_meeting:
+        # generate_follow_up_sequence()'s own cadence (scoring.py) says a
+        # meeting is due *exactly* today, regardless of win_probability.
+        # Never call_now — see _due_cadence_meeting()'s own docstring for
+        # why that's a structural guarantee here, not just a filter.
+        elif response.deal_risk_level != "critical" and _due_cadence_meeting(response, now):
             candidates.append((response, "schedule_meeting"))
 
     if not candidates:
