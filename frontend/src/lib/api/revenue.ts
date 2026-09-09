@@ -7,6 +7,9 @@ export interface RevenueSummary {
   lostRevenue: number;
   atRiskRevenue: number;
   conversionRate: number;
+  /** Probability-weighted forecast of the open (new + contacted) pipeline
+   * — unlike potentialRevenue (raw, unadjusted for likelihood to close). */
+  expectedPipelineRevenue: number;
 }
 
 interface RevenueSummaryDto {
@@ -15,6 +18,7 @@ interface RevenueSummaryDto {
   lost_revenue: number;
   at_risk_revenue: number;
   conversion_rate: number;
+  expected_pipeline_revenue: number;
 }
 
 /** GET /api/v1/revenue/summary — org-wide revenue snapshot: pipeline
@@ -34,6 +38,7 @@ export async function getRevenueSummary(): Promise<RevenueSummary> {
       lostRevenue: data.data.lost_revenue,
       atRiskRevenue: data.data.at_risk_revenue,
       conversionRate: data.data.conversion_rate,
+      expectedPipelineRevenue: data.data.expected_pipeline_revenue,
     };
   } catch (error) {
     throw toApiClientError(error);

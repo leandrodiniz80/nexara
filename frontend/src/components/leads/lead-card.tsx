@@ -24,6 +24,20 @@ function getScoreVariant(score: number): "destructive" | "warning" | "success" {
   return "destructive";
 }
 
+/** win_probability color bands (revenue-intelligence round) — >=70 green,
+ * 40-69 yellow, <40 red. Deliberately its own thresholds, not reused from
+ * getScoreVariant's 71/31 split: score and win_probability are different
+ * numbers with different meanings, even though the bands look similar. */
+function getWinProbabilityVariant(probability: number): "destructive" | "warning" | "success" {
+  if (probability >= 70) return "success";
+  if (probability >= 40) return "warning";
+  return "destructive";
+}
+
+function formatBRL(value: number): string {
+  return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
+}
+
 /** Native browser tooltip (no tooltip component in this UI kit yet, and one
  * factor list on hover doesn't warrant building one) — one line per factor,
  * signed impact so positive/negative reads at a glance. */
@@ -134,6 +148,14 @@ export function LeadCard({
         <Badge variant={getScoreVariant(lead.score)} title={scoreTitle(lead.scoreBreakdown)}>
           Score {lead.score}
         </Badge>
+        {lead.expectedValue > 0 && (
+          <Badge variant="outline">💰 R$ {formatBRL(lead.expectedValue)}</Badge>
+        )}
+        {(lead.status === "new" || lead.status === "contacted") && (
+          <Badge variant={getWinProbabilityVariant(lead.winProbability)}>
+            🎯 {lead.winProbability}%
+          </Badge>
+        )}
         {lead.nextAction && (
           <Badge variant={nextActionVariant(lead)}>
             {lead.isOverdue && lead.daysOverdue

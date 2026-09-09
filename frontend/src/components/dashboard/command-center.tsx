@@ -56,7 +56,13 @@ export function CommandCenter({
           </p>
         )}
 
-        <div className="grid grid-cols-3 gap-3 text-center">
+        {summary.todayPotentialRevenue > 0 && (
+          <p className="text-sm font-semibold text-success">
+            Hoje você pode gerar R$ {formatBRL(summary.todayPotentialRevenue)}
+          </p>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
           <div>
             <p className="text-lg font-semibold text-foreground">{summary.todayTasks}</p>
             <p className="text-xs text-muted-foreground">Tarefas hoje</p>
@@ -70,6 +76,12 @@ export function CommandCenter({
               R$ {formatBRL(summary.estimatedRevenueAtRisk)}
             </p>
             <p className="text-xs text-muted-foreground">Em risco</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-foreground">
+              R$ {formatBRL(summary.revenueAtRisk)}
+            </p>
+            <p className="text-xs text-muted-foreground">Em risco (ponderado)</p>
           </div>
         </div>
 

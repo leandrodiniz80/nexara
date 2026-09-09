@@ -49,6 +49,13 @@ export interface WorkdaySummary {
   /** Ready-to-render sentence — built by the backend, same rule the
    * timeline/activity feed already follow. Never assembled here. */
   focusMessage: string;
+  /** Probability-weighted "money genuinely at risk" — contacted leads
+   * that are overdue or stale, summed by expectedValue. Narrower than
+   * estimatedRevenueAtRisk above (contacted+stale only, raw value). */
+  revenueAtRisk: number;
+  /** "Hoje você pode gerar R$ X" — expectedValue summed over today's
+   * actionable leads (overdue or due today). */
+  todayPotentialRevenue: number;
 }
 
 interface WorkdaySummaryDto {
@@ -58,6 +65,8 @@ interface WorkdaySummaryDto {
   leads_at_risk: number;
   estimated_revenue_at_risk: number;
   focus_message: string;
+  revenue_at_risk: number;
+  today_potential_revenue: number;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -76,6 +85,8 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       leadsAtRisk: data.data.leads_at_risk,
       estimatedRevenueAtRisk: data.data.estimated_revenue_at_risk,
       focusMessage: data.data.focus_message,
+      revenueAtRisk: data.data.revenue_at_risk,
+      todayPotentialRevenue: data.data.today_potential_revenue,
     };
   } catch (error) {
     throw toApiClientError(error);
@@ -133,6 +144,8 @@ export interface WorkdayPerformance {
   /** Ready-to-render sentence — built by the backend, same rule
    * focusMessage/the timeline/activity feed already follow. */
   accountabilityMessage: string;
+  /** Same probability-weighted figure as WorkdaySummary.revenueAtRisk. */
+  revenueAtRisk: number;
 }
 
 interface WorkdayPerformanceDto {
@@ -145,6 +158,7 @@ interface WorkdayPerformanceDto {
   streak_days: number;
   failure_state: FailureState;
   accountability_message: string;
+  revenue_at_risk: number;
 }
 
 /** GET /api/v1/workday/performance — the accountability layer: how much of
@@ -172,6 +186,41 @@ export async function getWorkdayPerformance(): Promise<WorkdayPerformance> {
       streakDays: data.data.streak_days,
       failureState: data.data.failure_state,
       accountabilityMessage: data.data.accountability_message,
+      revenueAtRisk: data.data.revenue_at_risk,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface WorkdayTarget {
+  dailyTarget: number;
+  completedToday: number;
+  remaining: number;
+  progress: number;
+}
+
+interface WorkdayTargetDto {
+  daily_target: number;
+  completed_today: number;
+  remaining: number;
+  progress: number;
+}
+
+/** GET /api/v1/workday/target — the daily gamification target: a fixed
+ * default (no per-user/org customization yet) matched against today's
+ * completed-task count. */
+export async function getWorkdayTarget(): Promise<WorkdayTarget> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<WorkdayTargetDto>>("/workday/target");
+    if (!data.data) {
+      throw new Error("Workday target request succeeded but returned no data");
+    }
+    return {
+      dailyTarget: data.data.daily_target,
+      completedToday: data.data.completed_today,
+      remaining: data.data.remaining,
+      progress: data.data.progress,
     };
   } catch (error) {
     throw toApiClientError(error);

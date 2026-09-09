@@ -27,12 +27,18 @@ export function RevenuePanel({
         <CardTitle className="text-foreground">Revenue Intelligence</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-5">
           <div>
             <p className="text-lg font-semibold text-foreground">
               R$ {formatBRL(summary.potentialRevenue)}
             </p>
             <p className="text-xs text-muted-foreground">Potencial</p>
+          </div>
+          <div>
+            <p className="text-lg font-semibold text-primary">
+              R$ {formatBRL(summary.expectedPipelineRevenue)}
+            </p>
+            <p className="text-xs text-muted-foreground">Esperado (ponderado)</p>
           </div>
           <div>
             <p className="text-lg font-semibold text-success">

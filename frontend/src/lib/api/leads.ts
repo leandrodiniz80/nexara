@@ -49,6 +49,15 @@ export interface Lead {
   /** Only set when nextBestAction is set AND the backend's AI feature flag
    * is on — same template POST /leads/{id}/generate-message uses. */
   suggestedMessage: string | null;
+  /** 0-100 estimated likelihood this lead converts — backend-computed
+   * (compute_win_probability, scoring.py), no ML/LLM. */
+  winProbability: number;
+  /** Simulated deal size (R$), from enrichment_data's company_size — 0
+   * until enriched. Always a whole number. */
+  estimatedValue: number;
+  /** estimatedValue * winProbability / 100 — the probability-weighted
+   * forecast this lead is actually worth right now. */
+  expectedValue: number;
   /** Workday mode's execution lock — true while this lead is someone's
    * (not necessarily the current user's) active focus session. */
   inFocus: boolean;
@@ -87,6 +96,9 @@ export interface LeadDto {
   days_overdue: number | null;
   next_best_action: string | null;
   suggested_message: string | null;
+  win_probability: number;
+  estimated_value: number;
+  expected_value: number;
   in_focus: boolean;
   company_name: string | null;
   website: string | null;
@@ -112,6 +124,9 @@ export function toLead(dto: LeadDto): Lead {
     daysOverdue: dto.days_overdue,
     nextBestAction: dto.next_best_action,
     suggestedMessage: dto.suggested_message,
+    winProbability: dto.win_probability,
+    estimatedValue: dto.estimated_value,
+    expectedValue: dto.expected_value,
     inFocus: dto.in_focus,
     companyName: dto.company_name,
     website: dto.website,
