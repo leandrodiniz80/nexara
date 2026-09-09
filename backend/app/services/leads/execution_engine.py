@@ -30,6 +30,22 @@ class InvalidLeadAction(ValueError):
     The router catches this and 400s."""
 
 
+# Execution-engine round — a second LeadActivityLog entry per executed
+# action, on top of (not instead of) the event-specific one the if/elif
+# chain below already writes (message_sent/call_initiated/meeting_scheduled
+# — kept as-is since message_sent in particular is read elsewhere for
+# has_pending_response/response_delay_minutes, scoring.py). This one exists
+# purely so compute_action_effectiveness() (scoring.py) has one uniform
+# "an action of type X ran" marker to query across all three action types
+# at once (event_type.in_([...]))  instead of three differently-named
+# columns/values that don't share a common prefix it could match on.
+ACTION_EFFECTIVENESS_EVENT_TYPE_BY_ACTION = {
+    "call_now": "action_call",
+    "send_message": "action_message",
+    "schedule_meeting": "action_meeting",
+}
+
+
 async def execute_lead_action(
     db: AsyncSession,
     lead: Lead,
@@ -99,6 +115,16 @@ async def execute_lead_action(
     else:
         raise InvalidLeadAction(f"Unknown action: {action}")
 
+    db.add(
+        LeadActivityLog(
+            organization_id=organization_id,
+            lead_id=lead.id,
+            lead_name=lead.name,
+            event_type=ACTION_EFFECTIVENESS_EVENT_TYPE_BY_ACTION[action],
+            message=f"Action executed: {action}",
+            user_email=user_email,
+        )
+    )
     lead.updated_at = now
 
 

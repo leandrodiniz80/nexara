@@ -113,6 +113,14 @@ HIGH_VALUE_LEAD_THRESHOLD = 5000.0
 ACTION_AWAIT_RESPONSE = "Aguardar resposta do lead"
 ACTION_ATTEMPT_CLOSE_DEAL = "Tentar fechar negócio agora"
 
+# Execution-engine round — compute_next_best_action()'s absolute-priority
+# override (Task 5's own "ALWAYS" wording): a critical-risk lead with a
+# message still unanswered short-circuits every other rule, no exceptions.
+# No message template below (falls through to the final `return None`,
+# same as ACTION_AWAIT_RESPONSE) and no enrichment-context suffix appended
+# either — this is a forced command, not an outreach opener to decorate.
+ACTION_RESPOND_OR_CALL_NOW = "Responder ou ligar imediatamente (lead crítico)"
+
 
 def _seeded_choice(seed: str, salt: str, options: list[str]) -> str:
     """Deterministic pick keyed on the lead's own id — the same lead always

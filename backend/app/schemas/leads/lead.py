@@ -291,6 +291,22 @@ class RecordLeadResponseRequest(BaseModel):
     response: Literal["responded", "interested", "not_interested"]
 
 
+class ActionEffectivenessResponse(BaseModel):
+    """compute_action_effectiveness() (scoring.py) — org-wide "did this
+    ACTION lead to a RESULT" per action type (call_now/send_message/
+    schedule_meeting), inferred from LeadActivityLog's action_call/
+    action_message/action_meeting entries (execute_lead_action(),
+    execution_engine.py) against lead_interested/converted outcomes — no
+    FK, no ML. Feeds compute_lead_score()'s own "learned channel" bonus.
+    Each rate is None (not 0.0) until at least one lead has had that
+    action type at all, same "None until there's real signal" rule
+    ConversionInsightsResponse's own fields already follow."""
+
+    call_success_rate: float | None = None
+    message_success_rate: float | None = None
+    meeting_success_rate: float | None = None
+
+
 class ResponseMetricsResponse(BaseModel):
     """compute_response_metrics() (scoring.py) — org-wide messaging
     effectiveness mined from the last 30 days of message_sent/lead_responded/

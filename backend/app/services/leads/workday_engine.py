@@ -64,6 +64,92 @@ _PIPELINE_RISK_ALERT_DEDUP_HOURS = 6
 _HIGH_PRESSURE_OVERDUE_THRESHOLD = 8
 _HIGH_PRESSURE_COMPLETION_RATE = 0.3
 
+# build_action_queue()'s own cap — the prompt's own number, same rationale
+# as _HIGH_PRIORITY_TOP_N (workday.py): a short, genuinely actionable list,
+# not "everything sorted."
+_ACTION_QUEUE_LIMIT = 10
+_RISK_LEVEL_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+# build_action_queue()'s "force to the top" bar — deliberately its own
+# number, distinct from HIGH_VALUE_LEAD_THRESHOLD (5000, enrichment.py):
+# that one gates "is this a big deal at all" everywhere else in this
+# codebase; this one gates "big enough to jump the queue's own risk-first
+# ordering," a stricter, prompt-specified bar.
+_MONEY_FIRST_THRESHOLD = 10000.0
+_MONEY_FIRST_TOP_SLOTS = 3
+# get_next_mandatory_lead()'s own "how overdue is too overdue to keep
+# waiting" bar — same magnitude as compute_lead_score's own
+# _PENDING_RESPONSE_DELAY_MINUTES_LOW (scoring.py), kept as its own literal
+# here rather than an import to avoid a cross-module constant dependency
+# for one plain number neither module needs to share via code.
+_MANDATORY_PENDING_RESPONSE_MINUTES = 60
+
+
+def build_action_queue(leads: list[LeadResponse]) -> list[LeadResponse]:
+    """Execution-engine round — the deterministic "what do I do next, in
+    order" queue GET /workday/action-queue (workday.py) and
+    get_next_mandatory_lead() below both read. Pure, no DB access: takes
+    whatever rank_leads_by_priority()'s own already-scored candidate pool
+    the caller passes in — same "reuse, don't re-query" precedent every
+    other workday_engine.py aggregation already follows.
+
+    Filtered to leads with an actual recommended action
+    (next_best_action_type is not None — always None for a converted lead,
+    compute_action_type_and_urgency, scoring.py) and not already closed
+    either way (status not in converted/lost — a *lost* lead still gets
+    next_best_action_type == "drop_lead", so the status check catches
+    what the type-nullness check alone wouldn't).
+
+    Sorted deal_risk_level first (critical > high > medium > low), then
+    expected_value/win_probability/response_delay_minutes (each DESC,
+    nulls sorted last) — "how bad could it get" before "how much money"
+    before "how likely" before "how long ignored." Money-first override
+    (Task 6): any lead worth >= _MONEY_FIRST_THRESHOLD is pulled into the
+    queue's own top _MONEY_FIRST_TOP_SLOTS positions regardless of risk
+    tier — a deal that big jumps the line even past a merely medium-risk
+    one, though a *critical*-risk lead worth that much would already be
+    there on its own merits without the override. Capped to
+    _ACTION_QUEUE_LIMIT."""
+    candidates = [
+        lead
+        for lead in leads
+        if lead.next_best_action_type is not None and lead.status not in ("converted", "lost")
+    ]
+    candidates.sort(
+        key=lambda lead: (
+            -_RISK_LEVEL_ORDER.get(lead.deal_risk_level, 0),
+            -lead.expected_value,
+            -lead.win_probability,
+            lead.response_delay_minutes is None,
+            -(lead.response_delay_minutes or 0),
+        )
+    )
+
+    forced = [lead for lead in candidates if lead.expected_value >= _MONEY_FIRST_THRESHOLD][
+        :_MONEY_FIRST_TOP_SLOTS
+    ]
+    forced_ids = {lead.id for lead in forced}
+    ordered = forced + [lead for lead in candidates if lead.id not in forced_ids]
+
+    return ordered[:_ACTION_QUEUE_LIMIT]
+
+
+def get_next_mandatory_lead(queue: list[LeadResponse]) -> LeadResponse | None:
+    """Execution-engine round's "hard focus mode" — the ONE lead the user
+    is pointed at right now, out of build_action_queue()'s own ordered top
+    10. Prefers whichever comes first in queue order that's either
+    deal_risk_level == "critical" or has gone unanswered for over
+    _MANDATORY_PENDING_RESPONSE_MINUTES minutes (response_delay_minutes);
+    falls back to the queue's own first entry (already the single
+    highest-priority lead by build_action_queue()'s own ordering) when
+    neither condition is met by anything in it."""
+    for lead in queue:
+        if lead.deal_risk_level == "critical" or (
+            lead.response_delay_minutes is not None
+            and lead.response_delay_minutes > _MANDATORY_PENDING_RESPONSE_MINUTES
+        ):
+            return lead
+    return queue[0] if queue else None
+
 
 async def get_next_actionable_lead(
     db: AsyncSession, organization_id: str, *, exclude_lead_id: uuid.UUID | None = None

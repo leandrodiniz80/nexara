@@ -15,6 +15,7 @@ from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import (
+    ActionQueueItem,
     WorkdayCompleteAndNextRequest,
     WorkdayCompleteAndNextResponse,
     WorkdayNextResponse,
@@ -26,11 +27,13 @@ from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_es
 from app.services.leads.execution_engine import AUTO_EXECUTION_NOTIFICATION_PREFIX, maybe_auto_execute
 from app.services.leads.scoring import compute_response_metrics, rank_leads_by_priority, score_leads
 from app.services.leads.workday_engine import (
+    build_action_queue,
     complete_lead_task,
     detect_user_failure_state,
     format_brl,
     generate_accountability_message,
     get_next_actionable_lead,
+    get_next_mandatory_lead,
     maybe_notify_critical_deals,
     maybe_notify_high_value_leads,
     maybe_notify_ignored_leads,
@@ -621,6 +624,11 @@ async def get_workday_summary(
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
     response_metrics = await compute_response_metrics(db, organization_id)
 
+    # Execution-engine round — Task 2's own "next_mandatory_lead_id", reusing
+    # this same `ranked` list, zero extra query.
+    action_queue = build_action_queue(ranked)
+    mandatory_lead = get_next_mandatory_lead(action_queue)
+
     return ApiResponse(
         success=True,
         data=WorkdaySummaryResponse(
@@ -640,7 +648,44 @@ async def get_workday_summary(
             pending_responses_count=pending_responses_count,
             high_value_at_risk_count=high_value_at_risk_count,
             pipeline_expected_value=pipeline_expected_value,
+            next_mandatory_lead_id=mandatory_lead.id if mandatory_lead is not None else None,
         ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/action-queue", response_model=ApiResponse[list[ActionQueueItem]])
+async def get_action_queue(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[ActionQueueItem]]:
+    """Execution-engine round — Task 1's "Fila de execução": the top 10
+    leads worth acting on right now, risk-first then money-first
+    (build_action_queue(), workday_engine.py), built from a fresh
+    rank_leads_by_priority() call — same one query cost GET /leads/priority
+    and /workday/summary each already pay independently."""
+    start = time.perf_counter()
+    organization_id, _user_email = _require_caller(session)
+
+    ranked = await rank_leads_by_priority(db, organization_id)
+    queue = build_action_queue(ranked)
+
+    return ApiResponse(
+        success=True,
+        data=[
+            ActionQueueItem(
+                lead_id=lead.id,
+                name=lead.name,
+                deal_risk_level=lead.deal_risk_level,
+                expected_value=lead.expected_value,
+                next_best_action=lead.next_best_action,
+                next_best_action_type=lead.next_best_action_type,
+                next_best_action_urgency=lead.next_best_action_urgency,
+            )
+            for lead in queue
+        ],
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

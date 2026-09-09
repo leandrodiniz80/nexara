@@ -85,6 +85,32 @@ class WorkdaySummaryResponse(BaseModel):
     pending_responses_count: int = 0
     high_value_at_risk_count: int = 0
     pipeline_expected_value: int = 0
+    # Execution-engine round — the Command Center's "Próxima ação
+    # obrigatória": get_next_mandatory_lead() (workday_engine.py) applied to
+    # this same endpoint's already-computed `ranked` list run through
+    # build_action_queue() first, zero new queries. None only when the
+    # action queue itself is empty (nothing next_best_action_type-eligible
+    # and non-converted/non-lost) — the frontend hides the section instead
+    # of rendering a null lead.
+    next_mandatory_lead_id: uuid.UUID | None = None
+
+
+class ActionQueueItem(BaseModel):
+    """GET /workday/action-queue's own per-item shape — a deliberately
+    narrow projection of LeadResponse (build_action_queue(), workday_engine.py)
+    rather than the full lead payload: this endpoint's whole point is a
+    short, scannable "what to do next" list, not another full lead fetch.
+    The frontend opens the full lead modal via lead_id when "Botão direto"
+    is clicked (reusing whatever full Lead objects it already has cached),
+    rather than this endpoint carrying the full record itself."""
+
+    lead_id: uuid.UUID
+    name: str
+    deal_risk_level: str | None
+    expected_value: int
+    next_best_action: str | None
+    next_best_action_type: str | None
+    next_best_action_urgency: str | None
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):

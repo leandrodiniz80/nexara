@@ -10,6 +10,7 @@ from app.models.leads.automation_activity_log import AutomationActivityLog
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
 from app.schemas.leads.lead import (
+    ActionEffectivenessResponse,
     ConversionInsightsResponse,
     LeadResponse,
     ResponseMetricsResponse,
@@ -23,6 +24,7 @@ from app.services.leads.enrichment import (
     ACTION_FOLLOW_UP,
     ACTION_MAXIMUM_URGENCY_FOLLOW_UP,
     ACTION_NURTURE_OR_DISCARD,
+    ACTION_RESPOND_OR_CALL_NOW,
     ACTION_URGENT_FOLLOW_UP,
     COMPANY_SIZE_PT,
     COMPANY_SIZE_SCORE_IMPACT,
@@ -179,6 +181,15 @@ _FULL_PROFILE_MATCH_BONUS = 15
 # "close it *now*, this is as good as it gets."
 _ATTEMPT_CLOSE_WIN_PROBABILITY = 80
 
+# Execution-engine round — compute_lead_score()'s "learned channel"
+# bonus: whichever of call_now/send_message has the higher org-wide
+# success rate (compute_action_effectiveness()) earns a small reinforcement
+# when it's also this lead's own recommended action_type — same magnitude
+# as the codebase's other secondary reinforcement signals (Recent
+# automation activity, High-value sector, etc. all use small single-digit-
+# to-teens bonuses too).
+_ACTION_LEARNING_BONUS = 5
+
 
 def compute_win_probability(
     lead: Lead, *, has_recent_manual_activity: bool, task_completed_recently: bool, now: datetime
@@ -228,19 +239,29 @@ def compute_next_best_action(
     win_probability: int,
     has_pending_response: bool,
     response_delay_minutes: int | None,
+    deal_risk_level: str,
 ) -> str | None:
     """"What should I do about this lead right now" — a plain rule table on
     status (+ overdue), no ML/LLM involved. Converted (and any other status
     outside new/contacted, e.g. lost) has nothing left to act on. Builds on
     ACTION_FIRST_CONTACT/ACTION_URGENT_FOLLOW_UP/ACTION_FOLLOW_UP/
     ACTION_MAXIMUM_URGENCY_FOLLOW_UP/ACTION_CLOSE_DEAL/ACTION_NURTURE_OR_DISCARD/
-    ACTION_AWAIT_RESPONSE/ACTION_ATTEMPT_CLOSE_DEAL (enrichment.py) rather
-    than its own string literals, since generate_lead_message_by_action()
-    matches on those same prefixes to pick a message tone for
-    suggested_message.
+    ACTION_AWAIT_RESPONSE/ACTION_ATTEMPT_CLOSE_DEAL/ACTION_RESPOND_OR_CALL_NOW
+    (enrichment.py) rather than its own string literals, since
+    generate_lead_message_by_action() matches on those same prefixes to
+    pick a message tone for suggested_message.
 
-    For a "contacted" lead, one ordered decision tree, highest-priority
-    rule first:
+    Execution-engine round's "force priority" rule sits above everything
+    else, status included: a critical-risk lead with a message still
+    unanswered (deal_risk_level == "critical" and has_pending_response)
+    always returns ACTION_RESPOND_OR_CALL_NOW, full stop — the prompt's own
+    "ALWAYS," so it isn't folded into the "contacted" branch's own ordered
+    tree below (deal_risk_level is computed from status/expected_value/
+    idle-days already, so this can theoretically apply to any status, not
+    just "contacted," though in practice a pending response implies one).
+
+    Otherwise, for a "contacted" lead, one ordered decision tree,
+    highest-priority rule first:
       1. A message is out with no reply yet (has_pending_response) and it's
          been over _PENDING_RESPONSE_DELAY_MINUTES_HIGH minutes — stop
          waiting, escalate (same string
@@ -263,6 +284,9 @@ def compute_next_best_action(
          let it go cold on its own.
       8. Otherwise — the original plain follow-up.
     """
+    if deal_risk_level == "critical" and has_pending_response:
+        return ACTION_RESPOND_OR_CALL_NOW
+
     if lead.status == "new":
         action = ACTION_FIRST_CONTACT
     elif lead.status == "contacted":
@@ -291,10 +315,10 @@ def compute_next_best_action(
     else:
         return None
 
-    # ACTION_AWAIT_RESPONSE excluded: "Aguardar resposta do lead com
-    # empresa de X de Y" doesn't read as a sentence the way the other
-    # actions' own suffixed forms do.
-    if lead.enrichment_data and action != ACTION_AWAIT_RESPONSE:
+    # ACTION_AWAIT_RESPONSE/ACTION_RESPOND_OR_CALL_NOW excluded: neither
+    # reads as a sentence with "com empresa de X de Y" tacked on the way
+    # the other actions' own suffixed forms do.
+    if lead.enrichment_data and action not in (ACTION_AWAIT_RESPONSE, ACTION_RESPOND_OR_CALL_NOW):
         industry = INDUSTRY_PT.get(lead.enrichment_data.get("industry", ""))
         size = COMPANY_SIZE_PT.get(lead.enrichment_data.get("company_size", ""))
         if industry and size:
@@ -319,6 +343,9 @@ def compute_lead_score(
     response_delay_minutes: int | None,
     response_time_minutes: int | None,
     days_since_last_activity: int,
+    action_type: str | None,
+    call_success_rate: float | None,
+    message_success_rate: float | None,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -622,6 +649,33 @@ def compute_lead_score(
         )
         total += _HIGH_WIN_PROBABILITY_SCORE_BONUS
 
+    # Execution-engine round — reinforces whichever channel
+    # compute_action_effectiveness() (below) has learned actually works
+    # better org-wide, but only on top of this lead's own already-
+    # recommended action_type (compute_action_type_and_urgency, computed
+    # earlier in score_leads() than this call): a lead recommended
+    # call_now doesn't get the message bonus just because messages happen
+    # to convert better elsewhere, and vice versa. Requires both rates to
+    # be real (not None) — no comparison, no bonus, until there's enough
+    # actual outcome data to learn from.
+    if call_success_rate is not None and message_success_rate is not None:
+        if action_type == "send_message" and message_success_rate > call_success_rate:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Mensagens historicamente mais eficazes que ligações",
+                    impact=_ACTION_LEARNING_BONUS,
+                )
+            )
+            total += _ACTION_LEARNING_BONUS
+        elif action_type == "call_now" and call_success_rate > message_success_rate:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Ligações historicamente mais eficazes que mensagens",
+                    impact=_ACTION_LEARNING_BONUS,
+                )
+            )
+            total += _ACTION_LEARNING_BONUS
+
     return max(0, min(100, total)), breakdown
 
 
@@ -804,6 +858,96 @@ async def compute_response_metrics(
     )
 
 
+# Execution-engine round — the "action_*" event types execute_lead_action()
+# (execution_engine.py) writes on top of its own event-specific ones, purely
+# so compute_action_effectiveness() below has one shared vocabulary to
+# query across all three action types at once.
+ACTION_EVENT_TYPES = ["action_call", "action_message", "action_meeting"]
+
+
+async def compute_action_effectiveness(
+    db: AsyncSession, organization_id: str
+) -> ActionEffectivenessResponse:
+    """Execution-engine round — "did this ACTION lead to a RESULT," per
+    action type, no ML. There's no FK from an action_* entry to the
+    response that (maybe) followed it — LeadActivityLog has no such column
+    (see that model's own docstring) — so this infers the link the same
+    way lead_response_state already does elsewhere: by comparing
+    timestamps, not by an explicit relationship.
+
+    Simplification, disclosed: rather than pairing every individual action
+    with whichever specific response came right after it (a lead can have
+    several actions of the same type over its lifetime), this asks one
+    coarser question per lead per action type — "after the *last* time
+    this action type ran on this lead, did it ever show interest, or has
+    it since converted?" A lead that eventually converts counts as a
+    success for every action type it was ever subjected to, not just the
+    final one — there's no way to attribute a conversion to one specific
+    past action without a real link, so this doesn't pretend to. Same
+    "known approximation" spirit as money_saved_today's own disclosed
+    proxy (workday.py).
+
+    Two queries regardless of org size: one LeadActivityLog scan
+    (action_call/action_message/action_meeting/lead_interested, all time —
+    no window, same precedent compute_conversion_insights() already sets
+    for a signal this function itself feeds into via compute_lead_score()),
+    one Lead status check scoped to just the leads that scan turned up.
+    Each rate is None (not 0.0) until at least one lead has that action
+    type at all — "no data" isn't the same claim as "0% success," same
+    rule ConversionInsightsResponse's own fields already follow."""
+    rows_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type.in_(ACTION_EVENT_TYPES + ["lead_interested"]),
+    )
+    rows = (await db.execute(rows_stmt)).all()
+
+    latest_action_at: dict[tuple, datetime] = {}
+    lead_ids_by_action_type: dict[str, set] = {event_type: set() for event_type in ACTION_EVENT_TYPES}
+    latest_interested_at: dict = {}
+
+    for row in rows:
+        if row.event_type == "lead_interested":
+            current = latest_interested_at.get(row.lead_id)
+            if current is None or row.created_at > current:
+                latest_interested_at[row.lead_id] = row.created_at
+            continue
+        lead_ids_by_action_type[row.event_type].add(row.lead_id)
+        key = (row.lead_id, row.event_type)
+        current = latest_action_at.get(key)
+        if current is None or row.created_at > current:
+            latest_action_at[key] = row.created_at
+
+    all_lead_ids = set().union(*lead_ids_by_action_type.values()) if rows else set()
+    converted_lead_ids: set = set()
+    if all_lead_ids:
+        converted_stmt = select(Lead.id).where(
+            Lead.id.in_(all_lead_ids), Lead.status == "converted"
+        )
+        converted_lead_ids = set((await db.execute(converted_stmt)).scalars().all())
+
+    def success_rate(event_type: str) -> float | None:
+        lead_ids = lead_ids_by_action_type[event_type]
+        if not lead_ids:
+            return None
+        successes = 0
+        for lead_id in lead_ids:
+            if lead_id in converted_lead_ids:
+                successes += 1
+                continue
+            interested_at = latest_interested_at.get(lead_id)
+            if interested_at is not None and interested_at > latest_action_at[(lead_id, event_type)]:
+                successes += 1
+        return round(successes / len(lead_ids) * 100, 1)
+
+    return ActionEffectivenessResponse(
+        call_success_rate=success_rate("action_call"),
+        message_success_rate=success_rate("action_message"),
+        meeting_success_rate=success_rate("action_meeting"),
+    )
+
+
 def build_priority_reason(
     lead: Lead,
     *,
@@ -924,10 +1068,11 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
     LeadResponse.model_validate(lead) every lead-returning endpoint used
-    before this. Seven extra queries total (recent automation activity,
+    before this. Nine extra queries total (recent automation activity,
     recent manual activity, compute_conversion_insights()'s own two,
-    compute_response_metrics()'s own one, one covering both lead_response_state
-    and has_pending_response/response_delay_minutes, plus one for
+    compute_response_metrics()'s own one, compute_action_effectiveness()'s
+    own two, one covering both lead_response_state and
+    has_pending_response/response_delay_minutes, plus one for
     days_since_last_activity) for the whole batch, regardless of how many
     leads are passed in — no N+1."""
     if not leads:
@@ -944,6 +1089,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     organization_id = leads[0].organization_id
     insights = await compute_conversion_insights(db, organization_id)
     response_metrics = await compute_response_metrics(db, organization_id)
+    action_effectiveness = await compute_action_effectiveness(db, organization_id)
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -1061,6 +1207,19 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             (now - last_activity_at).days if last_activity_at is not None else days_idle
         )
 
+        # Moved ahead of compute_lead_score()/compute_next_best_action()
+        # (execution-engine round): both now need deal_risk_level (the
+        # force-priority rule) and/or action_type (the action-learning
+        # bonus), which used to only be computed after them.
+        deal_risk_level, deal_risk_reason = compute_deal_risk(
+            lead,
+            expected_value=expected_value,
+            win_probability=win_probability,
+            is_overdue=is_overdue,
+            now=now,
+        )
+        action_type, action_urgency = compute_action_type_and_urgency(lead, deal_risk_level)
+
         score, breakdown = compute_lead_score(
             lead,
             has_recent_automation=lead.id in recent_lead_ids,
@@ -1076,6 +1235,9 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             response_delay_minutes=response_delay_minutes,
             response_time_minutes=response_time_minutes,
             days_since_last_activity=days_since_last_activity,
+            action_type=action_type,
+            call_success_rate=action_effectiveness.call_success_rate,
+            message_success_rate=action_effectiveness.message_success_rate,
             now=now,
         )
 
@@ -1086,6 +1248,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             win_probability=win_probability,
             has_pending_response=has_pending_response,
             response_delay_minutes=response_delay_minutes,
+            deal_risk_level=deal_risk_level,
         )
         suggested_message = (
             generate_lead_message_by_action(lead, next_best_action, lead.owner_email or "the team")
@@ -1100,15 +1263,6 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             days_idle=days_idle,
             is_overdue=is_overdue,
         )
-
-        deal_risk_level, deal_risk_reason = compute_deal_risk(
-            lead,
-            expected_value=expected_value,
-            win_probability=win_probability,
-            is_overdue=is_overdue,
-            now=now,
-        )
-        action_type, action_urgency = compute_action_type_and_urgency(lead, deal_risk_level)
 
         # Execution-assistance round — "ready to just do it" gate. Not its
         # own compute_*() function: it's a plain two-field AND already fully
