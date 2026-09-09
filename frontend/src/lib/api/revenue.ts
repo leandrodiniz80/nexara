@@ -53,6 +53,47 @@ export async function getRevenueSummary(): Promise<RevenueSummary> {
   }
 }
 
+export interface RevenueForecast {
+  /** Decayed expected_value summed over leads due today or already
+   * overdue (see backend's compute_forecast_value() — overdue *0.6, idle
+   * >3 days *0.7). */
+  todayExpected: number;
+  /** Same decayed total across every active lead as monthExpected below,
+   * just discounted by 0.8 (a week captures less of the pipeline's
+   * eventual close than a month does). */
+  weekExpected: number;
+  monthExpected: number;
+  /** Mean win probability (0-1) across every active lead. */
+  confidence: number;
+}
+
+interface RevenueForecastDto {
+  today_expected: number;
+  week_expected: number;
+  month_expected: number;
+  confidence: number;
+}
+
+/** GET /api/v1/revenue/forecast — Autonomous-sales-OS round's Revenue
+ * Forecast Engine: how much of the open pipeline is actually likely to
+ * land today/this week/this month, plus an overall confidence figure. */
+export async function getRevenueForecast(): Promise<RevenueForecast> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<RevenueForecastDto>>("/revenue/forecast");
+    if (!data.data) {
+      throw new Error("Revenue forecast request succeeded but returned no data");
+    }
+    return {
+      todayExpected: data.data.today_expected,
+      weekExpected: data.data.week_expected,
+      monthExpected: data.data.month_expected,
+      confidence: data.data.confidence,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
 export interface RevenueTrendDay {
   /** "YYYY-MM-DD" */
   date: string;

@@ -7,6 +7,8 @@ import { ActionQueuePanel } from "@/components/dashboard/action-queue-panel";
 import { BusinessIntelligence } from "@/components/dashboard/business-intelligence";
 import { CommandCenter } from "@/components/dashboard/command-center";
 import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
+import { EnforcementOverlay } from "@/components/dashboard/enforcement-overlay";
+import { ExecutiveDashboard } from "@/components/dashboard/executive-dashboard";
 import { KpiGrid } from "@/components/dashboard/kpi-grid";
 import { LeadsMetricsGrid } from "@/components/dashboard/leads-metrics-grid";
 import { LearningPanel } from "@/components/dashboard/learning-panel";
@@ -25,9 +27,10 @@ import { useToast } from "@/components/ui/toast";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
-import { getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
+import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
   completeLeadTask,
+  executeLeadAction,
   getLeadInsights,
   getLeadMetrics,
   getLeads,
@@ -37,14 +40,17 @@ import {
   getLeadTasks,
   updateLeadStatus,
   type Lead,
+  type LeadExecutableAction,
   type LeadStatus,
 } from "@/lib/api/leads";
 import {
   completeAndNext,
   getActionQueue,
+  getEnforcementState,
   getWorkdayNext,
   getWorkdayPerformance,
   getWorkdaySummary,
+  getWorkdayTarget,
 } from "@/lib/api/workday";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
@@ -137,6 +143,34 @@ export default function DashboardPage() {
   const { data: actionQueue } = useQuery({
     queryKey: ["action-queue"],
     queryFn: getActionQueue,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  // Autonomous-sales-OS round — the hard-enforcement gate. Polled tighter
+  // than the other dashboard queries (20s, not 45s): this one can put up a
+  // fullscreen block, so it needs to notice a newly-mandatory lead (or the
+  // block clearing) sooner than a routine dashboard refresh would.
+  const { data: enforcementState } = useQuery({
+    queryKey: ["enforcement-state"],
+    queryFn: getEnforcementState,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 20000,
+  });
+
+  const { data: revenueForecast } = useQuery({
+    queryKey: ["revenue-forecast"],
+    queryFn: getRevenueForecast,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  const { data: workdayTarget } = useQuery({
+    queryKey: ["workday-target"],
+    queryFn: getWorkdayTarget,
     enabled: isAuthenticated,
     retry: false,
     refetchInterval: 45000,
@@ -279,6 +313,38 @@ export default function DashboardPage() {
     },
   });
 
+  // Autonomous-sales-OS round — the enforcement overlay's own "execute"
+  // button. Executes requiredAction, then best-effort completes that
+  // lead's pending task too (swallowed if there isn't one — a call_now/
+  // schedule_meeting requirement can be mandatory purely because the
+  // underlying task is overdue, and execute-action alone doesn't clear
+  // next_action_due_at the way completing the task does; without this,
+  // the overlay could reappear for the same lead immediately after
+  // "executing" it).
+  const enforcementExecuteMutation = useMutation({
+    mutationFn: async ({ leadId, action }: { leadId: string; action: LeadExecutableAction }) => {
+      await executeLeadAction(leadId, action);
+      try {
+        await completeLeadTask(leadId);
+      } catch {
+        // No pending task to complete — the action itself still went
+        // through, so this is not a failure.
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["enforcement-state"] });
+      queryClient.invalidateQueries({ queryKey: ["leads"] });
+      queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
+      queryClient.invalidateQueries({ queryKey: ["action-queue"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["workday-target"] });
+      showToast("Ação executada.");
+    },
+    onError: () => {
+      showToast("Não foi possível executar a ação automaticamente. Abra o lead para tratar manualmente.");
+    },
+  });
+
   const updateStatusMutation = useMutation({
     mutationFn: ({ id, status, reason }: { id: string; status: LeadStatus; reason?: string }) =>
       updateLeadStatus(id, status, reason),
@@ -331,6 +397,12 @@ export default function DashboardPage() {
       >
         {leadsMetrics && (
           <div className="space-y-4">
+            <ExecutiveDashboard
+              forecast={revenueForecast}
+              target={workdayTarget}
+              performance={workdayPerformance}
+            />
+
             {revenueSummary && (
               <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />
             )}
@@ -465,6 +537,28 @@ export default function DashboardPage() {
             : undefined
         }
       />
+
+      {/* Stepped aside (not rendered) while the user has explicitly opened
+          the mandatory lead's own modal via "Abrir lead" below — both use
+          z-50, and the modal needs to actually be reachable, not hidden
+          behind this. Reappears the moment that modal closes if the lead
+          is still mandatory. */}
+      {enforcementState && detailsLead?.id !== enforcementState.leadId && (
+        <EnforcementOverlay
+          state={enforcementState}
+          isExecuting={enforcementExecuteMutation.isPending}
+          onExecute={() => {
+            if (!enforcementState.leadId || !enforcementState.requiredAction) return;
+            enforcementExecuteMutation.mutate({
+              leadId: enforcementState.leadId,
+              action: enforcementState.requiredAction as LeadExecutableAction,
+            });
+          }}
+          onOpenLead={() => {
+            if (enforcementState.leadId) openLeadById(enforcementState.leadId);
+          }}
+        />
+      )}
     </>
   );
 }

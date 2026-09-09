@@ -356,6 +356,15 @@ export interface WorkdayTarget {
   completedToday: number;
   remaining: number;
   progress: number;
+  /** Autonomous-sales-OS round — a second, revenue-based target alongside
+   * the task-count one above (additive, not a replacement). Average
+   * converted revenue per day over the last 7 days. */
+  dailyTargetRevenue: number;
+  /** expectedValue summed over today's actionable leads — same figure as
+   * WorkdaySummary.todayPotentialRevenue. */
+  currentExpected: number;
+  /** dailyTargetRevenue - currentExpected. Positive means behind target. */
+  gap: number;
 }
 
 interface WorkdayTargetDto {
@@ -363,11 +372,15 @@ interface WorkdayTargetDto {
   completed_today: number;
   remaining: number;
   progress: number;
+  daily_target_revenue: number;
+  current_expected: number;
+  gap: number;
 }
 
 /** GET /api/v1/workday/target — the daily gamification target: a fixed
  * default (no per-user/org customization yet) matched against today's
- * completed-task count. */
+ * completed-task count, plus (Autonomous-sales-OS round) a revenue-based
+ * target alongside it. */
 export async function getWorkdayTarget(): Promise<WorkdayTarget> {
   try {
     const { data } = await apiClient.get<ApiResponse<WorkdayTargetDto>>("/workday/target");
@@ -379,6 +392,63 @@ export async function getWorkdayTarget(): Promise<WorkdayTarget> {
       completedToday: data.data.completed_today,
       remaining: data.data.remaining,
       progress: data.data.progress,
+      dailyTargetRevenue: data.data.daily_target_revenue,
+      currentExpected: data.data.current_expected,
+      gap: data.data.gap,
+    };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface EnforcementState {
+  blocked: boolean;
+  leadId: string | null;
+  name: string | null;
+  companyName: string | null;
+  phone: string | null;
+  expectedValue: number | null;
+  requiredAction: string | null;
+  nextBestAction: string | null;
+  reason: string | null;
+}
+
+interface EnforcementStateDto {
+  blocked: boolean;
+  lead_id: string | null;
+  name: string | null;
+  company_name: string | null;
+  phone: string | null;
+  expected_value: number | null;
+  required_action: string | null;
+  next_best_action: string | null;
+  reason: string | null;
+}
+
+/** GET /api/v1/workday/enforcement-state — Autonomous-sales-OS round's
+ * hard-block gate: when blocked is true, the frontend shows a fullscreen
+ * overlay (EnforcementOverlay) the user cannot dismiss except by executing
+ * requiredAction on leadId. Same mandatory lead WorkdaySummary.
+ * nextMandatoryLeadId already points at, just with enough detail here to
+ * render without a second fetch. */
+export async function getEnforcementState(): Promise<EnforcementState> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<EnforcementStateDto>>(
+      "/workday/enforcement-state"
+    );
+    if (!data.data) {
+      throw new Error("Enforcement-state request succeeded but returned no data");
+    }
+    return {
+      blocked: data.data.blocked,
+      leadId: data.data.lead_id,
+      name: data.data.name,
+      companyName: data.data.company_name,
+      phone: data.data.phone,
+      expectedValue: data.data.expected_value,
+      requiredAction: data.data.required_action,
+      nextBestAction: data.data.next_best_action,
+      reason: data.data.reason,
     };
   } catch (error) {
     throw toApiClientError(error);
