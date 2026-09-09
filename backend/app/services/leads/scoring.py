@@ -20,6 +20,7 @@ from app.services.leads.enrichment import (
     INDUSTRY_PT,
     LARGE_COMPANY_SIZES,
     generate_lead_message_by_action,
+    get_lead_estimated_value,
 )
 
 # "Recent" for the automation-activity boost — same window LeadResponse's
@@ -33,6 +34,58 @@ _RECENT_AUTOMATION_DAYS = 3
 # specifically about celebrating a *just-finished* task, not general recent
 # touch.
 _RECENT_TASK_COMPLETION_HOURS = 24
+# compute_win_probability()'s "no activity" penalty threshold — same 7-day
+# window compute_lead_score's own "Idle for over a week" line already uses.
+_WIN_PROBABILITY_IDLE_DAYS = 7
+# score_breakdown's "High conversion probability" line only appears at this
+# threshold — matches the frontend's own green-badge cutoff (lead-card.tsx),
+# so the same lead reads as "high probability" in both places.
+_HIGH_WIN_PROBABILITY_THRESHOLD = 70
+# Reinforcement bonus compute_lead_score() adds to `score` when
+# win_probability clears the threshold above — same magnitude as this
+# codebase's other secondary signals (Recent automation activity,
+# High-value sector, Larger company all use +10 too).
+_HIGH_WIN_PROBABILITY_SCORE_BONUS = 10
+
+
+def compute_win_probability(
+    lead: Lead, *, has_recent_manual_activity: bool, task_completed_recently: bool, now: datetime
+) -> int:
+    """0-100 estimated likelihood this lead converts — a plain rule table
+    over status plus the same recent-activity/overdue/enrichment signals
+    compute_lead_score() already gathers for its own batch query, no
+    ML/LLM. converted/lost short-circuit to 100/0 outright, matching
+    those statuses' own compute_lead_score treatment. is_overdue/days_idle
+    are recomputed here rather than threaded through as params — same
+    "cheap, pure, independently derived" precedent score_leads() already
+    sets by computing its own is_overdue separately from
+    compute_lead_score's internal check."""
+    if lead.status == "converted":
+        return 100
+    if lead.status == "lost":
+        return 0
+
+    probability = 40 if lead.status == "contacted" else 20  # "new"
+
+    if has_recent_manual_activity:
+        probability += 15
+    if task_completed_recently:
+        probability += 10
+
+    is_overdue = lead.next_action_due_at is not None and lead.next_action_due_at < now
+    if is_overdue:
+        probability -= 20
+
+    days_idle = (now - lead.updated_at).days
+    if days_idle > _WIN_PROBABILITY_IDLE_DAYS:
+        probability -= 25
+
+    if lead.enrichment_data:
+        probability += 10
+        if lead.enrichment_data.get("company_size") in LARGE_COMPANY_SIZES:
+            probability += 10
+
+    return max(0, min(100, probability))
 
 
 def compute_next_best_action(lead: Lead, *, is_overdue: bool) -> str | None:
@@ -66,7 +119,7 @@ def compute_lead_score(
     has_recent_manual_activity: bool,
     task_completed_recently: bool,
     now: datetime,
-) -> tuple[int, list[ScoreBreakdownItem]]:
+) -> tuple[int, list[ScoreBreakdownItem], int]:
     """Dynamic score, computed at read time from the lead's current state —
     never persisted (Lead.score, the stored column, is only this
     computation's starting baseline). Pure: no DB access, so a batch of
@@ -84,10 +137,18 @@ def compute_lead_score(
     checks below, not a replacement for them: an overdue, long-idle lead now
     stacks both its original penalty and this layer's, dropping toward 0
     faster than before. That's intentional — the whole point of this layer
-    is to make neglect cost visibly more than before."""
+    is to make neglect cost visibly more than before.
+
+    Also returns win_probability (compute_win_probability()) as a third
+    tuple element — computed here (not by a separate caller query) since it
+    shares has_recent_manual_activity/task_completed_recently/now with this
+    function already; a high win_probability also earns its own
+    score_breakdown line (revenue-intelligence round), same "stack another
+    reinforcement signal on top" precedent as the overdue/idle lines
+    above."""
     if lead.status == "converted":
         impact = 100 - lead.score
-        return 100, [ScoreBreakdownItem(reason="Lead converted", impact=impact)]
+        return 100, [ScoreBreakdownItem(reason="Lead converted", impact=impact)], 100
 
     breakdown: list[ScoreBreakdownItem] = []
     total = lead.score
@@ -195,7 +256,21 @@ def compute_lead_score(
         )
         total += unenriched_impact
 
-    return max(0, min(100, total)), breakdown
+    win_probability = compute_win_probability(
+        lead,
+        has_recent_manual_activity=has_recent_manual_activity,
+        task_completed_recently=task_completed_recently,
+        now=now,
+    )
+    if win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD:
+        breakdown.append(
+            ScoreBreakdownItem(
+                reason="High conversion probability", impact=_HIGH_WIN_PROBABILITY_SCORE_BONUS
+            )
+        )
+        total += _HIGH_WIN_PROBABILITY_SCORE_BONUS
+
+    return max(0, min(100, total)), breakdown, win_probability
 
 
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
@@ -245,7 +320,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
 
     responses = []
     for lead in leads:
-        score, breakdown = compute_lead_score(
+        score, breakdown, win_probability = compute_lead_score(
             lead,
             has_recent_automation=lead.id in recent_lead_ids,
             has_recent_manual_activity=lead.id in recent_manual_activity_ids,
@@ -262,6 +337,14 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             else None
         )
 
+        # Both always exact whole numbers: estimated_value is one of
+        # 0/1000/5000/20000, win_probability an integer 0-100, so their
+        # product divided by 100 never leaves a fraction — round() is just
+        # a guard against float imprecision (e.g. 5000 * 42 / 100), not a
+        # real rounding decision.
+        estimated_value = get_lead_estimated_value(lead)
+        expected_value = round(estimated_value * win_probability / 100)
+
         response = LeadResponse.model_validate(lead)
         responses.append(
             response.model_copy(
@@ -272,6 +355,9 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "days_overdue": days_overdue,
                     "next_best_action": next_best_action,
                     "suggested_message": suggested_message,
+                    "win_probability": win_probability,
+                    "estimated_value": round(estimated_value),
+                    "expected_value": expected_value,
                 }
             )
         )
@@ -285,14 +371,19 @@ _PRIORITY_CANDIDATE_POOL_SIZE = 200
 
 
 async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list[LeadResponse]:
-    """Same ranking as GET /leads/priority (overdue tasks first, then due
-    today, then future-dated, then no next_action at all — score DESC
-    within each bucket), factored out so the workday command-mode engine
+    """Same urgency bucketing as GET /leads/priority (overdue tasks first,
+    then due today, then future-dated, then no next_action at all),
+    factored out so the workday command-mode engine
     (get_next_actionable_lead(), workday_engine.py) can reuse it without a
     second, separately-maintained copy of the bucket logic. Deliberately
     duplicates GET /leads/priority's own inline implementation rather than
     having that endpoint call this — it's already shipped and working, and
-    this round's mandate is zero regression on existing routes."""
+    this round's mandate is zero regression on existing routes.
+
+    Within each urgency bucket, ordering is money-first (revenue-
+    intelligence round): expected_value DESC, then win_probability DESC,
+    then the base score DESC as a final tiebreaker — "money × probability ×
+    urgency" instead of urgency-then-score alone."""
     candidate_pool_stmt = (
         select(Lead)
         .where(
@@ -316,5 +407,12 @@ async def rank_leads_by_priority(db: AsyncSession, organization_id: str) -> list
             return 0
         return 1 if due.date() == now.date() else 2
 
-    scored.sort(key=lambda response: (bucket(response), -response.score))
+    scored.sort(
+        key=lambda response: (
+            bucket(response),
+            -response.expected_value,
+            -response.win_probability,
+            -response.score,
+        )
+    )
     return scored

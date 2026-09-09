@@ -12,12 +12,14 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
+from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import (
     WorkdayCompleteAndNextRequest,
     WorkdayCompleteAndNextResponse,
     WorkdayNextResponse,
     WorkdayPerformanceResponse,
     WorkdaySummaryResponse,
+    WorkdayTargetResponse,
 )
 from app.services.leads.enrichment import get_lead_estimated_value
 from app.services.leads.scoring import rank_leads_by_priority, score_leads
@@ -27,6 +29,7 @@ from app.services.leads.workday_engine import (
     format_brl,
     generate_accountability_message,
     get_next_actionable_lead,
+    maybe_notify_high_value_leads,
     maybe_notify_performance_alert,
 )
 
@@ -42,6 +45,8 @@ _AT_RISK_STALE_AFTER_DAYS = 3
 _AT_RISK_POOL_SIZE = 500
 # GET /workday/summary's "top N" for high_priority_leads.
 _HIGH_PRIORITY_TOP_N = 5
+# GET /workday/target's fixed default — no per-user/org customization yet.
+_DEFAULT_DAILY_TARGET = 5
 
 # Below this computed score, a lead is "low enough" to qualify for the
 # workday queue even with no next_action set — roughly the midpoint of the
@@ -280,6 +285,40 @@ async def _count_overdue_tasks(db: AsyncSession, organization_id: str, now: dt) 
     return (await db.execute(stmt)).scalar_one()
 
 
+def _compute_revenue_at_risk(ranked: list[LeadResponse], *, now: dt, stale_cutoff: dt) -> int:
+    """"Money genuinely at risk, probability-adjusted" — contacted leads
+    that are either overdue or stale (updated_at older than stale_cutoff),
+    summed by expected_value (not the raw estimated_value
+    estimated_revenue_at_risk/estimated_revenue_lost elsewhere use). Reuses
+    whatever rank_leads_by_priority() already scored — zero extra query.
+    Shared by GET /workday/summary and .../performance."""
+    total = 0
+    for response in ranked:
+        if response.status != "contacted":
+            continue
+        is_overdue = (
+            response.next_action_due_at is not None and response.next_action_due_at < now
+        )
+        is_stale = response.updated_at < stale_cutoff
+        if is_overdue or is_stale:
+            total += response.expected_value
+    return total
+
+
+def _sum_today_potential_revenue(ranked: list[LeadResponse], *, now: dt) -> int:
+    """The Command Center's "Hoje você pode gerar R$ X" — expected_value
+    summed over today's actionable leads (overdue or due today). Reuses the
+    same already-scored ranked list _compute_revenue_at_risk does."""
+    total = 0
+    for response in ranked:
+        due = response.next_action_due_at
+        if due is None:
+            continue
+        if response.is_overdue or due.date() == now.date():
+            total += response.expected_value
+    return total
+
+
 @router.get("/summary", response_model=ApiResponse[WorkdaySummaryResponse])
 async def get_workday_summary(
     request_id: str = Depends(get_request_id),
@@ -291,14 +330,17 @@ async def get_workday_summary(
     R$-at-risk estimate — collapsed into one focus_message so the dashboard
     has a single headline to lead with instead of four separate numbers.
 
-    Five queries total, none per-row: today/overdue are plain COUNTs
+    Six queries total, none per-row (a 7th, conditional, only when a new
+    high-value alert is actually staged): today/overdue are plain COUNTs
     (backed by ix_leads_org_id_next_action_due_at, same index GET
     /leads/tasks uses); leads-at-risk is the same WHERE shape as GET
     /leads/attention (ix_leads_org_id_status_updated_at), fetched as rows
     (not just a count) since estimated_revenue_at_risk needs each one's
-    enrichment_data; high_priority_leads reuses rank_leads_by_priority()
+    enrichment_data; high_priority_leads/revenue_at_risk/
+    today_potential_revenue all reuse the one rank_leads_by_priority() call
     (candidate query + score_leads' own one extra query) — the same cost
-    GET /leads/priority already pays elsewhere on this same dashboard."""
+    GET /leads/priority already pays elsewhere on this same dashboard —
+    plus one dedup check for maybe_notify_high_value_leads()."""
     start = time.perf_counter()
     organization_id, _user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -334,6 +376,8 @@ async def get_workday_summary(
 
     ranked = await rank_leads_by_priority(db, organization_id)
     high_priority_leads = len(ranked[:_HIGH_PRIORITY_TOP_N])
+    revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+    today_potential_revenue = _sum_today_potential_revenue(ranked, now=now)
 
     focus_message = _build_focus_message(
         overdue_tasks=overdue_tasks,
@@ -341,6 +385,15 @@ async def get_workday_summary(
         leads_at_risk=leads_at_risk,
         revenue_at_risk=estimated_revenue_at_risk,
     )
+
+    # Revenue-intelligence round: a high-value lead going cold gets its own
+    # per-lead alert (distinct from the org-wide "failing" one GET
+    # /workday/performance already sends) — reuses `ranked`, no new query.
+    notified_count = await maybe_notify_high_value_leads(
+        db, organization_id=organization_id, leads=ranked, now=now
+    )
+    if notified_count:
+        await db.commit()
 
     return ApiResponse(
         success=True,
@@ -351,6 +404,8 @@ async def get_workday_summary(
             leads_at_risk=leads_at_risk,
             estimated_revenue_at_risk=estimated_revenue_at_risk,
             focus_message=focus_message,
+            revenue_at_risk=revenue_at_risk,
+            today_potential_revenue=today_potential_revenue,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -432,11 +487,14 @@ async def get_workday_performance(
     completion) is, by definition, still unresolved from at least
     yesterday — a strict subset of overdue_tasks.
 
-    Six queries total (two inside _workday_stats, two counts, one
-    ignored-leads row fetch for the revenue estimate, one dedup check for
-    the notification), none per-row. Reuses _count_overdue_tasks and
-    _workday_stats (both already used by /next and /summary) instead of
-    re-deriving overdue/streak logic a third time."""
+    Eight queries total (two inside _workday_stats, two counts, one
+    ignored-leads row fetch for the revenue estimate, two inside
+    rank_leads_by_priority for revenue_at_risk, one dedup check for the
+    notification), none per-row. Reuses _count_overdue_tasks and
+    _workday_stats (both already used by /next and /summary), plus the
+    same rank_leads_by_priority()/_compute_revenue_at_risk() pairing GET
+    /workday/summary already uses, instead of re-deriving any of this a
+    third time."""
     start = time.perf_counter()
     organization_id, user_email = _require_caller(session)
     now = dt.now(timezone.utc)
@@ -472,11 +530,16 @@ async def get_workday_performance(
     leads_ignored_yesterday = len(ignored_leads)
     estimated_revenue_lost = sum(get_lead_estimated_value(lead) for lead in ignored_leads)
 
+    at_risk_cutoff = now - timedelta(days=_AT_RISK_STALE_AFTER_DAYS)
+    ranked = await rank_leads_by_priority(db, organization_id)
+    revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+
     failure_state = detect_user_failure_state(
         completion_rate=completion_rate, overdue_tasks=overdue_tasks
     )
     accountability_message = generate_accountability_message(
         failure_state=failure_state,
+        completion_rate=completion_rate,
         overdue_tasks=overdue_tasks,
         leads_ignored_yesterday=leads_ignored_yesterday,
         estimated_revenue_lost=estimated_revenue_lost,
@@ -506,6 +569,41 @@ async def get_workday_performance(
             streak_days=streak_days,
             failure_state=failure_state,
             accountability_message=accountability_message,
+            revenue_at_risk=revenue_at_risk,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/target", response_model=ApiResponse[WorkdayTargetResponse])
+async def get_workday_target(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[WorkdayTargetResponse]:
+    """Daily gamification target — a fixed default (_DEFAULT_DAILY_TARGET,
+    no per-user/org customization yet) matched against the same
+    tasks_completed_today _workday_stats() already computes for GET
+    /workday/next and .../performance. Two queries (both inside
+    _workday_stats), no new table."""
+    start = time.perf_counter()
+    organization_id, user_email = _require_caller(session)
+    now = dt.now(timezone.utc)
+
+    completed_today, _streak_days = await _workday_stats(db, organization_id, user_email, now)
+    remaining = max(_DEFAULT_DAILY_TARGET - completed_today, 0)
+    progress = (
+        min(completed_today / _DEFAULT_DAILY_TARGET, 1.0) if _DEFAULT_DAILY_TARGET > 0 else 1.0
+    )
+
+    return ApiResponse(
+        success=True,
+        data=WorkdayTargetResponse(
+            daily_target=_DEFAULT_DAILY_TARGET,
+            completed_today=completed_today,
+            remaining=remaining,
+            progress=progress,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

@@ -73,6 +73,16 @@ class LeadResponse(BaseModel):
     # in enrichment.py), not the single first-contact-only template POST
     # /leads/{id}/generate-message uses; no extra LLM/API call either way.
     suggested_message: str | None = None
+    # Revenue-intelligence layer — all three computed at read time
+    # (compute_win_probability/get_lead_estimated_value, scoring.py), same
+    # "never persisted" pattern as score/is_overdue. estimated_value and
+    # expected_value are ints rather than this codebase's usual float money
+    # fields: both are always exact whole numbers given today's discrete
+    # company-size buckets (1000/5000/20000) and integer win_probability, so
+    # int loses nothing and matches win_probability's own type.
+    win_probability: int = 0
+    estimated_value: int = 0
+    expected_value: int = 0
     in_focus: bool = False
     company_name: str | None = None
     website: str | None = None

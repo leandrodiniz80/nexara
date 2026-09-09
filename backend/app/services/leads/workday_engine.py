@@ -21,6 +21,27 @@ _FAILING_OVERDUE_THRESHOLD = 5
 # maybe_notify_performance_alert()'s dedup window — a "failing" alert isn't
 # repeated more often than this, however often the dashboard is refreshed.
 _PERFORMANCE_ALERT_DEDUP_HOURS = 6
+# maybe_notify_high_value_leads()'s own per-lead dedup window — same 6h
+# rhythm as the org-wide performance alert above, just keyed per-lead
+# instead of per-user.
+_HIGH_VALUE_ALERT_DEDUP_HOURS = 6
+# "High-value" for the per-lead alert below — a médio/grande-porte deal
+# (COMPANY_SIZE_REVENUE_ESTIMATE), the same bucket compute_lead_score's own
+# "High revenue potential" line rewards.
+_HIGH_VALUE_ALERT_THRESHOLD = 5000.0
+# "No activity" for the per-lead alert — same 7-day window
+# compute_win_probability's own idle penalty and compute_lead_score's "Idle
+# for over a week" line already use.
+_HIGH_VALUE_ALERT_IDLE_DAYS = 7
+
+# generate_accountability_message()'s "high pressure" tier — a stricter bar
+# than detect_user_failure_state()'s own "failing" thresholds (overdue > 5,
+# completion_rate < 0.3): this is for the *worst* of an already-failing day,
+# not failing itself, so it never introduces a 4th FailureState value (the
+# frontend's failureState color-mapping stays exactly the 3 it already
+# handles).
+_HIGH_PRESSURE_OVERDUE_THRESHOLD = 8
+_HIGH_PRESSURE_COMPLETION_RATE = 0.3
 
 
 async def get_next_actionable_lead(
@@ -108,6 +129,7 @@ def detect_user_failure_state(*, completion_rate: float, overdue_tasks: int) -> 
 def generate_accountability_message(
     *,
     failure_state: FailureState,
+    completion_rate: float,
     overdue_tasks: int,
     leads_ignored_yesterday: int,
     estimated_revenue_lost: float,
@@ -121,15 +143,32 @@ def generate_accountability_message(
     only contributes revenue once it's been enriched, see
     get_lead_estimated_value()) whenever there's a real number to show;
     falls back to a plain activity-count message otherwise, in both
-    failing and at_risk."""
+    failing and at_risk.
+
+    Within "failing", a stricter "high pressure" tier (overdue >
+    _HIGH_PRESSURE_OVERDUE_THRESHOLD or completion_rate below
+    _HIGH_PRESSURE_COMPLETION_RATE) gets the harshest copy — this is a
+    messaging-only distinction, not a new failure_state value, so the
+    frontend's existing 3-way color mapping needs no change."""
     has_revenue_impact = leads_ignored_yesterday > 0 and estimated_revenue_lost > 0
+    is_high_pressure = (
+        overdue_tasks > _HIGH_PRESSURE_OVERDUE_THRESHOLD
+        or completion_rate < _HIGH_PRESSURE_COMPLETION_RATE
+    )
 
     if failure_state == "failing":
+        if is_high_pressure and has_revenue_impact:
+            return (
+                "Você está deixando dinheiro na mesa. "
+                f"R$ {format_brl(estimated_revenue_lost)} em risco agora."
+            )
         if has_revenue_impact:
             return (
                 f"Você ignorou {leads_ignored_yesterday} leads que podem gerar "
                 f"R$ {format_brl(estimated_revenue_lost)}. Aja agora antes que vire prejuízo real."
             )
+        if is_high_pressure:
+            return "Você está deixando dinheiro na mesa. Aja agora."
         return f"Você está atrasado em {overdue_tasks} leads. Aja agora antes que piore."
     if failure_state == "at_risk":
         focus_count = max(tasks_remaining_today, 1)
@@ -138,7 +177,7 @@ def generate_accountability_message(
                 f"Você ainda pode recuperar seu dia. Foque nos próximos {focus_count} leads "
                 f"antes de perder R$ {format_brl(estimated_revenue_lost)}."
             )
-        return f"Você ainda pode recuperar seu dia. Foque nos próximos {focus_count} leads."
+        return "Seu desempenho está abaixo do ideal. Foque nos próximos leads."
     return "Bom ritmo. Continue assim para fechar mais negócios hoje."
 
 
@@ -174,3 +213,59 @@ async def maybe_notify_performance_alert(
         )
     )
     return True
+
+
+async def maybe_notify_high_value_leads(
+    db: AsyncSession, *, organization_id: str, leads: list[LeadResponse], now: datetime
+) -> int:
+    """Per-lead "this one's worth acting on now" alert — fires for a
+    non-converted lead worth >= _HIGH_VALUE_ALERT_THRESHOLD that's either
+    overdue or idle for over _HIGH_VALUE_ALERT_IDLE_DAYS. Takes an
+    already-scored list (typically rank_leads_by_priority()'s own result,
+    which the caller usually already computed for something else) rather
+    than querying again — zero new candidate query, only the per-lead dedup
+    check below.
+
+    Deduped per lead_id within _HIGH_VALUE_ALERT_DEDUP_HOURS — unlike
+    maybe_notify_performance_alert()'s org-wide null-lead_id dedup, this one
+    is keyed on the specific lead, so two different high-value leads going
+    cold on the same day each get their own alert. Skips leads with no
+    owner_email — same constraint the existing notify-automation path
+    already has (UserNotification.user_email is required NOT NULL; an
+    unowned lead has nobody specific to notify persistently). Caller
+    commits; returns how many notifications were actually staged."""
+    candidates = [
+        lead
+        for lead in leads
+        if lead.status != "converted"
+        and lead.owner_email is not None
+        and lead.estimated_value >= _HIGH_VALUE_ALERT_THRESHOLD
+        and (lead.is_overdue or (now - lead.updated_at).days > _HIGH_VALUE_ALERT_IDLE_DAYS)
+    ]
+    if not candidates:
+        return 0
+
+    cutoff = now - timedelta(hours=_HIGH_VALUE_ALERT_DEDUP_HOURS)
+    lead_ids = [lead.id for lead in candidates]
+    already_notified_stmt = select(UserNotification.lead_id).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.lead_id.in_(lead_ids),
+        UserNotification.created_at >= cutoff,
+    )
+    already_notified_ids = set((await db.execute(already_notified_stmt)).scalars().all())
+
+    notified = 0
+    for lead in candidates:
+        if lead.id in already_notified_ids:
+            continue
+        days_idle = (now - lead.updated_at).days
+        db.add(
+            UserNotification(
+                organization_id=organization_id,
+                user_email=lead.owner_email,
+                lead_id=lead.id,
+                message=f"Lead de R$ {format_brl(lead.estimated_value)} parado há {days_idle} dias.",
+            )
+        )
+        notified += 1
+    return notified

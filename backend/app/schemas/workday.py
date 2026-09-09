@@ -35,6 +35,16 @@ class WorkdaySummaryResponse(BaseModel):
     leads_at_risk: int
     estimated_revenue_at_risk: float
     focus_message: str
+    # Revenue-intelligence round, both additive. revenue_at_risk is a
+    # narrower, probability-weighted figure than estimated_revenue_at_risk
+    # above: contacted leads that are overdue OR stale (vs. that field's
+    # contacted+stale-only), summed by expected_value (vs. raw estimated
+    # value) — "money genuinely at risk, probability-adjusted" rather than
+    # "money attached to leads going cold." today_potential_revenue is the
+    # Command Center's "Hoje você pode gerar R$ X": expected_value summed
+    # over today's actionable leads (overdue + due today).
+    revenue_at_risk: int = 0
+    today_potential_revenue: int = 0
 
 
 class WorkdayCompleteAndNextRequest(BaseModel):
@@ -72,3 +82,18 @@ class WorkdayPerformanceResponse(BaseModel):
     streak_days: int
     failure_state: FailureState
     accountability_message: str
+    # Same probability-weighted "contacted + (overdue or stale)" figure as
+    # WorkdaySummaryResponse.revenue_at_risk above — additive.
+    revenue_at_risk: int = 0
+
+
+class WorkdayTargetResponse(BaseModel):
+    """GET /workday/target — the daily gamification target. daily_target is
+    a fixed default for now (no per-user/org customization yet); completed_
+    today reuses the same tasks_completed_today _workday_stats() already
+    computes for GET /workday/next and .../performance."""
+
+    daily_target: int
+    completed_today: int
+    remaining: int
+    progress: float

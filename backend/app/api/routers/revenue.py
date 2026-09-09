@@ -13,6 +13,7 @@ from app.models.leads.lead import Lead
 from app.models.leads.lead_status_history import LeadStatusHistory
 from app.schemas.revenue import RevenueSummaryResponse, RevenueTrendDay
 from app.services.leads.enrichment import get_lead_estimated_value
+from app.services.leads.scoring import score_leads
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/revenue", tags=["Revenue"])
 
@@ -45,15 +46,19 @@ async def get_revenue_summary(
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[RevenueSummaryResponse]:
     """Org-wide revenue snapshot: how much is in the pipeline, how much has
-    already closed, how much was lost, and how much of the open pipeline is
-    going cold. Every R$ figure comes from get_lead_estimated_value() at
-    read time — nothing here is a stored column.
+    already closed, how much was lost, how much of the open pipeline is
+    going cold, and — probability-weighted — what the open pipeline is
+    actually forecast to yield. potential/converted/lost/at_risk come from
+    get_lead_estimated_value() (raw, unweighted) at read time;
+    expected_pipeline_revenue is score_leads()'s own probability-weighted
+    expected_value, summed over new+contacted leads.
 
-    Three queries total, none per-row: one capped row-fetch (needed for
+    Five queries total, none per-row: one capped row-fetch (needed for
     per-lead enrichment_data — potential/converted/lost/at_risk are all
-    derived from this single pass over the same rows) plus two plain
-    COUNTs for conversion_rate (accurate regardless of scale, unlike the
-    capped revenue pool)."""
+    derived from this single pass over the same rows), two plain COUNTs for
+    conversion_rate (accurate regardless of scale, unlike the capped
+    revenue pool), and score_leads()'s own two queries — reused on the same
+    `leads` list already fetched, not a second row-fetch."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
     now = datetime.now(timezone.utc)
@@ -95,6 +100,15 @@ async def get_revenue_summary(
 
     conversion_rate = converted_count / total_count if total_count > 0 else 0.0
 
+    # Revenue-intelligence round: the open pipeline's probability-weighted
+    # forecast — reuses the same `leads` pool already fetched above, scored
+    # once (two more queries, same as every other score_leads() call in
+    # this codebase) rather than a second row-fetch.
+    scored = await score_leads(db, leads)
+    expected_pipeline_revenue = sum(
+        response.expected_value for response in scored if response.status in ("new", "contacted")
+    )
+
     return ApiResponse(
         success=True,
         data=RevenueSummaryResponse(
@@ -103,6 +117,7 @@ async def get_revenue_summary(
             lost_revenue=lost_revenue,
             at_risk_revenue=at_risk_revenue,
             conversion_rate=conversion_rate,
+            expected_pipeline_revenue=expected_pipeline_revenue,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,

@@ -11,6 +11,11 @@ class RevenueSummaryResponse(BaseModel):
     lost_revenue: float
     at_risk_revenue: float
     conversion_rate: float
+    # Revenue-intelligence round, additive: the open (new + contacted)
+    # pipeline's expected_value sum — probability-weighted, unlike
+    # potential_revenue above (which is every non-lost lead's raw
+    # estimated_value, un-adjusted for how likely it is to actually close).
+    expected_pipeline_revenue: float = 0.0
 
 
 class RevenueTrendDay(BaseModel):
