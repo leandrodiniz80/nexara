@@ -17,6 +17,7 @@ import { PerformancePanel } from "@/components/dashboard/performance-panel";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
 import { RecentActivity } from "@/components/dashboard/recent-activity";
 import { RevenuePanel } from "@/components/dashboard/revenue-panel";
+import { TeamLeaderboard } from "@/components/dashboard/team-leaderboard";
 import { TodaysFocus } from "@/components/dashboard/todays-focus";
 import { UpcomingTasks } from "@/components/dashboard/upcoming-tasks";
 import { LeadDetailsModal } from "@/components/leads/lead-details-modal";
@@ -27,6 +28,7 @@ import { useToast } from "@/components/ui/toast";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
+import { getLeaderboard, getTeamSummary } from "@/lib/api/performance";
 import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
   completeLeadTask,
@@ -56,7 +58,7 @@ import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
 
 export default function DashboardPage() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
   const [detailsLead, setDetailsLead] = useState<Lead | null>(null);
@@ -171,6 +173,25 @@ export default function DashboardPage() {
   const { data: workdayTarget } = useQuery({
     queryKey: ["workday-target"],
     queryFn: getWorkdayTarget,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  // Multi-user revenue-war round — the leaderboard's own read also fires
+  // maybe_notify_underperformance() server-side (see that endpoint's own
+  // docstring), so this poll doubles as the pressure system's trigger.
+  const { data: leaderboard } = useQuery({
+    queryKey: ["performance-leaderboard"],
+    queryFn: getLeaderboard,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  const { data: teamSummary } = useQuery({
+    queryKey: ["performance-team-summary"],
+    queryFn: getTeamSummary,
     enabled: isAuthenticated,
     retry: false,
     refetchInterval: 45000,
@@ -403,6 +424,14 @@ export default function DashboardPage() {
               performance={workdayPerformance}
               summary={workdaySummary}
             />
+
+            {leaderboard && (
+              <TeamLeaderboard
+                leaderboard={leaderboard}
+                teamSummary={teamSummary}
+                currentUserEmail={user?.email}
+              />
+            )}
 
             {revenueSummary && (
               <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />
