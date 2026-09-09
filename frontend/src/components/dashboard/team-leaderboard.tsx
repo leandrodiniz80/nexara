@@ -108,7 +108,7 @@ export function TeamLeaderboard({
                     #{entry.position} {entry.name}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    {entry.responseRate.toFixed(0)}% resposta ·{" "}
+                    {entry.dealsClosed} fechados · {entry.responseRate.toFixed(0)}% resposta ·{" "}
                     {formatMinutes(entry.avgResponseTimeMinutes)} médio
                   </p>
                   {entry.badges.length > 0 && (

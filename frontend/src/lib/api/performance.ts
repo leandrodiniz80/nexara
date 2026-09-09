@@ -14,6 +14,7 @@ export interface LeaderboardEntry {
   position: number;
   commissionEstimate: number;
   badges: string[];
+  dealsClosed: number;
 }
 
 interface LeaderboardEntryDto {
@@ -25,6 +26,7 @@ interface LeaderboardEntryDto {
   position: number;
   commission_estimate: number;
   badges: string[];
+  deals_closed: number;
 }
 
 /** GET /api/v1/performance/leaderboard — Multi-user revenue-war round's
@@ -45,6 +47,7 @@ export async function getLeaderboard(): Promise<LeaderboardEntry[]> {
       position: entry.position,
       commissionEstimate: entry.commission_estimate,
       badges: entry.badges,
+      dealsClosed: entry.deals_closed,
     }));
   } catch (error) {
     throw toApiClientError(error);
