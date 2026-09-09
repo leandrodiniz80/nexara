@@ -17,11 +17,16 @@ export function LeadsKanban({
   onMove,
   onOpenDetails,
   highlightedLeadId,
+  queuePositionByLeadId,
 }: {
   leads: Lead[];
   onMove: (leadId: string, status: LeadStatus) => void;
   onOpenDetails: (lead: Lead) => void;
   highlightedLeadId?: string | null;
+  /** Execution-engine round — leadId -> 1-based position in the action
+   * queue (build_action_queue(), backend), for LeadCard's own "Posição na
+   * fila: #X" badge. Undefined/omitted leads just render without it. */
+  queuePositionByLeadId?: Record<string, number>;
 }) {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverStatus, setDragOverStatus] = useState<LeadStatus | null>(null);
@@ -83,6 +88,7 @@ export function LeadsKanban({
                     lead={lead}
                     isDragging={draggingId === lead.id}
                     isHighlighted={lead.id === highlightedLeadId}
+                    queuePosition={queuePositionByLeadId?.[lead.id]}
                     onDragStart={() => setDraggingId(lead.id)}
                     onMove={(status) => onMove(lead.id, status)}
                     onOpenDetails={() => onOpenDetails(lead)}

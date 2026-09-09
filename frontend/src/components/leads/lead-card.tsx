@@ -141,6 +141,7 @@ export function LeadCard({
   lead,
   isDragging,
   isHighlighted,
+  queuePosition,
   onDragStart,
   onMove,
   onOpenDetails,
@@ -148,6 +149,11 @@ export function LeadCard({
   lead: Lead;
   isDragging: boolean;
   isHighlighted?: boolean;
+  /** Execution-engine round — this lead's 1-based position in
+   * build_action_queue()'s Top 10 (backend), when it's in the queue at all.
+   * Undefined for a lead not in the queue (or when the caller hasn't
+   * fetched the queue) — no badge rendered either way. */
+  queuePosition?: number;
   onDragStart: () => void;
   onMove: (status: LeadStatus) => void;
   onOpenDetails: () => void;
@@ -249,6 +255,11 @@ export function LeadCard({
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {queuePosition !== undefined && (
+          <Badge variant="outline" className="border-transparent bg-primary/15 text-primary">
+            Posição na fila: #{queuePosition}
+          </Badge>
+        )}
         {lead.dealRiskLevel && lead.dealRiskLevel !== "low" && (
           <Badge
             variant="outline"

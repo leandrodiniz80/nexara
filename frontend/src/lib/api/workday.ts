@@ -85,6 +85,11 @@ export interface WorkdaySummary {
    * across every open (new/contacted) lead, not just today's actionable
    * ones the way todayPotentialRevenue above is scoped. */
   pipelineExpectedValue: number;
+  /** Execution-engine round — the one lead the Command Center forces to the
+   * front: "Próxima ação obrigatória". Null only when the action queue
+   * itself is empty (nothing next-best-action-eligible and non-converted/
+   * non-lost) — the frontend hides that section instead of rendering it. */
+  nextMandatoryLeadId: string | null;
 }
 
 interface WorkdaySummaryDto {
@@ -104,6 +109,7 @@ interface WorkdaySummaryDto {
   pending_responses_count: number;
   high_value_at_risk_count: number;
   pipeline_expected_value: number;
+  next_mandatory_lead_id: string | null;
 }
 
 /** GET /api/v1/workday/summary — the Command Center's "what does today
@@ -132,7 +138,55 @@ export async function getWorkdaySummary(): Promise<WorkdaySummary> {
       pendingResponsesCount: data.data.pending_responses_count,
       highValueAtRiskCount: data.data.high_value_at_risk_count,
       pipelineExpectedValue: data.data.pipeline_expected_value,
+      nextMandatoryLeadId: data.data.next_mandatory_lead_id,
     };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}
+
+export interface ActionQueueItem {
+  leadId: string;
+  name: string;
+  dealRiskLevel: string | null;
+  expectedValue: number;
+  nextBestAction: string | null;
+  nextBestActionType: string | null;
+  nextBestActionUrgency: string | null;
+}
+
+interface ActionQueueItemDto {
+  lead_id: string;
+  name: string;
+  deal_risk_level: string | null;
+  expected_value: number;
+  next_best_action: string | null;
+  next_best_action_type: string | null;
+  next_best_action_urgency: string | null;
+}
+
+/** GET /api/v1/workday/action-queue — Execution-engine round's "Fila de
+ * execução (Top 10)": the leads most worth acting on right now, risk-first
+ * then money-first (build_action_queue(), backend). A narrow projection,
+ * not full Lead objects — the frontend resolves leadId against whatever
+ * full leads it already has cached to open the details modal. */
+export async function getActionQueue(): Promise<ActionQueueItem[]> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<ActionQueueItemDto[]>>(
+      "/workday/action-queue"
+    );
+    if (!data.data) {
+      throw new Error("Action queue request succeeded but returned no data");
+    }
+    return data.data.map((item) => ({
+      leadId: item.lead_id,
+      name: item.name,
+      dealRiskLevel: item.deal_risk_level,
+      expectedValue: item.expected_value,
+      nextBestAction: item.next_best_action,
+      nextBestActionType: item.next_best_action_type,
+      nextBestActionUrgency: item.next_best_action_urgency,
+    }));
   } catch (error) {
     throw toApiClientError(error);
   }

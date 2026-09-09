@@ -21,6 +21,7 @@ export function CommandCenter({
   tasksCompletedToday,
   onStart,
   isStarting,
+  onOpenMandatoryLead,
 }: {
   summary: WorkdaySummary;
   /** Optional so the card still renders (with its default look) before
@@ -32,6 +33,11 @@ export function CommandCenter({
   tasksCompletedToday: number;
   onStart: () => void;
   isStarting: boolean;
+  /** Execution-engine round — "Próxima ação obrigatória"'s own button:
+   * opens summary.nextMandatoryLeadId's lead modal directly. Optional/
+   * omittable (no button rendered) when the caller hasn't resolved that id
+   * against a full Lead yet. */
+  onOpenMandatoryLead?: (leadId: string) => void;
 }) {
   const remaining = summary.overdueTasks + summary.todayTasks;
   const total = tasksCompletedToday + remaining;
@@ -49,6 +55,25 @@ export function CommandCenter({
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm font-medium text-foreground">{summary.focusMessage}</p>
+
+        {/* Execution-engine round — the queue's own mandatory pick
+            (get_next_mandatory_lead(), backend): a critical-risk lead or one
+            with a pending response over 60min, always forced to the front
+            regardless of anything else in the queue. */}
+        {summary.nextMandatoryLeadId && onOpenMandatoryLead && (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+            <p className="text-sm font-semibold text-destructive">
+              🚨 Próxima ação obrigatória
+            </p>
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() => onOpenMandatoryLead(summary.nextMandatoryLeadId!)}
+            >
+              Abrir agora
+            </Button>
+          </div>
+        )}
 
         {performance && (
           <p className={`text-sm font-semibold ${stateStyle?.text}`}>

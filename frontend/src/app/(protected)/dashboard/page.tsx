@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { ActionQueuePanel } from "@/components/dashboard/action-queue-panel";
 import { BusinessIntelligence } from "@/components/dashboard/business-intelligence";
 import { CommandCenter } from "@/components/dashboard/command-center";
 import { DashboardSkeleton } from "@/components/dashboard/dashboard-skeleton";
@@ -29,6 +30,7 @@ import {
   completeLeadTask,
   getLeadInsights,
   getLeadMetrics,
+  getLeads,
   getLeadsActivityFeed,
   getLeadsNeedingAttention,
   getLeadsPriority,
@@ -39,6 +41,7 @@ import {
 } from "@/lib/api/leads";
 import {
   completeAndNext,
+  getActionQueue,
   getWorkdayNext,
   getWorkdayPerformance,
   getWorkdaySummary,
@@ -120,6 +123,33 @@ export default function DashboardPage() {
     retry: false,
     refetchInterval: 45000,
   });
+
+  // Execution-engine round — full leads, so the mandatory-lead button and
+  // each action-queue row's own button can resolve an id into a full Lead
+  // to open in the details modal, without a per-click fetch.
+  const { data: leads } = useQuery({
+    queryKey: ["leads"],
+    queryFn: getLeads,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  const { data: actionQueue } = useQuery({
+    queryKey: ["action-queue"],
+    queryFn: getActionQueue,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  function openLeadById(leadId: string) {
+    const lead = leads?.find((item) => item.id === leadId);
+    if (lead) {
+      setIsWorkdayMode(false);
+      setIsCommandMode(false);
+      setDetailsLead(lead);
+    }
+  }
 
   // Accountability layer's own snapshot — a "failing" read also fires a
   // persistent notification server-side (deduped within 6h), so this is a
@@ -312,8 +342,11 @@ export default function DashboardPage() {
                 tasksCompletedToday={workdayStats?.tasksCompletedToday ?? 0}
                 onStart={() => commandStartMutation.mutate()}
                 isStarting={commandStartMutation.isPending}
+                onOpenMandatoryLead={openLeadById}
               />
             )}
+
+            {actionQueue && <ActionQueuePanel items={actionQueue} onOpenLead={openLeadById} />}
 
             {workdayPerformance && <PerformancePanel performance={workdayPerformance} />}
 

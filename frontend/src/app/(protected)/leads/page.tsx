@@ -17,6 +17,7 @@ import { useToast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth/auth-context";
 import { ApiClientError } from "@/lib/api/client";
 import { createLead, getLeads, updateLeadStatus, type Lead, type LeadStatus } from "@/lib/api/leads";
+import { getActionQueue } from "@/lib/api/workday";
 import { cn } from "@/lib/utils/cn";
 
 const STATUS_FILTERS: { label: string; value: "all" | LeadStatus }[] = [
@@ -75,6 +76,24 @@ export default function LeadsPage() {
     queryFn: getLeads,
     retry: false,
   });
+
+  // Execution-engine round — LeadCard's "Posição na fila: #X" badge. Not
+  // polled as aggressively as the dashboard's own action-queue read: the
+  // Pipeline View is a slower-moving, browse-oriented surface.
+  const { data: actionQueue } = useQuery({
+    queryKey: ["action-queue"],
+    queryFn: getActionQueue,
+    retry: false,
+  });
+
+  const queuePositionByLeadId = useMemo(() => {
+    if (!actionQueue) return undefined;
+    const map: Record<string, number> = {};
+    actionQueue.forEach((item, index) => {
+      map[item.leadId] = index + 1;
+    });
+    return map;
+  }, [actionQueue]);
 
   // A 401 here means the session that was valid when this page mounted
   // expired mid-visit (tokens have a 1h TTL server-side) — auto-logout
@@ -252,6 +271,7 @@ export default function LeadsPage() {
                 onMove={handleMoveLead}
                 onOpenDetails={setDetailsLead}
                 highlightedLeadId={highlightedLeadId}
+                queuePositionByLeadId={queuePositionByLeadId}
               />
             )}
           </div>
