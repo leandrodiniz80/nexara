@@ -12,6 +12,7 @@ import { NeedsAttention } from "@/components/dashboard/needs-attention";
 import { PerformancePanel } from "@/components/dashboard/performance-panel";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
 import { RecentActivity } from "@/components/dashboard/recent-activity";
+import { RevenuePanel } from "@/components/dashboard/revenue-panel";
 import { TodaysFocus } from "@/components/dashboard/todays-focus";
 import { UpcomingTasks } from "@/components/dashboard/upcoming-tasks";
 import { LeadDetailsModal } from "@/components/leads/lead-details-modal";
@@ -22,6 +23,7 @@ import { useToast } from "@/components/ui/toast";
 import { useMinimumLoadingDelay } from "@/hooks/use-minimum-loading-delay";
 import { getBusinessOverview } from "@/lib/api/billing";
 import { ApiClientError } from "@/lib/api/client";
+import { getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
   completeLeadTask,
   getLeadMetrics,
@@ -128,6 +130,24 @@ export default function DashboardPage() {
     refetchInterval: 45000,
   });
 
+  const { data: revenueSummary } = useQuery({
+    queryKey: ["revenue-summary"],
+    queryFn: getRevenueSummary,
+    enabled: isAuthenticated,
+    retry: false,
+    refetchInterval: 45000,
+  });
+
+  // Last 7 days — doesn't move within a session the way the other polled
+  // queries do, so no refetchInterval; still invalidated below wherever a
+  // status change or task completion could shift it.
+  const { data: revenueTrend } = useQuery({
+    queryKey: ["revenue-trend"],
+    queryFn: getRevenuePerformanceTrend,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
   // "Começar meu dia": fetches the one lead to work on right now, marks it
   // in_focus server-side, and opens its modal. Completing that lead's task
   // (see the modal's onTaskCompleted below) calls this again automatically
@@ -191,6 +211,7 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
       queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
       queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
+      queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
     },
   });
 
@@ -211,6 +232,7 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads"] });
       queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
       queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
+      queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
       showToast("Task completed");
     },
   });
@@ -224,6 +246,8 @@ export default function DashboardPage() {
       queryClient.invalidateQueries({ queryKey: ["leads-attention"] });
       queryClient.invalidateQueries({ queryKey: ["leads-tasks"] });
       queryClient.invalidateQueries({ queryKey: ["leads"] });
+      queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["revenue-trend"] });
       result.notifications.forEach((message) => showToast(message));
     },
   });
@@ -259,6 +283,10 @@ export default function DashboardPage() {
       >
         {leadsMetrics && (
           <div className="space-y-4">
+            {revenueSummary && (
+              <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />
+            )}
+
             {workdaySummary && (
               <CommandCenter
                 summary={workdaySummary}

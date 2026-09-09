@@ -152,6 +152,7 @@ function LeadNotesAndTasks({
       queryClient.invalidateQueries({ queryKey: ["leads-activity"] });
       queryClient.invalidateQueries({ queryKey: ["workday-summary"] });
       queryClient.invalidateQueries({ queryKey: ["workday-performance"] });
+      queryClient.invalidateQueries({ queryKey: ["revenue-summary"] });
       onTaskCompleted?.(nextLead);
     },
   });
