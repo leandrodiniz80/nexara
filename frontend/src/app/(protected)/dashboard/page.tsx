@@ -15,6 +15,7 @@ import { LearningPanel } from "@/components/dashboard/learning-panel";
 import { NeedsAttention } from "@/components/dashboard/needs-attention";
 import { PerformancePanel } from "@/components/dashboard/performance-panel";
 import { PipelineBar } from "@/components/dashboard/pipeline-bar";
+import { PressureBanner } from "@/components/dashboard/pressure-banner";
 import { RecentActivity } from "@/components/dashboard/recent-activity";
 import { RevenuePanel } from "@/components/dashboard/revenue-panel";
 import { TeamLeaderboard } from "@/components/dashboard/team-leaderboard";
@@ -35,7 +36,7 @@ import {
   getGlobalStrategy,
   getRevenueLeaks,
 } from "@/lib/api/intelligence";
-import { getLeaderboard, getTeamSummary } from "@/lib/api/performance";
+import { getLeaderboard, getPressureState, getTeamSummary } from "@/lib/api/performance";
 import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
 import {
   completeLeadTask,
@@ -159,7 +160,7 @@ export default function DashboardPage() {
 
   // Final round (Task 9) — the same low-frequency read rhythm as
   // adaptiveWeights/execInsight above.
-  const { data: aggressionLevel } = useQuery({
+  const { data: aggressionState } = useQuery({
     queryKey: ["intelligence-aggression-level"],
     queryFn: getAggressionLevel,
     enabled: isAuthenticated,
@@ -176,6 +177,15 @@ export default function DashboardPage() {
   const { data: revenueLeaks } = useQuery({
     queryKey: ["intelligence-revenue-leaks"],
     queryFn: getRevenueLeaks,
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  // Sales Pressure Engine (final round, Task 1/8) — the calling user's
+  // own behavioral-control classification, for the Pressure Banner.
+  const { data: pressureState } = useQuery({
+    queryKey: ["performance-pressure-state"],
+    queryFn: getPressureState,
     enabled: isAuthenticated,
     retry: false,
   });
@@ -487,6 +497,8 @@ export default function DashboardPage() {
               <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />
             )}
 
+            <PressureBanner pressureState={pressureState} />
+
             {workdaySummary && (
               <CommandCenter
                 summary={workdaySummary}
@@ -498,7 +510,8 @@ export default function DashboardPage() {
                 execInsight={execInsight}
                 adaptiveWeights={adaptiveWeights}
                 hasRecentReassignments={hasRecentReassignments}
-                aggressionLevel={aggressionLevel ?? undefined}
+                aggressionLevel={aggressionState?.level}
+                revenueMode={aggressionState?.revenueMode}
                 globalStrategy={globalStrategy ?? undefined}
                 revenueLeakValue={revenueLeaks?.totalLeakValue}
               />

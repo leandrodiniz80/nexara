@@ -92,17 +92,28 @@ export async function getGlobalStrategy(): Promise<GlobalStrategy | null> {
 }
 
 export type AggressionLevel = "low" | "medium" | "high" | "extreme";
+/** compute_revenue_mode()'s own relabeling of AggressionLevel (final
+ * round, Task 6/8) — same underlying signal, "efficiency"/"balanced"/
+ * "aggressive" vocabulary instead, for the Command Center's own Revenue
+ * Mode indicator. */
+export type RevenueMode = "efficiency" | "balanced" | "aggressive";
+
+export interface AggressionState {
+  level: AggressionLevel;
+  revenueMode: RevenueMode;
+}
 
 /** GET /api/v1/intelligence/aggression-level — Dynamic Aggression Mode
  * (final round, Task 3/8): how hard the system should be pushing right
  * now, derived from today's lost opportunity and the Revenue Simulation
- * Engine's own gap. */
-export async function getAggressionLevel(): Promise<AggressionLevel | null> {
+ * Engine's own gap, plus its own revenue_mode relabeling. */
+export async function getAggressionLevel(): Promise<AggressionState | null> {
   try {
-    const { data } = await apiClient.get<ApiResponse<{ level: AggressionLevel }>>(
-      "/intelligence/aggression-level"
-    );
-    return data.data?.level ?? null;
+    const { data } = await apiClient.get<
+      ApiResponse<{ level: AggressionLevel; revenue_mode: RevenueMode }>
+    >("/intelligence/aggression-level");
+    if (!data.data) return null;
+    return { level: data.data.level, revenueMode: data.data.revenue_mode };
   } catch (error) {
     throw toApiClientError(error);
   }

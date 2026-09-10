@@ -122,6 +122,13 @@ export interface Lead {
    * lead's own expectedValue. Always >= 0. Powers LeadCard's own "⚠️
    * Perdendo R$ X" badge. */
   opportunityCost: number;
+  /** Execution Chain Engine (final round, Task 7/8) — "step X of Y"
+   * through this lead's own follow-up cadence (message -> call ->
+   * meeting -> close, or whichever compute_execution_chain_progress()
+   * picked for this lead's response state). Both null together whenever
+   * there's no real chain to show (converted/lost). */
+  chainStep: number | null;
+  chainTotal: number | null;
 }
 
 interface EnrichmentDataDto {
@@ -174,6 +181,8 @@ export interface LeadDto {
   created_at: string;
   updated_at: string;
   opportunity_cost: number;
+  chain_step: number | null;
+  chain_total: number | null;
 }
 
 export function toLead(dto: LeadDto): Lead {
@@ -223,6 +232,8 @@ export function toLead(dto: LeadDto): Lead {
     createdAt: dto.created_at,
     updatedAt: dto.updated_at,
     opportunityCost: dto.opportunity_cost,
+    chainStep: dto.chain_step,
+    chainTotal: dto.chain_total,
   };
 }
 

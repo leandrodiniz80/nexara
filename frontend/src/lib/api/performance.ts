@@ -109,3 +109,25 @@ export async function getTeamSummary(): Promise<TeamSummary> {
     throw toApiClientError(error);
   }
 }
+
+export type PressureStateValue = "leader" | "neutral" | "at_risk" | "underperforming";
+
+export interface PressureState {
+  state: PressureStateValue;
+  message: string;
+}
+
+/** GET /api/v1/performance/pressure-state — Sales Pressure Engine (final
+ * round, Task 1/8): the calling user's own behavioral-control
+ * classification, for the dashboard's per-user Pressure Banner. */
+export async function getPressureState(): Promise<PressureState | null> {
+  try {
+    const { data } = await apiClient.get<ApiResponse<{ state: PressureStateValue; message: string }>>(
+      "/performance/pressure-state"
+    );
+    if (!data.data) return null;
+    return { state: data.data.state, message: data.data.message };
+  } catch (error) {
+    throw toApiClientError(error);
+  }
+}

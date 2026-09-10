@@ -284,6 +284,13 @@ export function LeadCard({
             Posição na fila: #{queuePosition}
           </Badge>
         )}
+        {/* Execution Chain Engine (final round, Task 7/8) — "step X of Y"
+            through this lead's own follow-up cadence. */}
+        {lead.chainStep !== null && lead.chainTotal !== null && (
+          <Badge variant="outline" className="border-transparent bg-muted text-muted-foreground">
+            ⛓️ Etapa {lead.chainStep}/{lead.chainTotal}
+          </Badge>
+        )}
         {lead.dealRiskLevel && lead.dealRiskLevel !== "low" && (
           <Badge
             variant="outline"

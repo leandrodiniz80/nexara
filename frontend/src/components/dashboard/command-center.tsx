@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { AggressionLevel, GlobalStrategy } from "@/lib/api/intelligence";
+import type { AggressionLevel, GlobalStrategy, RevenueMode } from "@/lib/api/intelligence";
 import type { FailureState, WorkdayPerformance, WorkdaySummary } from "@/lib/api/workday";
 
 function formatBRL(value: number): string {
@@ -85,6 +85,22 @@ const STRATEGY_FOCUS_LABEL_PT: Record<GlobalStrategy["focus"], string> = {
   meetings: "Reuniões",
 };
 
+// Revenue Maximization Mode indicator (final round, Task 6/8/9) —
+// compute_revenue_mode()'s own vocabulary, the prompt's own literal
+// emoji pairing (🔥 AGGRESSIVE / ⚖️ BALANCED) plus a third for the calm
+// end of the same scale.
+const REVENUE_MODE_ICON: Record<RevenueMode, string> = {
+  efficiency: "💡",
+  balanced: "⚖️",
+  aggressive: "🔥",
+};
+
+const REVENUE_MODE_LABEL: Record<RevenueMode, string> = {
+  efficiency: "EFFICIENCY",
+  balanced: "BALANCED",
+  aggressive: "AGGRESSIVE",
+};
+
 export function CommandCenter({
   summary,
   performance,
@@ -96,6 +112,7 @@ export function CommandCenter({
   adaptiveWeights,
   hasRecentReassignments,
   aggressionLevel,
+  revenueMode,
   globalStrategy,
   revenueLeakValue,
 }: {
@@ -129,6 +146,10 @@ export function CommandCenter({
   /** GET /intelligence/aggression-level (final round, Task 9) — backs
    * "🔥 Modo atual: EXTREMO." */
   aggressionLevel?: AggressionLevel;
+  /** Same endpoint's own revenue_mode relabeling (final round, Task 6/8/9)
+   * — backs the Revenue Mode indicator (🔥 AGGRESSIVE / ⚖️ BALANCED /
+   * 💡 EFFICIENCY). */
+  revenueMode?: RevenueMode;
   /** GET /intelligence/global-strategy (final round, Task 9) — backs
    * "🎯 Foco do sistema: Ligações." */
   globalStrategy?: GlobalStrategy;
@@ -258,6 +279,11 @@ export function CommandCenter({
         {aggressionLevel && (
           <p className={`text-sm font-semibold ${AGGRESSION_STYLE[aggressionLevel]}`}>
             🔥 Modo atual: {AGGRESSION_LABEL_PT[aggressionLevel]}
+          </p>
+        )}
+        {revenueMode && (
+          <p className={`text-sm font-semibold ${AGGRESSION_STYLE[aggressionLevel ?? "medium"]}`}>
+            {REVENUE_MODE_ICON[revenueMode]} Modo de receita: {REVENUE_MODE_LABEL[revenueMode]}
           </p>
         )}
         {globalStrategy && (
