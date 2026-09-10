@@ -193,6 +193,14 @@ class LeadResponse(BaseModel):
     # a second query" rationale as acceleration_mode above), true whenever
     # the org's whole open pipeline is running structurally thin.
     hunter_mode: bool = False
+    # Execution Chain Engine (Task 7, final round) — compute_execution_
+    # chain_progress() (scoring.py): "step X of Y" through this lead's own
+    # generate_follow_up_sequence() cadence, for LeadCard's chain-progress
+    # display. Both None together whenever there's no real chain to show
+    # (converted/lost, or an empty sequence) — never one without the
+    # other.
+    chain_step: int | None = None
+    chain_total: int | None = None
 
 
 class LeadStatusUpdateResponse(BaseModel):

@@ -713,6 +713,40 @@ def generate_follow_up_sequence(
     return follow_up_sequence_for_state(lead_response_state)
 
 
+def compute_execution_chain_progress(
+    lead: Lead, *, lead_response_state: str, now: datetime
+) -> dict | None:
+    """Execution Chain Engine (Task 7, final round) — "step X of Y" for
+    the frontend's LeadCard chain-progress display (message -> call ->
+    meeting -> close, or whichever generate_follow_up_sequence() picked
+    for this lead's own response state), derived from that same cadence
+    plus how many days have elapsed since lead.created_at — the same
+    day-offset anchor that function's own docstring establishes.
+    Deliberately time-based, not a live count of actually-executed
+    action_* rows: score_leads() already reads a large enough set of
+    aggregates for every batch, and a further per-lead action-count query
+    for a purely cosmetic progress indicator would cost more than the
+    display is worth (this codebase's own "keep performance scalable"
+    rule) — "how far the calendar says this lead should be" is a
+    close-enough approximation of "how far it actually is," same spirit
+    as every other cheap proxy already established here (compute_
+    forecast_value()'s own decay multipliers, for one; auto_execute_
+    engine()'s own _cadence_steps_done_by_lead(), execution_engine.py,
+    is the more precise, query-backed version of this same idea, used
+    there because it gates a real mutation rather than a display).
+
+    None for a converted/lost lead (nothing left to progress through) or
+    one with an empty sequence."""
+    if lead.status in ("converted", "lost"):
+        return None
+    sequence = follow_up_sequence_for_state(lead_response_state)
+    if not sequence:
+        return None
+    days_elapsed = (now - lead.created_at).days
+    current_step = sum(1 for step in sequence if step["day_offset"] <= days_elapsed)
+    return {"step": max(current_step, 1), "total": len(sequence)}
+
+
 def compute_lead_score(
     lead: Lead,
     *,
@@ -1600,8 +1634,72 @@ def _clamp_adaptive_weight(rate: float, baseline: float) -> float:
     return round(max(_ADAPTIVE_WEIGHT_MIN, min(_ADAPTIVE_WEIGHT_MAX, rate / baseline)), 2)
 
 
+# A/B Test Engine's own blend (Task 4, final round) — conversion rate and
+# revenue share weighted evenly (50/50): a channel can close more OFTEN
+# while generating less MONEY overall (a smaller average deal size), or
+# vice versa — same distinction _REVENUE_LEARNING_BONUS's own comment
+# (compute_lead_score()) already draws between success-rate learning and
+# revenue-attribution learning, just combined into one number here instead
+# of two separate bonuses.
+_CHANNEL_AB_CONVERSION_WEIGHT = 0.5
+_CHANNEL_AB_REVENUE_WEIGHT = 0.5
+
+
+def compute_channel_ab_performance(
+    action_effectiveness: ActionEffectivenessResponse,
+    revenue_attribution: RevenueAttributionResponse,
+) -> dict[str, dict]:
+    """A/B Test Engine (Task 4, final round) — combines two already-
+    computed org-wide signals (no new query, both already fetched by
+    score_leads() every batch) into one per-channel comparison, keyed by
+    the action_type vocabulary (call_now/send_message/schedule_meeting):
+    conversion_rate (ActionEffectivenessResponse's own success rate,
+    0-100 or None) and revenue (RevenueAttributionResponse's own
+    revenue_by_action, translated via ACTION_TYPE_TO_REVENUE_LABEL) side
+    by side, plus a combined `score` (0-100) blending conversion share and
+    revenue share evenly — see _CHANNEL_AB_CONVERSION_WEIGHT/_REVENUE_WEIGHT's
+    own comment for why this is one number instead of two that could
+    disagree. Feeds compute_adaptive_weights()'s own action:{action_type}
+    keys below instead of the plain success rate alone, so "boost the
+    best performing channel, penalize the weakest" (this round's own ask)
+    reflects both signals, not just one.
+
+    All three channels always get an entry (revenue defaults to 0.0,
+    conversion_rate stays None where there's no real data) so a caller
+    never has to special-case a missing key — just an honest "no signal"
+    reading where one doesn't exist yet."""
+    rates = {
+        "call_now": action_effectiveness.call_success_rate,
+        "send_message": action_effectiveness.message_success_rate,
+        "schedule_meeting": action_effectiveness.meeting_success_rate,
+    }
+    max_revenue = max(revenue_attribution.revenue_by_action.values(), default=0.0)
+
+    performance: dict[str, dict] = {}
+    for action_type, rate in rates.items():
+        label = ACTION_TYPE_TO_REVENUE_LABEL.get(action_type)
+        revenue = revenue_attribution.revenue_by_action.get(label, 0.0) if label else 0.0
+        revenue_share = (revenue / max_revenue) if max_revenue > 0 else 0.0
+        conversion_share = (rate / 100) if rate is not None else 0.0
+        combined_score = round(
+            (conversion_share * _CHANNEL_AB_CONVERSION_WEIGHT + revenue_share * _CHANNEL_AB_REVENUE_WEIGHT)
+            * 100,
+            1,
+        )
+        performance[action_type] = {
+            "conversion_rate": rate,
+            "revenue": revenue,
+            "score": combined_score,
+        }
+    return performance
+
+
 async def compute_adaptive_weights(
-    db: AsyncSession, organization_id: str, *, action_effectiveness: ActionEffectivenessResponse
+    db: AsyncSession,
+    organization_id: str,
+    *,
+    action_effectiveness: ActionEffectivenessResponse,
+    revenue_attribution: RevenueAttributionResponse,
 ) -> dict[str, float]:
     """Adaptive Scoring Weights (Task 1, Adaptive Intelligence round) —
     mines the last _ADAPTIVE_WEIGHTS_WINDOW_DAYS (30) of real lead_won/
@@ -1717,17 +1815,21 @@ async def compute_adaptive_weights(
             fast_response_won / len(fast_response_in_scope), baseline_rate
         )
 
-    action_rates = {
-        "call_now": action_effectiveness.call_success_rate,
-        "send_message": action_effectiveness.message_success_rate,
-        "schedule_meeting": action_effectiveness.meeting_success_rate,
-    }
-    real_action_rates = [rate for rate in action_rates.values() if rate is not None]
-    if real_action_rates:
-        action_baseline = sum(real_action_rates) / len(real_action_rates)
-        for action_type, rate in action_rates.items():
-            if rate is not None:
-                weights[f"action:{action_type}"] = _clamp_adaptive_weight(rate, action_baseline)
+    # A/B Test Engine (Task 4, final round) — action:{action_type} now
+    # rescaled by compute_channel_ab_performance()'s own combined
+    # conversion+revenue score, not conversion rate alone (see that
+    # function's own docstring for why the two can disagree and why a
+    # blend is the more complete "boost the best, penalize the weakest"
+    # reading this round's own ask calls for).
+    channel_performance = compute_channel_ab_performance(action_effectiveness, revenue_attribution)
+    real_scores = [
+        entry["score"] for entry in channel_performance.values() if entry["conversion_rate"] is not None
+    ]
+    if real_scores:
+        action_baseline = sum(real_scores) / len(real_scores)
+        for action_type, entry in channel_performance.items():
+            if entry["conversion_rate"] is not None:
+                weights[f"action:{action_type}"] = _clamp_adaptive_weight(entry["score"], action_baseline)
 
     return weights
 
@@ -1965,6 +2067,120 @@ def top_revenue_bucket(revenue_by_bucket: dict[str, float]) -> str | None:
     if not revenue_by_bucket or not any(revenue_by_bucket.values()):
         return None
     return max(revenue_by_bucket, key=revenue_by_bucket.get)
+
+
+# Segment Strategy Engine's own bars (Task 5, final round) — same
+# "too little data, no opinion" guard compute_adaptive_weights() already
+# applies (_ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE), kept as its own literal
+# here since the two functions measure different things (win-rate signal
+# strength vs. a plain count of wins) and shouldn't silently move together.
+_SEGMENT_STRATEGY_MIN_SAMPLE_SIZE = 3
+_SEGMENT_STRATEGY_FAST_TIMING_DAYS = 3
+
+
+async def compute_segment_strategy(db: AsyncSession, organization_id: str) -> dict[str, dict]:
+    """Segment Strategy Engine (Task 5, final round) — per-segment
+    (industry, company_size) recommendation, keyed "industry:{value}"/
+    "company_size:{value}" (same key format compute_adaptive_weights()
+    already establishes): best_action (whichever action_call/
+    action_message/action_meeting preceded the most conversions for that
+    segment value — same "last action before conversion" inference
+    compute_revenue_attribution() already uses), best_timing ("fast" when
+    that segment's own average time-to-close is under _SEGMENT_STRATEGY_
+    FAST_TIMING_DAYS, else "standard"), best_urgency ("high" alongside a
+    fast timing, "medium" otherwise). Requires
+    _SEGMENT_STRATEGY_MIN_SAMPLE_SIZE real wins for a segment value before
+    it earns an entry at all — a value with fewer is silently omitted, not
+    given a low-confidence guess.
+
+    All-time window (not the last 30 days compute_adaptive_weights() uses)
+    — a segment's own winning pattern is a slower-moving signal than the
+    realtime-relevant weights that function tracks, so it doesn't need to
+    reset on the same short cycle. Three queries regardless of org size:
+    one lead_won scan, one Lead row-fetch for those leads, one action_*
+    scan scoped to just their ids — same shape compute_revenue_
+    attribution() already uses."""
+    won_stmt = select(LeadActivityLog.lead_id, LeadActivityLog.duration_seconds).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type == "lead_won",
+    )
+    won_rows = (await db.execute(won_stmt)).all()
+    if not won_rows:
+        return {}
+
+    time_to_close_by_lead = {
+        lead_id: duration_seconds / 86400
+        for lead_id, duration_seconds in won_rows
+        if duration_seconds is not None
+    }
+    won_lead_ids = [lead_id for lead_id, _duration_seconds in won_rows]
+
+    leads_stmt = select(Lead).where(Lead.id.in_(won_lead_ids))
+    won_leads = (await db.execute(leads_stmt)).scalars().all()
+    leads_by_id = {lead.id: lead for lead in won_leads}
+
+    actions_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.lead_id.in_(won_lead_ids),
+        LeadActivityLog.event_type.in_(ACTION_EVENT_TYPES),
+    )
+    action_rows = (await db.execute(actions_stmt)).all()
+
+    last_action_event_type: dict = {}
+    last_action_at: dict = {}
+    for lead_id, event_type, created_at in action_rows:
+        lead = leads_by_id.get(lead_id)
+        if lead is None or created_at > lead.updated_at:
+            continue  # logged after conversion — not what led to it
+        current = last_action_at.get(lead_id)
+        if current is None or created_at > current:
+            last_action_at[lead_id] = created_at
+            last_action_event_type[lead_id] = event_type
+
+    action_wins_by_segment: dict[str, dict[str, int]] = {}
+    close_days_by_segment: dict[str, list[float]] = {}
+
+    for lead in won_leads:
+        if not lead.enrichment_data:
+            continue
+        event_type = last_action_event_type.get(lead.id)
+        if event_type is None:
+            continue
+        action_type = ACTION_EVENT_TYPE_TO_ACTION_TYPE.get(event_type)
+        if action_type is None:
+            continue
+
+        segment_keys = []
+        industry = lead.enrichment_data.get("industry")
+        company_size = lead.enrichment_data.get("company_size")
+        if industry:
+            segment_keys.append(f"industry:{industry}")
+        if company_size:
+            segment_keys.append(f"company_size:{company_size}")
+
+        close_days = time_to_close_by_lead.get(lead.id)
+        for segment_key in segment_keys:
+            wins = action_wins_by_segment.setdefault(segment_key, {})
+            wins[action_type] = wins.get(action_type, 0) + 1
+            if close_days is not None:
+                close_days_by_segment.setdefault(segment_key, []).append(close_days)
+
+    strategy: dict[str, dict] = {}
+    for segment_key, wins in action_wins_by_segment.items():
+        if sum(wins.values()) < _SEGMENT_STRATEGY_MIN_SAMPLE_SIZE:
+            continue
+        best_action = max(wins, key=wins.get)
+        close_days = close_days_by_segment.get(segment_key, [])
+        avg_close_days = sum(close_days) / len(close_days) if close_days else None
+        is_fast = avg_close_days is not None and avg_close_days < _SEGMENT_STRATEGY_FAST_TIMING_DAYS
+        strategy[segment_key] = {
+            "best_action": best_action,
+            "best_timing": "fast" if is_fast else "standard",
+            "best_urgency": "high" if is_fast else "medium",
+        }
+    return strategy
 
 
 async def compute_revenue_summary(
@@ -2267,6 +2483,7 @@ def compute_action_type_and_urgency(
     hunter_mode: bool = False,
     aggression_level: str | None = None,
     global_strategy_focus: str | None = None,
+    segment_strategy: dict[str, dict] | None = None,
 ) -> tuple[str | None, str | None]:
     """AI Deal Coach's action recommendation — collapses risk_level (plus
     the lead's own status) into one concrete next action + urgency tag for
@@ -2333,7 +2550,20 @@ def compute_action_type_and_urgency(
     already does, just checked first since it's the more holistic signal
     (revenue + response rate + win probability together, not revenue
     alone) — "meetings" isn't handled here (only calls/messages), so it
-    falls through to the existing logic below unchanged."""
+    falls through to the existing logic below unchanged.
+
+    Segment Strategy Engine (Task 5, final round): segment_strategy
+    (compute_segment_strategy()'s own {"industry:{value}": {...},
+    "company_size:{value}": {...}} dict) is checked BEFORE
+    global_strategy_focus — a proven winning pattern for this lead's own
+    specific industry/company_size is a more specific, more authoritative
+    signal than an org-wide blanket preference. industry checked before
+    company_size when both have an entry (a whole sector's own pattern
+    reads as a stronger signal than a size bracket alone, same "more
+    specific wins" spirit). best_urgency from that segment's own entry
+    overrides risk_level's own urgency here too — a segment known to close
+    fast deserves that urgency regardless of this one lead's own risk
+    tier."""
     if lead.status == "lost":
         return "drop_lead", "low"
     if lead.status == "converted":
@@ -2348,6 +2578,20 @@ def compute_action_type_and_urgency(
         return "call_now", "high"
 
     urgency = "high" if risk_level == "high" else "medium" if risk_level == "medium" else "low"
+
+    if segment_strategy and lead.enrichment_data:
+        industry = lead.enrichment_data.get("industry")
+        company_size = lead.enrichment_data.get("company_size")
+        segment_entry = (
+            segment_strategy.get(f"industry:{industry}")
+            or segment_strategy.get(f"company_size:{company_size}")
+        )
+        if segment_entry and segment_entry["best_action"] in (
+            "call_now",
+            "send_message",
+            "schedule_meeting",
+        ):
+            return segment_entry["best_action"], segment_entry["best_urgency"]
 
     if global_strategy_focus == "calls":
         return "call_now", urgency
@@ -2456,8 +2700,18 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     top_combination = revenue_attribution.top_combination
     acceleration_mode = await compute_acceleration_mode(db, organization_id)
     hunter_mode = await compute_hunter_mode(db, organization_id)
+    # Segment Strategy Engine (Task 5, final round) — no already-scored
+    # `leads` dependency (unlike compute_global_strategy()/compute_
+    # aggression_level(), which both need score_leads()'s own output as
+    # their own input and so can't run from inside it — see apply_
+    # strategy_override()'s own docstring), so this one is safe to
+    # compute here and apply on every read, same as adaptive_weights.
+    segment_strategy = await compute_segment_strategy(db, organization_id)
     adaptive_weights = await compute_adaptive_weights(
-        db, organization_id, action_effectiveness=action_effectiveness
+        db,
+        organization_id,
+        action_effectiveness=action_effectiveness,
+        revenue_attribution=revenue_attribution,
     )
     # Real-Time Learning Engine (Task 1, final round) — the process-local
     # realtime cache overrides the batch figure key-for-key wherever it has
@@ -2655,6 +2909,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             acceleration_mode=acceleration_mode,
             win_probability=win_probability,
             hunter_mode=hunter_mode,
+            segment_strategy=segment_strategy,
         )
         if is_low_potential:
             deal_risk_level = "low"
@@ -2708,6 +2963,12 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             lead,
             avg_time_to_close_days=insights.avg_time_to_close_days,
             win_probability=win_probability,
+        )
+
+        # Execution Chain Engine (Task 7, final round) — "step X of Y"
+        # for LeadCard's own chain-progress display.
+        chain_progress = compute_execution_chain_progress(
+            lead, lead_response_state=lead_response_state, now=now
         )
 
         next_best_action = compute_next_best_action(
@@ -2784,6 +3045,8 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
                     "momentum_score": momentum_score,
                     "lead_close_date_prediction": close_date_prediction,
                     "hunter_mode": hunter_mode,
+                    "chain_step": chain_progress["step"] if chain_progress else None,
+                    "chain_total": chain_progress["total"] if chain_progress else None,
                 }
             )
         )
@@ -3045,6 +3308,39 @@ def compute_aggression_level(*, lost_opportunity_today: int, current_expected: i
     if delta <= 0 and lost_opportunity_today <= 0:
         return "low"
     return "medium"
+
+
+# Revenue Maximization Mode's own mapping (Task 6, final round) —
+# deliberately NOT a second, independent "gap vs target" computation:
+# compute_aggression_level() just above already answers exactly that
+# question (its own gap_ratio/lost_ratio math, one query-free pure
+# function), and a second, differently-tuned engine measuring the same
+# thing under a different vocabulary would only invite the two to quietly
+# disagree over time. This is a one-line relabeling for a caller/UI that
+# wants the "efficiency/balanced/aggressive" vocabulary this round's own
+# spec asks for instead of aggression_level's four-tier one — same
+# underlying signal, different words for it.
+_REVENUE_MODE_BY_AGGRESSION_LEVEL = {
+    "low": "efficiency",
+    "medium": "balanced",
+    "high": "balanced",
+    "extreme": "aggressive",
+}
+
+
+def compute_revenue_mode(aggression_level: str) -> str:
+    """Revenue Maximization Mode (Task 6, final round) — "efficiency"/
+    "balanced"/"aggressive" from compute_aggression_level()'s own four-tier
+    output (see _REVENUE_MODE_BY_AGGRESSION_LEVEL's own comment for why
+    this reuses that computation instead of re-deriving "gap vs target"
+    a second time). Effect on scoring/urgency/execution aggressiveness is
+    the SAME effect aggression_level already has throughout this module
+    (compute_lead_score()'s adaptive-weight rescaling, compute_action_
+    type_and_urgency()'s forced call_now at "extreme," auto_execute_
+    engine()'s own execution volume) — this function exists purely to
+    expose that same behavior under the vocabulary this round's own
+    Command Center indicator asks for."""
+    return _REVENUE_MODE_BY_AGGRESSION_LEVEL.get(aggression_level, "balanced")
 
 
 # Revenue Leak Detector's own thresholds (Task 5, final round) —

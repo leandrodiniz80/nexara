@@ -38,6 +38,12 @@ from app.services.leads.scoring import (
     score_leads,
     top_revenue_bucket,
 )
+from app.services.leads.team_performance import (
+    compute_user_performance,
+    reassign_leads_if_needed,
+    reassignment_check_due,
+    score_org_leads,
+)
 from app.services.leads.workday_engine import (
     build_action_queue,
     complete_lead_task,
@@ -672,7 +678,34 @@ async def get_workday_summary(
     notified_count += await maybe_notify_focus_shift(
         db, organization_id=organization_id, user_email=user_email, leads=ranked, now=now
     )
-    if notified_count or auto_executed_count:
+    # Continuous Reassignment Engine (Task 2, final round) — the other
+    # entry point (besides GET /performance/leaderboard) this "run
+    # continuously, not just from one gated admin page" check now also
+    # fires from, gated behind reassignment_check_due()'s own per-org
+    # cooldown so this endpoint doesn't pay for a full team-performance
+    # computation (its own score_leads() pass) on every single dashboard
+    # load — only once per cooldown window, org-wide, regardless of how
+    # many different pages hit it. Deliberately its own score_org_leads()
+    # pass, not `ranked` (rank_leads_by_priority()'s own candidate pool
+    # excludes converted leads and caps at 200 by priority order) — the
+    # reassignment engine needs the same full, unfiltered org pool
+    # compute_user_performance() itself scores from, or it would
+    # systematically miss high-value leads that just didn't make this
+    # request's own top-200 priority cut.
+    reassigned_count = 0
+    if reassignment_check_due(organization_id, now):
+        org_scored_leads = await score_org_leads(db, organization_id)
+        team_performance = await compute_user_performance(
+            db, organization_id, leads=org_scored_leads
+        )
+        reassigned_count = await reassign_leads_if_needed(
+            db,
+            organization_id=organization_id,
+            leads=org_scored_leads,
+            user_performance=team_performance,
+        )
+
+    if notified_count or auto_executed_count or reassigned_count:
         await db.commit()
 
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)

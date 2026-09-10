@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -10,7 +10,7 @@ from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
-from app.services.leads.enrichment import format_brl
+from app.services.leads.enrichment import format_brl, generate_smart_message
 from app.services.leads.scoring import follow_up_sequence_for_state, update_adaptive_weights_realtime
 
 # The execution-assistance round's own UserNotification message prefix —
@@ -184,25 +184,51 @@ AUTO_ACTION_EVENT_TYPE_BY_ACTION = {
 }
 
 
-def _due_cadence_meeting(response: LeadResponse, now: datetime) -> bool:
-    """Autonomous Cadence Execution (Task 3, Adaptive Intelligence round)
-    — true when generate_follow_up_sequence()'s own cadence table
-    (follow_up_sequence_for_state(), scoring.py) has a schedule_meeting
-    step due *exactly* today, using response.created_at as the same
-    day-0 anchor that function's own docstring establishes (no separate
-    "sequence started" column exists). "Exactly," not "on or after": a
-    dashboard visit on any other day simply misses that one step — same
-    "close enough to act on" bar every other cheap approximation in this
-    codebase already accepts, rather than firing the same step again on
-    every later visit. Never returns true for call_now — the cadence
-    table's own call_now step is structurally excluded here (this function
-    only ever checks for "schedule_meeting"), so this can't be used to
-    accidentally auto-call regardless of how it's wired up."""
-    days_elapsed = (now - response.created_at).days
-    return any(
-        step["day_offset"] == days_elapsed and step["action"] == "schedule_meeting"
-        for step in follow_up_sequence_for_state(response.lead_response_state)
+async def _cadence_steps_done_by_lead(db: AsyncSession, lead_ids: list) -> dict:
+    """Per-lead execution memory for the Smart Follow-up cadence (Task 3,
+    final round) — LeadActivityLog IS the memory, no new column needed:
+    auto_execute_engine() below only ever fires generate_follow_up_
+    sequence()'s own steps (scoring.py) in order, one at a time per call,
+    so the count of a lead's own action_auto_message/action_auto_meeting
+    rows already logged doubles as exactly how many cadence steps have
+    executed for it so far — a plain grouped count, one query regardless
+    of batch size."""
+    if not lead_ids:
+        return {}
+    stmt = (
+        select(LeadActivityLog.lead_id, func.count(LeadActivityLog.id))
+        .where(
+            LeadActivityLog.lead_id.in_(lead_ids),
+            LeadActivityLog.event_type.in_(list(AUTO_ACTION_EVENT_TYPE_BY_ACTION.values())),
+        )
+        .group_by(LeadActivityLog.lead_id)
     )
+    return dict((await db.execute(stmt)).all())
+
+
+def _next_due_cadence_action(response: LeadResponse, steps_done: int, now: datetime) -> str | None:
+    """Full Autonomous Cadence Execution (Task 3, final round) — the next
+    generate_follow_up_sequence() step (scoring.py) not yet executed for
+    this lead, if its own day has arrived. "Arrived" (days_elapsed >=
+    day_offset), not "exactly today" — a real upgrade over this
+    function's own previous exact-day-only check, made safe now that
+    steps_done (from _cadence_steps_done_by_lead() above) gives real
+    per-lead memory instead of relying on "did today happen to match."
+    None once every step in the sequence is already done, or the lead's
+    own response state changed the sequence out from under an
+    in-progress index (steps_done >= len(sequence) covers both). Never
+    returns "call_now" — the only two actions this can ever produce are
+    send_message/schedule_meeting, the same hard "never auto-call"
+    guarantee this function's caller already relies on."""
+    sequence = follow_up_sequence_for_state(response.lead_response_state)
+    if steps_done >= len(sequence):
+        return None
+    next_step = sequence[steps_done]
+    if (now - response.created_at).days < next_step["day_offset"]:
+        return None
+    if next_step["action"] == "call_now":
+        return None
+    return next_step["action"]
 
 
 async def auto_execute_engine(
@@ -245,18 +271,26 @@ async def auto_execute_engine(
          all) — a deal this close to closing gets its meeting booked
          regardless of how overdue it's become, while the org is behind
          target.
-      3. Autonomous Cadence Execution (Task 3, Adaptive Intelligence
-         round) — schedule_meeting again, independent of win_probability
-         entirely this time: whenever generate_follow_up_sequence()'s own
-         cadence (scoring.py) has a meeting step due *exactly* today (see
-         _due_cadence_meeting()'s own docstring), regardless of how likely
-         the lead looks. Still excludes "critical" risk, same rationale as
-         rule 2.
+      3. Full Autonomous Cadence Execution (Task 3, Adaptive Intelligence
+         round; upgraded to the FULL sequence — message steps too, not
+         just meetings — final round) — whenever generate_follow_up_
+         sequence()'s own cadence (scoring.py) says this lead's next
+         not-yet-executed step (per-lead memory: _cadence_steps_done_by_
+         lead()'s own count of this lead's past action_auto_* rows) has
+         reached its own day, independent of win_probability entirely.
+         A cadence-due send_message step gets a message generated on the
+         spot via generate_smart_message() (enrichment.py) when the
+         existing next-best-action pipeline hadn't already populated
+         ready_to_send_message for other reasons. Still excludes
+         "critical" risk, same rationale as rule 2. Stops naturally once
+         the lead converts or is lost (both already excluded from this
+         loop's own candidates above) or once every step in its own
+         sequence has executed (_next_due_cadence_action() returns None).
 
     call_now is never auto-executed — no rule above ever produces it (rule
     3 in particular never even evaluates the cadence's own call_now step —
-    see _due_cadence_meeting()'s own docstring for why that's structural,
-    not just a filter this function applies on top).
+    see _next_due_cadence_action()'s own docstring for why that's
+    structural, not just a filter this function applies on top).
 
     Gated behind settings.AUTO_MODE_ENABLED, same as the function this
     upgrades (off by default — a no-op, zero extra queries, until an org
@@ -290,7 +324,20 @@ async def auto_execute_engine(
         return 0
     already_executed_lead_ids = set(already_today_ids)
 
+    # Full Autonomous Cadence Execution (Task 3, final round) — one query
+    # for the whole batch's own per-lead cadence progress, read once here
+    # rather than per lead inside the loop below.
+    cadence_steps_done = await _cadence_steps_done_by_lead(
+        db, [response.id for response in leads]
+    )
+
     candidates: list[tuple[LeadResponse, str]] = []
+    # Cadence-triggered send_message candidates need a message generated
+    # on the spot (the existing next-best-action pipeline hadn't already
+    # populated ready_to_send_message for them) — tracked here so the
+    # execution loop below knows which ones to generate for, once it has
+    # the raw Lead row generate_smart_message() needs.
+    needs_generated_message: set = set()
     for response in leads:
         if response.status in ("converted", "lost"):
             continue
@@ -314,20 +361,32 @@ async def auto_execute_engine(
 
         if response.ready_to_send_message is not None:
             candidates.append((response, "send_message"))
-        elif (
+            continue
+        if (
             response.deal_risk_level != "critical"
             and is_within_overdue_grace
             and response.win_probability >= _AUTO_EXECUTE_MEETING_WIN_PROBABILITY
         ):
             candidates.append((response, "schedule_meeting"))
-        # Autonomous Cadence Execution (Task 3, Adaptive Intelligence
-        # round) — a second, independent trigger for schedule_meeting:
-        # generate_follow_up_sequence()'s own cadence (scoring.py) says a
-        # meeting is due *exactly* today, regardless of win_probability.
-        # Never call_now — see _due_cadence_meeting()'s own docstring for
-        # why that's a structural guarantee here, not just a filter.
-        elif response.deal_risk_level != "critical" and _due_cadence_meeting(response, now):
+            continue
+        if response.deal_risk_level == "critical":
+            continue
+
+        # Full Autonomous Cadence Execution (Task 3, final round) —
+        # replaces the previous exact-day, meetings-only cadence check
+        # with the fuller generate_follow_up_sequence() progression (see
+        # _next_due_cadence_action()'s own docstring): whichever step this
+        # lead's own per-lead memory says is next, message or meeting,
+        # once its day has arrived. Never call_now — structural, not a
+        # filter this loop applies on top.
+        cadence_action = _next_due_cadence_action(
+            response, cadence_steps_done.get(response.id, 0), now
+        )
+        if cadence_action == "schedule_meeting":
             candidates.append((response, "schedule_meeting"))
+        elif cadence_action == "send_message":
+            candidates.append((response, "send_message"))
+            needs_generated_message.add(response.id)
 
     if not candidates:
         return 0
@@ -343,6 +402,19 @@ async def auto_execute_engine(
         lead = leads_by_id.get(response.id)
         if lead is None:
             continue
+
+        if response.id in needs_generated_message:
+            generated_message = generate_smart_message(
+                lead,
+                response.next_best_action,
+                lead.owner_email or "the team",
+                deal_risk_level=response.deal_risk_level,
+                lead_response_state=response.lead_response_state,
+                matches_top_combination=False,
+            )
+            if generated_message is None:
+                continue
+            response = response.model_copy(update={"ready_to_send_message": generated_message})
 
         await execute_lead_action(
             db,

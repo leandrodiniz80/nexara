@@ -48,6 +48,46 @@ _COMMISSION_RATE = 0.05
 _UNDERPERFORMANCE_ALERT_DEDUP_HOURS = 12
 UNDERPERFORMANCE_ALERT_MARKER = "abaixo da média do time"
 
+# Continuous Reassignment Engine's own per-org cooldown (Task 2, final
+# round) — the prompt's own ask ("run on EVERY score_leads() call") read
+# as "continuous across the app," not "recompute full team performance on
+# every single request": reassign_leads_if_needed()'s own inputs
+# (user_performance) need compute_user_performance(), which is itself a
+# fresh score_leads() pass over the whole org — calling that on literally
+# every score_leads() invocation would mean every lead list, every
+# priority queue, every workday summary each triggering ANOTHER full
+# org-wide scoring pass just to check reassignment, an unbounded
+# multiplication this codebase's own "batch + in-memory hybrid" and "keep
+# performance scalable" rules explicitly rule out. This in-memory,
+# per-organization cooldown (same "process-local, no DB" pattern as
+# _REALTIME_WEIGHTS_CACHE, scoring.py) lets any caller ask
+# reassignment_check_due() first and skip the whole expensive path when
+# it's already been checked recently — "continuous" in the sense that
+# many different pages can each trigger it rather than one gated admin
+# screen, while staying bounded to one real evaluation per org per
+# window.
+_REASSIGNMENT_CHECK_COOLDOWN_MINUTES = 15
+_last_reassignment_check: dict[str, datetime] = {}
+
+
+def reassignment_check_due(organization_id: str, now: datetime) -> bool:
+    """True at most once per _REASSIGNMENT_CHECK_COOLDOWN_MINUTES per org
+    — see _REASSIGNMENT_CHECK_COOLDOWN_MINUTES's own comment. Marks the
+    check as done for this window as a side effect of returning True (the
+    caller is expected to actually run the check immediately after), so
+    two callers racing within the same request don't both pay for it —
+    process-local, so this is a best-effort throttle, not a distributed
+    lock; a second worker process would have its own independent cooldown
+    clock, which is an acceptable, disclosed limitation for a plain
+    scalability guard rather than a correctness-critical one."""
+    last_checked = _last_reassignment_check.get(organization_id)
+    if last_checked is not None and (now - last_checked) < timedelta(
+        minutes=_REASSIGNMENT_CHECK_COOLDOWN_MINUTES
+    ):
+        return False
+    _last_reassignment_check[organization_id] = now
+    return True
+
 
 def _consecutive_days_streak(dates: set[date], today: date) -> int:
     """Same algorithm as GET /workday/target's own per-user streak
@@ -360,6 +400,20 @@ async def maybe_notify_underperformance(
 LEAD_REASSIGNED_EVENT_TYPE = "lead_reassigned"
 
 
+# Continuous Reassignment Engine (Task 2, final round) — the prompt's own
+# two upgrades over the original batch-trigger version:
+#   dynamic threshold — the bar an underperformer is measured against now
+#     scales with whoever the CURRENT top performer actually is (their own
+#     response_rate * this ratio), instead of a fixed team-average line
+#     that doesn't move when the leader pulls further ahead.
+#   progressive movement — at most this many leads move per underperformer
+#     per call (their own highest-value ones first), not every qualifying
+#     lead at once — a gradual correction, not a single disruptive dump on
+#     the top performer's plate.
+_REASSIGNMENT_LEADER_RATIO_THRESHOLD = 0.5
+_REASSIGNMENT_MAX_PER_OWNER_PER_CALL = 1
+
+
 async def reassign_leads_if_needed(
     db: AsyncSession,
     *,
@@ -367,17 +421,34 @@ async def reassign_leads_if_needed(
     leads: list[LeadResponse],
     user_performance: list[UserPerformanceResponse],
 ) -> int:
-    """Lead Reassignment Engine (Task 4, Adaptive Intelligence round) —
+    """Lead Reassignment Engine (Task 4, Adaptive Intelligence round;
+    upgraded to a continuous, progressive engine — Task 2, final round) —
     moves an underperforming owner's own high-value (expected_value >=
     HIGH_VALUE_LEAD_THRESHOLD), still-open leads to the org's current top
-    performer (rank_user_performance()'s own #1). "Underperforming" means
-    response_rate below the team average OR zero revenue_this_week (Elite
+    performer (rank_user_performance()'s own #1), at most
+    _REASSIGNMENT_MAX_PER_OWNER_PER_CALL per owner per call (their own
+    highest-expected_value ones first) rather than every qualifying lead
+    at once. "Underperforming" means response_rate below
+    _REASSIGNMENT_LEADER_RATIO_THRESHOLD of the CURRENT top performer's own
+    response_rate (a dynamic bar — it moves with whoever's leading right
+    now, not a fixed team average) OR zero revenue_this_week (Elite
     round's own 7-day figure — reused rather than a fresh query, matching
     the prompt's own "revenue_converted == 0 in 7 days" ask) — either is a
     real enough signal on its own, so this is an OR, not an AND. A no-op
-    with fewer than two team members (no meaningful "team average"/"top
-    performer" to reassign toward) or when the underperformer IS the top
+    with fewer than two team members (no meaningful "leader" to compare
+    against or reassign toward) or when the underperformer IS the top
     performer (nothing to move away from themselves).
+
+    Callers this round (GET /performance/leaderboard and GET /workday/
+    summary, both gated behind reassignment_check_due()'s own per-org
+    cooldown — see that function's own docstring for why "run on every
+    score_leads() call" is deliberately NOT read as "run inside
+    score_leads() itself") make this check continuous across the app
+    rather than gated behind one specific admin page, while still bounded
+    to at most one real DB-backed evaluation per org per cooldown window —
+    "continuous," not "on every single request," which would recompute
+    full team performance (its own score_leads() pass) far more often than
+    any real reassignment decision could possibly need.
 
     `leads` is expected to be the exact same already-scored batch
     `user_performance` was itself computed from (compute_user_performance()'s
@@ -394,28 +465,37 @@ async def reassign_leads_if_needed(
 
     ranked = rank_user_performance(user_performance)
     top_performer = ranked[0]
-    avg_response_rate = sum(performance.response_rate for performance in user_performance) / len(
-        user_performance
-    )
+    leader_response_rate_bar = top_performer.response_rate * _REASSIGNMENT_LEADER_RATIO_THRESHOLD
 
     underperformer_emails = {
         performance.user_id
         for performance in user_performance
         if performance.user_id != top_performer.user_id
-        and (performance.response_rate < avg_response_rate or performance.revenue_this_week == 0)
+        and (
+            (top_performer.response_rate > 0 and performance.response_rate < leader_response_rate_bar)
+            or performance.revenue_this_week == 0
+        )
     }
     if not underperformer_emails:
         return 0
 
-    candidate_lead_ids = [
-        response.id
-        for response in leads
-        if response.owner_email in underperformer_emails
-        and response.status not in ("converted", "lost")
-        and response.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
-    ]
-    if not candidate_lead_ids:
+    candidates_by_owner: dict[str, list[LeadResponse]] = {}
+    for response in leads:
+        if (
+            response.owner_email in underperformer_emails
+            and response.status not in ("converted", "lost")
+            and response.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+        ):
+            candidates_by_owner.setdefault(response.owner_email, []).append(response)
+    if not candidates_by_owner:
         return 0
+
+    candidate_lead_ids: list = []
+    for owner_responses in candidates_by_owner.values():
+        owner_responses.sort(key=lambda response: -response.expected_value)
+        candidate_lead_ids.extend(
+            response.id for response in owner_responses[:_REASSIGNMENT_MAX_PER_OWNER_PER_CALL]
+        )
 
     lead_rows_stmt = select(Lead).where(Lead.id.in_(candidate_lead_ids))
     lead_rows = (await db.execute(lead_rows_stmt)).scalars().all()
@@ -439,3 +519,177 @@ async def reassign_leads_if_needed(
         )
         reassigned += 1
     return reassigned
+
+
+# Sales Pressure Engine (Task 1, final round) — one behavioral-control
+# state per team member, deterministic, worst-condition-first (same
+# severity-ordering style compute_deal_risk() already established).
+PressureState = str  # "leader" | "neutral" | "at_risk" | "underperforming"
+
+
+def compute_user_pressure_state(
+    performance: UserPerformanceResponse,
+    *,
+    rank: int,
+    team_size: int,
+    avg_revenue_converted: float,
+    avg_response_time_minutes: float | None,
+    avg_pipeline_value: float,
+) -> PressureState:
+    """Sales Pressure Engine (Task 1, final round) — "leader"/"neutral"/
+    "at_risk"/"underperforming" from three signals compute_user_
+    performance() already computes per member (revenue_converted,
+    avg_response_time_minutes, pipeline_value), each compared against the
+    team's own average — no ML, plain rule table:
+
+      leader — rank == 1 (rank_user_performance()'s own #1).
+      underperforming — revenue_converted == 0 AND response slower than
+        the team average (or no response-time figure at all yet) AND
+        pipeline_value also below the team average — genuinely nothing
+        going for them right now: no closes, slow to respond, and no real
+        pipeline building either. pipeline_value is what keeps this from
+        firing on someone who simply hasn't closed YET but is building a
+        strong pipeline — see the next rule.
+      at_risk — below average on revenue_converted or response time, but
+        NOT all three at once (a real pipeline offsets an otherwise-bad
+        pair, or being merely below-average on one front isn't yet a real
+        problem) — a warning, not a crisis.
+      neutral — everyone else: at or above average on every front,
+        without being the outright #1.
+
+    Always "neutral" with fewer than two team members — no meaningful
+    team average or "leader" to compare against with just one, or zero,
+    data points."""
+    if team_size < 2:
+        return "neutral"
+    if rank == 1:
+        return "leader"
+
+    is_slow_response = (
+        avg_response_time_minutes is not None
+        and (
+            performance.avg_response_time_minutes is None
+            or performance.avg_response_time_minutes > avg_response_time_minutes
+        )
+    )
+    is_zero_revenue = performance.revenue_converted == 0
+    is_low_pipeline = performance.pipeline_value < avg_pipeline_value
+
+    if is_zero_revenue and is_slow_response and is_low_pipeline:
+        return "underperforming"
+
+    is_below_avg_revenue = performance.revenue_converted < avg_revenue_converted
+    if is_below_avg_revenue or is_slow_response:
+        return "at_risk"
+
+    return "neutral"
+
+
+# maybe_notify_user_pressure()'s own dedup window — same 12h as the
+# Pressure System's own maybe_notify_underperformance() above (this is
+# its evolution, not an unrelated feature, so it shares the same cadence).
+_PRESSURE_ALERT_DEDUP_HOURS = 12
+# Each state's own dedup marker AND the substring compute_user_pressure_
+# state() output maps to for classification — plain "structured info via
+# string matching," same technique LOSS_REASON_MARKER (scoring.py)
+# already established, since UserNotification has no separate "kind"
+# column of its own to key on.
+_PRESSURE_ALERT_MARKER_BY_STATE = {
+    "leader": "Você está liderando o time",
+    "at_risk": "atenção: seu desempenho caiu abaixo da média",
+    "underperforming": "seu desempenho está crítico",
+}
+# Includes "neutral" too (not just the three alertable states above) —
+# GET /performance/pressure-state (final round) needs a real sentence for
+# every state, including the un-alerted one, so the frontend's own
+# pressure banner never has to invent copy maybe_notify_user_pressure()
+# itself doesn't produce (that function only ever notifies non-"neutral"
+# states, by design — see its own docstring).
+PRESSURE_MESSAGE_BY_STATE = {
+    "leader": f"🏆 {_PRESSURE_ALERT_MARKER_BY_STATE['leader']} — continue assim!",
+    "at_risk": f"⚠️ Atenção: {_PRESSURE_ALERT_MARKER_BY_STATE['at_risk']}.",
+    "underperforming": f"🚨 Alerta: {_PRESSURE_ALERT_MARKER_BY_STATE['underperforming']} — reaja agora.",
+    "neutral": "Desempenho dentro da média do time.",
+}
+
+
+async def maybe_notify_user_pressure(
+    db: AsyncSession,
+    *,
+    organization_id: str,
+    performances: list[UserPerformanceResponse],
+    now: datetime,
+) -> int:
+    """Sales Pressure Engine's own notification half (Task 1, final
+    round) — runs compute_user_pressure_state() over every team member
+    and stages one UserNotification per non-"neutral" state:
+    underperforming gets a strong alert (🚨), leader gets dominance
+    reinforcement (🏆), at_risk gets a plain warning (⚠️). Additive
+    alongside (not a replacement for) maybe_notify_underperformance()
+    above — that one's own binary "below average" alert and this one's
+    richer 4-state classification measure overlapping but not identical
+    signals, same "layers compound, they don't override" precedent this
+    codebase's own scoring bonuses already establish. Same per-(user,
+    marker) dedup shape as every other maybe_notify_* function in this
+    codebase, within _PRESSURE_ALERT_DEDUP_HOURS. A no-op with fewer than
+    two team members. Caller commits; returns how many notifications were
+    actually staged."""
+    if len(performances) < 2:
+        return 0
+
+    ranked = rank_user_performance(performances)
+    avg_revenue = sum(performance.revenue_converted for performance in performances) / len(performances)
+    response_times = [
+        performance.avg_response_time_minutes
+        for performance in performances
+        if performance.avg_response_time_minutes is not None
+    ]
+    avg_response_time = sum(response_times) / len(response_times) if response_times else None
+    avg_pipeline_value = sum(performance.pipeline_value for performance in performances) / len(
+        performances
+    )
+
+    state_by_user: dict[str, PressureState] = {}
+    for rank, performance in enumerate(ranked, start=1):
+        state = compute_user_pressure_state(
+            performance,
+            rank=rank,
+            team_size=len(performances),
+            avg_revenue_converted=avg_revenue,
+            avg_response_time_minutes=avg_response_time,
+            avg_pipeline_value=avg_pipeline_value,
+        )
+        if state != "neutral":
+            state_by_user[performance.user_id] = state
+
+    if not state_by_user:
+        return 0
+
+    cutoff = now - timedelta(hours=_PRESSURE_ALERT_DEDUP_HOURS)
+    already_notified_stmt = select(UserNotification.user_email, UserNotification.message).where(
+        UserNotification.organization_id == organization_id,
+        UserNotification.user_email.in_(list(state_by_user)),
+        UserNotification.created_at >= cutoff,
+    )
+    already_notified_rows = (await db.execute(already_notified_stmt)).all()
+    already_notified = {
+        (user_email, state)
+        for user_email, message in already_notified_rows
+        for state, marker in _PRESSURE_ALERT_MARKER_BY_STATE.items()
+        if marker in message
+    }
+
+    notified = 0
+    for user_email, state in state_by_user.items():
+        if (user_email, state) in already_notified:
+            continue
+        db.add(
+            UserNotification(
+                organization_id=organization_id,
+                user_email=user_email,
+                lead_id=None,
+                message=PRESSURE_MESSAGE_BY_STATE[state],
+            )
+        )
+        notified += 1
+    return notified

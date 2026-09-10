@@ -19,9 +19,12 @@ from app.services.leads.scoring import (
     compute_action_effectiveness,
     compute_adaptive_weights,
     compute_aggression_level,
+    compute_channel_ab_performance,
     compute_global_strategy,
     compute_response_metrics,
     compute_revenue_attribution,
+    compute_revenue_mode,
+    compute_segment_strategy,
     detect_revenue_leaks,
     rank_leads_by_priority,
     simulate_revenue_if_all_actions_executed,
@@ -56,8 +59,12 @@ async def get_adaptive_weights(
     organization_id = _require_organization(session)
 
     action_effectiveness = await compute_action_effectiveness(db, organization_id)
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
     weights = await compute_adaptive_weights(
-        db, organization_id, action_effectiveness=action_effectiveness
+        db,
+        organization_id,
+        action_effectiveness=action_effectiveness,
+        revenue_attribution=revenue_attribution,
     )
 
     return ApiResponse(
@@ -151,10 +158,62 @@ async def get_aggression_level(
         current_expected=simulation["current_expected"],
         delta=simulation["delta"],
     )
+    revenue_mode = compute_revenue_mode(level)
 
     return ApiResponse(
         success=True,
-        data=AggressionLevelResponse(level=level),
+        data=AggressionLevelResponse(level=level, revenue_mode=revenue_mode),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/channel-ab-performance", response_model=ApiResponse[dict[str, dict]])
+async def get_channel_ab_performance(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[dict[str, dict]]:
+    """A/B Test Engine (Task 4/8, final round) —
+    compute_channel_ab_performance() (scoring.py) over the same
+    ActionEffectivenessResponse/RevenueAttributionResponse this router's
+    own /adaptive-weights endpoint already computes, no new query. Keyed
+    call_now/send_message/schedule_meeting, each with conversion_rate/
+    revenue/score."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    action_effectiveness = await compute_action_effectiveness(db, organization_id)
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
+    performance = compute_channel_ab_performance(action_effectiveness, revenue_attribution)
+
+    return ApiResponse(
+        success=True,
+        data=performance,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/segment-strategy", response_model=ApiResponse[dict[str, dict]])
+async def get_segment_strategy(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[dict[str, dict]]:
+    """Segment Strategy Engine (Task 5/8, final round) —
+    compute_segment_strategy()'s own dict straight through (scoring.py),
+    the same per-segment recommendation compute_action_type_and_urgency()
+    itself already applies (score_leads() computes and threads this
+    through on every read). Exposed here purely for visibility."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    strategy = await compute_segment_strategy(db, organization_id)
+
+    return ApiResponse(
+        success=True,
+        data=strategy,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

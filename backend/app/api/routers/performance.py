@@ -10,12 +10,21 @@ from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead_activity_log import LeadActivityLog
-from app.schemas.performance import LeaderboardEntry, TeamSummaryResponse, UserPerformanceResponse
+from app.schemas.performance import (
+    LeaderboardEntry,
+    PressureStateResponse,
+    TeamSummaryResponse,
+    UserPerformanceResponse,
+)
 from app.services.leads.team_performance import (
+    PRESSURE_MESSAGE_BY_STATE,
     compute_user_performance,
+    compute_user_pressure_state,
     maybe_notify_underperformance,
+    maybe_notify_user_pressure,
     rank_user_performance,
     reassign_leads_if_needed,
+    reassignment_check_due,
     score_org_leads,
 )
 
@@ -53,12 +62,13 @@ async def get_leaderboard(
     with at least one lead in this org) ranked by rank_user_performance()
     (team_performance.py): revenue_converted DESC, response_rate DESC,
     avg_response_time_minutes ASC. Also runs maybe_notify_underperformance()
-    (Task 5) and, since the Adaptive Intelligence round, reassign_leads_
-    if_needed() (Task 4) over the same already-computed performances/scored
-    leads, zero extra score_leads() pass — this endpoint doubles as the
-    read AND the trigger for both side effects, same "GET also fires
-    side-effect notifications" pattern GET /workday/summary already
-    established."""
+    (Task 5), maybe_notify_user_pressure() (Sales Pressure Engine, final
+    round), and, gated behind reassignment_check_due()'s own cooldown,
+    reassign_leads_if_needed() (Task 4; continuous upgrade, final round)
+    over the same already-computed performances/scored leads, zero extra
+    score_leads() pass — this endpoint doubles as the read AND the trigger
+    for all three side effects, same "GET also fires side-effect
+    notifications" pattern GET /workday/summary already established."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
     now = datetime.now(timezone.utc)
@@ -70,10 +80,15 @@ async def get_leaderboard(
     notified = await maybe_notify_underperformance(
         db, organization_id=organization_id, performances=performances, now=now
     )
-    reassigned = await reassign_leads_if_needed(
-        db, organization_id=organization_id, leads=scored_leads, user_performance=performances
+    pressure_notified = await maybe_notify_user_pressure(
+        db, organization_id=organization_id, performances=performances, now=now
     )
-    if notified or reassigned:
+    reassigned = 0
+    if reassignment_check_due(organization_id, now):
+        reassigned = await reassign_leads_if_needed(
+            db, organization_id=organization_id, leads=scored_leads, user_performance=performances
+        )
+    if notified or pressure_notified or reassigned:
         await db.commit()
 
     return ApiResponse(
@@ -162,6 +177,61 @@ async def get_team_summary(
             top_performer_name=top_performer_name,
             worst_performer_name=worst_performer_name,
         ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/pressure-state", response_model=ApiResponse[PressureStateResponse])
+async def get_pressure_state(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[PressureStateResponse]:
+    """Sales Pressure Engine (Task 1, final round) — the calling user's
+    own compute_user_pressure_state() classification, for the frontend's
+    per-user pressure banner (Task 8.1): "leader"/"neutral"/"at_risk"/
+    "underperforming" plus the same ready-to-render sentence
+    maybe_notify_user_pressure()'s own notification would carry. Read-
+    only — this endpoint never stages a notification itself (that's
+    GET /performance/leaderboard's own side effect); it just classifies
+    and returns. "neutral" (with team_size < 2, or genuinely average
+    otherwise) whenever the calling user isn't in this org's own
+    performances at all (no leads owned) — same "no data, no verdict"
+    rule this codebase's other learned fields already follow."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+    user_email = session.get("email")
+
+    performances = await compute_user_performance(db, organization_id)
+    own_performance = next((p for p in performances if p.user_id == user_email), None)
+
+    if own_performance is None or len(performances) < 2:
+        state = "neutral"
+    else:
+        ranked = rank_user_performance(performances)
+        rank = next(
+            position for position, p in enumerate(ranked, start=1) if p.user_id == user_email
+        )
+        avg_revenue = sum(p.revenue_converted for p in performances) / len(performances)
+        response_times = [
+            p.avg_response_time_minutes for p in performances if p.avg_response_time_minutes is not None
+        ]
+        avg_response_time = sum(response_times) / len(response_times) if response_times else None
+        avg_pipeline_value = sum(p.pipeline_value for p in performances) / len(performances)
+
+        state = compute_user_pressure_state(
+            own_performance,
+            rank=rank,
+            team_size=len(performances),
+            avg_revenue_converted=avg_revenue,
+            avg_response_time_minutes=avg_response_time,
+            avg_pipeline_value=avg_pipeline_value,
+        )
+
+    return ApiResponse(
+        success=True,
+        data=PressureStateResponse(state=state, message=PRESSURE_MESSAGE_BY_STATE[state]),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )

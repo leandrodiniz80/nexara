@@ -101,3 +101,17 @@ class TeamSummaryResponse(BaseModel):
     avg_response_rate: float = 0.0
     top_performer_name: str | None = None
     worst_performer_name: str | None = None
+
+
+class PressureStateResponse(BaseModel):
+    """GET /performance/pressure-state — the calling user's own Sales
+    Pressure Engine classification (compute_user_pressure_state(),
+    team_performance.py, final round): one of "leader"/"neutral"/
+    "at_risk"/"underperforming". message is the same ready-to-render
+    sentence maybe_notify_user_pressure()'s own notification would carry
+    for that state — always populated (even for "neutral", where it's a
+    plain, calm sentence) so the frontend's pressure banner never has to
+    invent its own copy for the un-alerted case."""
+
+    state: str
+    message: str

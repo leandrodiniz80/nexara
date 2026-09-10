@@ -45,9 +45,14 @@ class GlobalStrategyResponse(BaseModel):
 class AggressionLevelResponse(BaseModel):
     """GET /intelligence/aggression-level — compute_aggression_level()'s
     own return value (scoring.py), one of "low"/"medium"/"high"/
-    "extreme"."""
+    "extreme". revenue_mode (final round) is compute_revenue_mode()'s own
+    one-line relabeling of that same level into "efficiency"/"balanced"/
+    "aggressive" — the vocabulary this round's own Command Center
+    indicator asks for, same underlying signal as `level`, not a second
+    computation (see that function's own docstring)."""
 
     level: str
+    revenue_mode: str = "balanced"
 
 
 class RevenueLeaksResponse(BaseModel):
