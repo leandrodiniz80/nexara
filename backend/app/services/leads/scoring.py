@@ -2151,6 +2151,34 @@ def long_term_performance_to_weights(long_term_performance: dict[str, dict]) -> 
     return weights
 
 
+def split_long_term_performance_weights(long_term_weights: dict[str, float]) -> dict[str, dict[str, float]]:
+    """Reshapes long_term_performance_to_weights()'s own flat "industry:X"/
+    "company_size:X"/"action:X" dict into
+    {industry_performance, company_size_performance, action_type_performance}
+    — three separate dict[str, float]s, one per dimension, each keyed by
+    the bare segment value (no prefix). Pure reformatting of already-
+    computed weights, zero new query, zero new aggregation: every number
+    here is identical to the one long_term_performance_to_weights() itself
+    already produced, just split by dimension and stripped of its prefix
+    for a caller that wants that shape directly rather than one flat,
+    prefixed dict it has to filter itself."""
+    industry_performance: dict[str, float] = {}
+    company_size_performance: dict[str, float] = {}
+    action_type_performance: dict[str, float] = {}
+    for key, weight in long_term_weights.items():
+        if key.startswith("industry:"):
+            industry_performance[key[len("industry:") :]] = weight
+        elif key.startswith("company_size:"):
+            company_size_performance[key[len("company_size:") :]] = weight
+        elif key.startswith("action:"):
+            action_type_performance[key[len("action:") :]] = weight
+    return {
+        "industry_performance": industry_performance,
+        "company_size_performance": company_size_performance,
+        "action_type_performance": action_type_performance,
+    }
+
+
 # Weight Stabilization's own blend (Task 2, memory round) — the prompt's
 # own literal split.
 _STABILIZATION_REALTIME_WEIGHT = 0.2
@@ -2204,10 +2232,12 @@ def compute_stabilized_weights(
     return stabilized
 
 
-# Trend Detection's own window/thresholds (Task 3, memory round).
+# Trend Detection's own window/thresholds (Task 3, memory round) — the
+# +-20% bar this round's own spec tightens these to (was +-10% when this
+# function was first built).
 _TREND_WINDOW_DAYS = 7
-_TREND_RISING_RATIO = 1.1
-_TREND_DECLINING_RATIO = 0.9
+_TREND_RISING_RATIO = 1.2
+_TREND_DECLINING_RATIO = 0.8
 
 
 async def compute_channel_trends(
@@ -2229,7 +2259,18 @@ async def compute_channel_trends(
     that function's own docstring for the full disclosed approximation),
     windowed to the last 7 days instead of all-time — a shorter lookback
     over the same query shape, not a second copy of that function's own
-    logic living independently."""
+    logic living independently.
+
+    Keyed call_now/send_message/schedule_meeting — this codebase's own
+    "channel" vocabulary throughout (compute_action_effectiveness(),
+    compute_revenue_attribution(), compute_adaptive_weights()'s own
+    action:{action_type} keys). There is no per-sub-channel distinction
+    anywhere in this data model (no "was this message sent via WhatsApp
+    vs. email" column on LeadActivityLog or anywhere else — see that
+    model's own docstring), so a caller expecting literal "whatsapp"/
+    "email" keys instead would need a genuinely new tracking column,
+    which this round's own "no schema changes" rule rules out; these
+    three are the real, honest granularity this system actually tracks."""
     window_start = datetime.now(timezone.utc) - timedelta(days=_TREND_WINDOW_DAYS)
     rows_stmt = select(
         LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at

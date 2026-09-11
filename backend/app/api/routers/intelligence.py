@@ -33,6 +33,7 @@ from app.services.leads.scoring import (
     long_term_performance_to_weights,
     rank_leads_by_priority,
     simulate_revenue_if_all_actions_executed,
+    split_long_term_performance_weights,
     top_revenue_bucket,
 )
 from app.services.leads.team_performance import compute_user_performance
@@ -102,9 +103,20 @@ async def get_long_term_performance(
     """Long-Term Learning Store (Task 1/8, memory round) —
     compute_long_term_performance()'s own dict straight through
     (scoring.py): all-time conversions/revenue/response_rate by industry,
-    company_size, and action_type. Exposed here purely for visibility —
-    it's LeadActivityLog's own data aggregated at read time, no new table
-    or JSON store written anywhere (see that function's own docstring)."""
+    company_size, and action_type, under its own "industry"/
+    "company_size"/"action_type" keys. Exposed here purely for
+    visibility — it's LeadActivityLog's own data aggregated at read time,
+    no new table or JSON store written anywhere (see that function's own
+    docstring).
+
+    Also includes industry_performance/company_size_performance/
+    action_type_performance — split_long_term_performance_weights()'s own
+    reshaping of the SAME underlying figures into plain dict[str, float]
+    weights (each centered on 1.0, same clamp compute_adaptive_weights()
+    itself uses) for a caller that wants that shape directly. Purely
+    additive keys alongside the original three — zero new query, zero new
+    aggregation, and any existing reader of this endpoint that only looks
+    at "industry"/"company_size"/"action_type" keeps working unchanged."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
@@ -116,10 +128,13 @@ async def get_long_term_performance(
         action_effectiveness=action_effectiveness,
         revenue_attribution=revenue_attribution,
     )
+    performance_weights = split_long_term_performance_weights(
+        long_term_performance_to_weights(performance)
+    )
 
     return ApiResponse(
         success=True,
-        data=performance,
+        data={**performance, **performance_weights},
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
