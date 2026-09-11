@@ -365,6 +365,13 @@ _MOMENTUM_MAX = 100
 _HUNTER_MODE_PIPELINE_RATIO_THRESHOLD = 0.5
 _HUNTER_MODE_NEW_LEAD_BONUS = 25
 
+# Segment Memory Boost (Task 4, memory round) — deliberately smaller than
+# _WINNER_PATTERN_BONUS (25): that one rewards matching the single BEST
+# combination org-wide (a stronger, more specific signal); this one
+# rewards merely belonging to A historically-strong segment, a broader
+# and slightly weaker claim.
+_SEGMENT_MEMORY_BOOST = 15
+
 # Elite round — Auto Drop Inteligente refinement (Task 9): a second,
 # value-agnostic pruning trigger alongside the autonomous-sales-OS round's
 # original three-condition one (_PRUNE_WIN_PROBABILITY_THRESHOLD/
@@ -775,6 +782,7 @@ def compute_lead_score(
     deal_risk_level: str,
     hunter_mode: bool,
     adaptive_weights: dict[str, float],
+    long_term_performance: dict[str, dict] | None = None,
     now: datetime,
 ) -> tuple[int, list[ScoreBreakdownItem]]:
     """Dynamic score, computed at read time from the lead's current state —
@@ -1273,6 +1281,41 @@ def compute_lead_score(
             ScoreBreakdownItem(reason="Modo caçador: lead novo priorizado", impact=_HUNTER_MODE_NEW_LEAD_BONUS)
         )
         total += _HUNTER_MODE_NEW_LEAD_BONUS
+
+    # Segment Memory Boost (Task 4, memory round) — a lead whose own
+    # industry or company_size has a historically strong track record
+    # (compute_long_term_performance(), this module — _LONG_TERM_MIN_
+    # SAMPLE_SIZE real conversions or more) gets this bonus even with zero
+    # RECENT activity of its own: the 30-day adaptive weights and realtime
+    # cache both go quiet the moment a signal goes cold, but a segment
+    # that has reliably converted across this org's entire history is
+    # still worth leaning into. long_term_performance defaults to None —
+    # every existing caller that doesn't pass it (and any org with no
+    # real long-term history yet, which returns {} from that function)
+    # gets 100% unchanged behavior; this is a pure addition, never a
+    # penalty, so it can only ever raise a score, never lower one.
+    if long_term_performance and lead.enrichment_data:
+        industry = lead.enrichment_data.get("industry")
+        company_size = lead.enrichment_data.get("company_size")
+        industry_entry = long_term_performance.get("industry", {}).get(industry) if industry else None
+        company_size_entry = (
+            long_term_performance.get("company_size", {}).get(company_size) if company_size else None
+        )
+        is_historically_strong = (
+            (industry_entry is not None and industry_entry["conversions"] >= _LONG_TERM_MIN_SAMPLE_SIZE)
+            or (
+                company_size_entry is not None
+                and company_size_entry["conversions"] >= _LONG_TERM_MIN_SAMPLE_SIZE
+            )
+        )
+        if is_historically_strong:
+            breakdown.append(
+                ScoreBreakdownItem(
+                    reason="Segmento historicamente forte — memória de longo prazo",
+                    impact=_SEGMENT_MEMORY_BOOST,
+                )
+            )
+            total += _SEGMENT_MEMORY_BOOST
 
     # Autonomous-sales-OS round — intelligent pipeline pruning: a lead
     # this unlikely to close (win_probability), this small even if it did
@@ -1927,6 +1970,340 @@ def update_adaptive_weights_realtime(event: dict) -> None:
             nudge(f"action:{event['action_type']}", _REALTIME_OBSERVED_INTERESTED)
     elif event_type == "message_sent":
         nudge("action:send_message", _REALTIME_OBSERVED_ACTIVITY)
+
+
+# Long-Term Learning Store (Task 1, memory round) — the prompt's own
+# "too little data" bar, same spirit as _ADAPTIVE_WEIGHTS_MIN_SAMPLE_SIZE/
+# _SEGMENT_STRATEGY_MIN_SAMPLE_SIZE above, kept as its own literal since
+# this one measures raw conversions (a count), not a win-rate ratio like
+# those two.
+_LONG_TERM_MIN_SAMPLE_SIZE = 3
+
+
+async def compute_long_term_performance(
+    db: AsyncSession,
+    organization_id: str,
+    *,
+    action_effectiveness: ActionEffectivenessResponse,
+    revenue_attribution: RevenueAttributionResponse,
+) -> dict[str, dict]:
+    """Long-Term Learning Store (Task 1, memory round) — all-time (not the
+    30-day window compute_adaptive_weights() uses) aggregated performance
+    by industry, company_size, and action_type: {"conversions": int,
+    "revenue": float, "response_rate": float} per segment value, keyed
+    {"industry": {value: {...}}, "company_size": {value: {...}},
+    "action_type": {value: {...}}}.
+
+    No new table, no JSON blob written anywhere: LeadActivityLog (already
+    this org's own permanent activity ledger) IS the long-term store this
+    reads fresh every call — the exact same "the data already persists,
+    aggregate it at read time" convention every other compute_*()
+    aggregate in this module already follows (compute_conversion_
+    insights(), compute_adaptive_weights(), compute_segment_strategy()). A
+    genuinely new table or JSON blob would just be a second, redundant
+    copy of data LeadActivityLog already holds forever — exactly what the
+    prompt's own "no new tables if possible... reuse LeadActivityLog
+    aggregation" instruction asks to avoid.
+
+    action_effectiveness/revenue_attribution are accepted as already-
+    computed inputs (both already all-time, no time window of their own —
+    see each one's own docstring) rather than recomputed here: revenue by
+    action/industry/company_size and each action's own all-time success
+    rate are exactly what this function's own "revenue"/"response_rate"
+    columns need for two of its three dimensions, at zero extra query.
+    The one genuinely new piece is a per-segment CONVERSION COUNT (a
+    number those two responses don't carry — they only have rates and
+    sums) — mined here via the same "last action_call/action_message/
+    action_meeting before this lead's own conversion" inference
+    compute_revenue_attribution() and compute_segment_strategy() both
+    already use, reapplied to a third context rather than duplicated as a
+    shared helper (see compute_segment_strategy()'s own comment for why a
+    cross-cutting refactor here would risk touching working code this
+    round's own "do not change existing scoring or behavior" rule wants
+    left alone).
+
+    Requires _LONG_TERM_MIN_SAMPLE_SIZE conversions for a segment/action
+    value before it earns an entry at all — a value with fewer is
+    silently omitted, not given a low-confidence guess, same "no signal,
+    no opinion" rule this module's other learned aggregates already
+    follow.
+
+    Three queries regardless of org size: one converted-Lead scan
+    (all-time), one response-type scan scoped to those leads' ids (for
+    response_rate), one action_* scan scoped to the same ids (for the
+    per-action-type conversion count)."""
+    won_stmt = select(Lead).where(
+        Lead.organization_id == organization_id,
+        Lead.status == "converted",
+        Lead.deleted_at.is_(None),
+    )
+    won_leads = (await db.execute(won_stmt)).scalars().all()
+    if not won_leads:
+        return {"industry": {}, "company_size": {}, "action_type": {}}
+
+    won_lead_ids = [lead.id for lead in won_leads]
+    leads_by_id = {lead.id: lead for lead in won_leads}
+
+    response_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.lead_id.in_(won_lead_ids),
+            LeadActivityLog.event_type.in_(list(RESPONSE_STATE_BY_EVENT_TYPE)),
+        )
+    )
+    responded_lead_ids = set((await db.execute(response_stmt)).scalars().all())
+
+    conversions_by_segment: dict[str, dict[str, int]] = {"industry": {}, "company_size": {}}
+    responded_by_segment: dict[str, dict[str, int]] = {"industry": {}, "company_size": {}}
+    for lead in won_leads:
+        if not lead.enrichment_data:
+            continue
+        responded = lead.id in responded_lead_ids
+        for dimension in ("industry", "company_size"):
+            value = lead.enrichment_data.get(dimension)
+            if not value:
+                continue
+            conversions_by_segment[dimension][value] = conversions_by_segment[dimension].get(value, 0) + 1
+            if responded:
+                responded_by_segment[dimension][value] = responded_by_segment[dimension].get(value, 0) + 1
+
+    performance: dict[str, dict] = {"industry": {}, "company_size": {}, "action_type": {}}
+    revenue_by_dimension = {
+        "industry": revenue_attribution.revenue_by_industry,
+        "company_size": revenue_attribution.revenue_by_company_size,
+    }
+    for dimension in ("industry", "company_size"):
+        for value, conversions in conversions_by_segment[dimension].items():
+            if conversions < _LONG_TERM_MIN_SAMPLE_SIZE:
+                continue
+            responded_count = responded_by_segment[dimension].get(value, 0)
+            performance[dimension][value] = {
+                "conversions": conversions,
+                "revenue": revenue_by_dimension[dimension].get(value, 0.0),
+                "response_rate": round(responded_count / conversions * 100, 1),
+            }
+
+    actions_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.lead_id.in_(won_lead_ids),
+        LeadActivityLog.event_type.in_(ACTION_EVENT_TYPES),
+    )
+    action_rows = (await db.execute(actions_stmt)).all()
+    last_action_event_type: dict = {}
+    last_action_at: dict = {}
+    for lead_id, event_type, created_at in action_rows:
+        lead = leads_by_id.get(lead_id)
+        if lead is None or created_at > lead.updated_at:
+            continue  # logged after conversion — not what led to it
+        current = last_action_at.get(lead_id)
+        if current is None or created_at > current:
+            last_action_at[lead_id] = created_at
+            last_action_event_type[lead_id] = event_type
+
+    conversions_by_action: dict[str, int] = {}
+    for event_type in last_action_event_type.values():
+        action_type = ACTION_EVENT_TYPE_TO_ACTION_TYPE.get(event_type)
+        if action_type:
+            conversions_by_action[action_type] = conversions_by_action.get(action_type, 0) + 1
+
+    action_rates = {
+        "call_now": action_effectiveness.call_success_rate,
+        "send_message": action_effectiveness.message_success_rate,
+        "schedule_meeting": action_effectiveness.meeting_success_rate,
+    }
+    for action_type, conversions in conversions_by_action.items():
+        if conversions < _LONG_TERM_MIN_SAMPLE_SIZE:
+            continue
+        label = ACTION_TYPE_TO_REVENUE_LABEL.get(action_type)
+        performance["action_type"][action_type] = {
+            "conversions": conversions,
+            "revenue": revenue_attribution.revenue_by_action.get(label, 0.0) if label else 0.0,
+            "response_rate": action_rates.get(action_type) or 0.0,
+        }
+
+    return performance
+
+
+def long_term_performance_to_weights(long_term_performance: dict[str, dict]) -> dict[str, float]:
+    """Converts compute_long_term_performance()'s own nested per-segment
+    dict into the flat "industry:X"/"company_size:X"/"action:X" weight
+    format compute_stabilized_weights() blends against — each segment
+    value's own response_rate compared to the average response_rate
+    across every other value in that same dimension, the exact same
+    _clamp_adaptive_weight() formula compute_adaptive_weights() itself
+    uses for its own weights."""
+    weights: dict[str, float] = {}
+    for dimension, prefix in (
+        ("industry", "industry"),
+        ("company_size", "company_size"),
+        ("action_type", "action"),
+    ):
+        entries = long_term_performance.get(dimension, {})
+        rates = [entry["response_rate"] for entry in entries.values()]
+        if not rates:
+            continue
+        baseline = sum(rates) / len(rates)
+        for value, entry in entries.items():
+            weights[f"{prefix}:{value}"] = _clamp_adaptive_weight(entry["response_rate"], baseline)
+    return weights
+
+
+# Weight Stabilization's own blend (Task 2, memory round) — the prompt's
+# own literal split.
+_STABILIZATION_REALTIME_WEIGHT = 0.2
+_STABILIZATION_BATCH_WEIGHT = 0.3
+_STABILIZATION_LONG_TERM_WEIGHT = 0.5
+
+
+def compute_stabilized_weights(
+    realtime_weights: dict[str, float],
+    batch_weights: dict[str, float],
+    long_term_weights: dict[str, float],
+) -> dict[str, float]:
+    """Weight Stabilization (Task 2, memory round) — the prompt's own
+    literal blend (final_weight = realtime*0.2 + batch*0.3 +
+    long_term*0.5) for whichever keys long_term_weights actually has a
+    real entry for (compute_adaptive_weights()'s own 30-day figure and
+    get_realtime_adaptive_weights()'s own process-local one are always
+    computed regardless, so those two halves are effectively "free" —
+    long_term_weights, from compute_long_term_performance(), is the one
+    that can genuinely be missing a key for a brand-new org, or a value
+    too fresh to have built up all-time history yet).
+
+    Deliberately does NOT default a missing long_term_weights key to a
+    neutral 1.0 and blend anyway — that would silently DILUTE a real
+    realtime/batch signal by anchoring half the formula to "no opinion"
+    math, a real behavior regression for exactly the orgs this adaptive-
+    weights system already serves well, and this round's own "do not
+    change existing scoring or behavior" rule rules that out. For a key
+    long_term doesn't have yet, this instead falls back to whichever of
+    realtime_weights/batch_weights already has it (same priority
+    score_leads()'s own pre-existing realtime-overrides-batch merge
+    already used before this function existed) — the blend only ever
+    engages where it can genuinely stabilize a key across all three
+    timescales; every other key behaves exactly as it did before this
+    round."""
+    all_keys = set(realtime_weights) | set(batch_weights) | set(long_term_weights)
+    stabilized: dict[str, float] = {}
+    for key in all_keys:
+        long_term_weight = long_term_weights.get(key)
+        if long_term_weight is None:
+            stabilized[key] = realtime_weights.get(key, batch_weights.get(key, 1.0))
+            continue
+        realtime_weight = realtime_weights.get(key, batch_weights.get(key, long_term_weight))
+        batch_weight = batch_weights.get(key, long_term_weight)
+        blended = (
+            realtime_weight * _STABILIZATION_REALTIME_WEIGHT
+            + batch_weight * _STABILIZATION_BATCH_WEIGHT
+            + long_term_weight * _STABILIZATION_LONG_TERM_WEIGHT
+        )
+        stabilized[key] = round(max(_ADAPTIVE_WEIGHT_MIN, min(_ADAPTIVE_WEIGHT_MAX, blended)), 4)
+    return stabilized
+
+
+# Trend Detection's own window/thresholds (Task 3, memory round).
+_TREND_WINDOW_DAYS = 7
+_TREND_RISING_RATIO = 1.1
+_TREND_DECLINING_RATIO = 0.9
+
+
+async def compute_channel_trends(
+    db: AsyncSession, organization_id: str, *, action_effectiveness: ActionEffectivenessResponse
+) -> dict[str, dict]:
+    """Trend Detection (Task 3, memory round) — compares each channel's
+    own last _TREND_WINDOW_DAYS (7) success rate against its all-time
+    baseline (action_effectiveness, already computed elsewhere in
+    score_leads()'s own pipeline — no second query for that half),
+    classifying "rising" (recent >= _TREND_RISING_RATIO x baseline),
+    "declining" (recent <= _TREND_DECLINING_RATIO x baseline), or
+    "stable" otherwise. "insufficient_data" whenever either figure isn't
+    real yet (no recent activity in the window, or no all-time baseline
+    at all).
+
+    One query: the exact same action_call/action_message/action_meeting +
+    lead_interested scan compute_action_effectiveness() itself uses (same
+    "last action, did it convert or show interest after" inference, see
+    that function's own docstring for the full disclosed approximation),
+    windowed to the last 7 days instead of all-time — a shorter lookback
+    over the same query shape, not a second copy of that function's own
+    logic living independently."""
+    window_start = datetime.now(timezone.utc) - timedelta(days=_TREND_WINDOW_DAYS)
+    rows_stmt = select(
+        LeadActivityLog.lead_id, LeadActivityLog.event_type, LeadActivityLog.created_at
+    ).where(
+        LeadActivityLog.organization_id == organization_id,
+        LeadActivityLog.event_type.in_(ACTION_EVENT_TYPES + ["lead_interested"]),
+        LeadActivityLog.created_at >= window_start,
+    )
+    rows = (await db.execute(rows_stmt)).all()
+
+    latest_action_at: dict[tuple, datetime] = {}
+    lead_ids_by_action_type: dict[str, set] = {event_type: set() for event_type in ACTION_EVENT_TYPES}
+    latest_interested_at: dict = {}
+    for lead_id, event_type, created_at in rows:
+        if event_type == "lead_interested":
+            current = latest_interested_at.get(lead_id)
+            if current is None or created_at > current:
+                latest_interested_at[lead_id] = created_at
+            continue
+        lead_ids_by_action_type[event_type].add(lead_id)
+        key = (lead_id, event_type)
+        current = latest_action_at.get(key)
+        if current is None or created_at > current:
+            latest_action_at[key] = created_at
+
+    all_lead_ids = set().union(*lead_ids_by_action_type.values()) if rows else set()
+    converted_lead_ids: set = set()
+    if all_lead_ids:
+        converted_stmt = select(Lead.id).where(Lead.id.in_(all_lead_ids), Lead.status == "converted")
+        converted_lead_ids = set((await db.execute(converted_stmt)).scalars().all())
+
+    def recent_rate(event_type: str) -> float | None:
+        lead_ids = lead_ids_by_action_type[event_type]
+        if not lead_ids:
+            return None
+        successes = 0
+        for lead_id in lead_ids:
+            if lead_id in converted_lead_ids:
+                successes += 1
+                continue
+            interested_at = latest_interested_at.get(lead_id)
+            if interested_at is not None and interested_at > latest_action_at[(lead_id, event_type)]:
+                successes += 1
+        return round(successes / len(lead_ids) * 100, 1)
+
+    baseline_by_event_type = {
+        "action_call": action_effectiveness.call_success_rate,
+        "action_message": action_effectiveness.message_success_rate,
+        "action_meeting": action_effectiveness.meeting_success_rate,
+    }
+
+    trends: dict[str, dict] = {}
+    for event_type in ACTION_EVENT_TYPES:
+        action_type = ACTION_EVENT_TYPE_TO_ACTION_TYPE.get(event_type)
+        if action_type is None:
+            continue
+        recent = recent_rate(event_type)
+        baseline = baseline_by_event_type.get(event_type)
+        if recent is None or not baseline:
+            trends[action_type] = {
+                "trend": "insufficient_data",
+                "recent_rate": recent,
+                "baseline_rate": baseline,
+            }
+            continue
+        ratio = recent / baseline
+        if ratio >= _TREND_RISING_RATIO:
+            trend = "rising"
+        elif ratio <= _TREND_DECLINING_RATIO:
+            trend = "declining"
+        else:
+            trend = "stable"
+        trends[action_type] = {"trend": trend, "recent_rate": recent, "baseline_rate": baseline}
+    return trends
 
 
 # Revenue-loop round — the same three action_* event types
@@ -2707,19 +3084,35 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
     # strategy_override()'s own docstring), so this one is safe to
     # compute here and apply on every read, same as adaptive_weights.
     segment_strategy = await compute_segment_strategy(db, organization_id)
-    adaptive_weights = await compute_adaptive_weights(
+    batch_weights = await compute_adaptive_weights(
         db,
         organization_id,
         action_effectiveness=action_effectiveness,
         revenue_attribution=revenue_attribution,
     )
-    # Real-Time Learning Engine (Task 1, final round) — the process-local
-    # realtime cache overrides the batch figure key-for-key wherever it has
-    # a fresher opinion (an event since the last 30-day recompute), and
-    # falls back to the batch value everywhere else. See
-    # _REALTIME_WEIGHTS_CACHE's own comment for why this, not a DB write,
-    # is the source for the realtime half.
-    adaptive_weights = {**adaptive_weights, **get_realtime_adaptive_weights(organization_id)}
+    # Long-Term Learning Store (Task 1, memory round) — all-time
+    # performance by industry/company_size/action_type, reusing
+    # action_effectiveness/revenue_attribution (both already computed
+    # just above, both already all-time) at zero extra query for two of
+    # its three dimensions. Feeds both Weight Stabilization just below and
+    # compute_lead_score()'s own Segment Memory Boost (Task 4).
+    long_term_performance = await compute_long_term_performance(
+        db,
+        organization_id,
+        action_effectiveness=action_effectiveness,
+        revenue_attribution=revenue_attribution,
+    )
+    # Weight Stabilization (Task 2, memory round) — blends the realtime
+    # cache, the 30-day batch figure, and long-term all-time performance
+    # (realtime*0.2 + batch*0.3 + long_term*0.5) for whichever keys have
+    # real long-term signal; falls back to the previous realtime-overrides-
+    # batch behavior for every other key — see compute_stabilized_
+    # weights()'s own docstring for why that fallback matters.
+    adaptive_weights = compute_stabilized_weights(
+        get_realtime_adaptive_weights(organization_id),
+        batch_weights,
+        long_term_performance_to_weights(long_term_performance),
+    )
 
     recent_stmt = (
         select(AutomationActivityLog.lead_id)
@@ -2944,6 +3337,7 @@ async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]
             deal_risk_level=deal_risk_level,
             hunter_mode=hunter_mode,
             adaptive_weights=adaptive_weights,
+            long_term_performance=long_term_performance,
             now=now,
         )
 

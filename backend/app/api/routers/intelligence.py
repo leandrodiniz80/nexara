@@ -20,12 +20,17 @@ from app.services.leads.scoring import (
     compute_adaptive_weights,
     compute_aggression_level,
     compute_channel_ab_performance,
+    compute_channel_trends,
     compute_global_strategy,
+    compute_long_term_performance,
     compute_response_metrics,
     compute_revenue_attribution,
     compute_revenue_mode,
     compute_segment_strategy,
+    compute_stabilized_weights,
     detect_revenue_leaks,
+    get_realtime_adaptive_weights,
+    long_term_performance_to_weights,
     rank_leads_by_priority,
     simulate_revenue_if_all_actions_executed,
     top_revenue_bucket,
@@ -49,18 +54,63 @@ async def get_adaptive_weights(
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[dict[str, float]]:
-    """Adaptive Scoring Weights (Task 1/7, Adaptive Intelligence round) —
-    compute_adaptive_weights()'s own dict straight through (scoring.py),
-    the same values compute_lead_score() itself already applies to its
-    matching bonuses. Exposed here purely for visibility/debugging (e.g.
-    a future Learning Panel entry) — nothing here feeds back into scoring
-    beyond what score_leads() already does on every read."""
+    """Adaptive Scoring Weights (Task 1/7, Adaptive Intelligence round;
+    Weight Stabilization — Task 2, memory round) — the same stabilized
+    blend (realtime*0.2 + 30-day batch*0.3 + long-term all-time*0.5,
+    compute_stabilized_weights()) compute_lead_score() itself now applies
+    to its matching bonuses, not the raw 30-day batch figure alone.
+    Exposed here purely for visibility/debugging (e.g. a future Learning
+    Panel entry) — nothing here feeds back into scoring beyond what
+    score_leads() already does on every read."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
     action_effectiveness = await compute_action_effectiveness(db, organization_id)
     revenue_attribution = await compute_revenue_attribution(db, organization_id)
-    weights = await compute_adaptive_weights(
+    batch_weights = await compute_adaptive_weights(
+        db,
+        organization_id,
+        action_effectiveness=action_effectiveness,
+        revenue_attribution=revenue_attribution,
+    )
+    long_term_performance = await compute_long_term_performance(
+        db,
+        organization_id,
+        action_effectiveness=action_effectiveness,
+        revenue_attribution=revenue_attribution,
+    )
+    weights = compute_stabilized_weights(
+        get_realtime_adaptive_weights(organization_id),
+        batch_weights,
+        long_term_performance_to_weights(long_term_performance),
+    )
+
+    return ApiResponse(
+        success=True,
+        data=weights,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/long-term-performance", response_model=ApiResponse[dict[str, dict]])
+async def get_long_term_performance(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[dict[str, dict]]:
+    """Long-Term Learning Store (Task 1/8, memory round) —
+    compute_long_term_performance()'s own dict straight through
+    (scoring.py): all-time conversions/revenue/response_rate by industry,
+    company_size, and action_type. Exposed here purely for visibility —
+    it's LeadActivityLog's own data aggregated at read time, no new table
+    or JSON store written anywhere (see that function's own docstring)."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    action_effectiveness = await compute_action_effectiveness(db, organization_id)
+    revenue_attribution = await compute_revenue_attribution(db, organization_id)
+    performance = await compute_long_term_performance(
         db,
         organization_id,
         action_effectiveness=action_effectiveness,
@@ -69,7 +119,33 @@ async def get_adaptive_weights(
 
     return ApiResponse(
         success=True,
-        data=weights,
+        data=performance,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+@router.get("/trends", response_model=ApiResponse[dict[str, dict]])
+async def get_trends(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[dict[str, dict]]:
+    """Trend Detection (Task 3/8, memory round) — compute_channel_trends()
+    (scoring.py): each channel's last-7-day success rate vs. its all-time
+    baseline, classified "rising"/"declining"/"stable"/"insufficient_data".
+    Keyed call_now/send_message/schedule_meeting."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    action_effectiveness = await compute_action_effectiveness(db, organization_id)
+    trends = await compute_channel_trends(
+        db, organization_id, action_effectiveness=action_effectiveness
+    )
+
+    return ApiResponse(
+        success=True,
+        data=trends,
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
