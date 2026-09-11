@@ -45,9 +45,14 @@ from app.services.leads.team_performance import (
     score_org_leads,
 )
 from app.services.leads.workday_engine import (
+    AT_RISK_STALE_AFTER_DAYS,
+    DAILY_TARGET_REVENUE_WINDOW_DAYS,
     build_action_queue,
     complete_lead_task,
+    compute_daily_target_revenue,
     compute_lost_opportunity_today,
+    compute_revenue_at_risk,
+    derive_required_action_and_reason,
     detect_user_failure_state,
     format_brl,
     generate_accountability_message,
@@ -60,13 +65,11 @@ from app.services.leads.workday_engine import (
     maybe_notify_ignored_leads,
     maybe_notify_performance_alert,
     maybe_notify_pipeline_risk,
+    sum_today_potential_revenue,
 )
 
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/workday", tags=["Workday"])
 
-# GET /workday/summary's leads_at_risk criteria — same "contacted, no recent
-# touch" definition and default window as GET /leads/attention.
-_AT_RISK_STALE_AFTER_DAYS = 3
 # Sanity cap on the at-risk-leads row fetch (needed for per-lead
 # enrichment_data, not just a count) — same rationale as the 200-row
 # priority candidate pool: comfortably above any realistic per-org count at
@@ -76,13 +79,6 @@ _AT_RISK_POOL_SIZE = 500
 _HIGH_PRIORITY_TOP_N = 5
 # GET /workday/target's fixed default — no per-user/org customization yet.
 _DEFAULT_DAILY_TARGET = 5
-# GET /workday/target's revenue-based target (Autonomous-sales-OS round) —
-# the window _compute_daily_target_revenue() averages over, same 7-day
-# span this codebase's other "steady, not noisy" windows already use
-# (compute_response_metrics's own _RESPONSE_METRICS_WINDOW_DAYS uses 30 for
-# a rarer signal; a week is enough here since conversions are the much
-# more frequent event being averaged).
-_DAILY_TARGET_REVENUE_WINDOW_DAYS = 7
 # Revenue Acceleration Mode's own trigger (Task 3, revenue-maximization
 # round) — this endpoint's own precise `gap > 5000` check, computed
 # directly from the accurate gap just above. Kept as its own local
@@ -331,46 +327,12 @@ async def _count_overdue_tasks(db: AsyncSession, organization_id: str, now: dt) 
     return (await db.execute(stmt)).scalar_one()
 
 
-def _compute_revenue_at_risk(ranked: list[LeadResponse], *, now: dt, stale_cutoff: dt) -> int:
-    """"Money genuinely at risk, probability-adjusted" — contacted leads
-    that are either overdue or stale (updated_at older than stale_cutoff),
-    summed by expected_value (not the raw estimated_value
-    estimated_revenue_at_risk/estimated_revenue_lost elsewhere use). Reuses
-    whatever rank_leads_by_priority() already scored — zero extra query.
-    Shared by GET /workday/summary and .../performance."""
-    total = 0
-    for response in ranked:
-        if response.status != "contacted":
-            continue
-        is_overdue = (
-            response.next_action_due_at is not None and response.next_action_due_at < now
-        )
-        is_stale = response.updated_at < stale_cutoff
-        if is_overdue or is_stale:
-            total += response.expected_value
-    return total
-
-
-def _sum_today_potential_revenue(ranked: list[LeadResponse], *, now: dt) -> int:
-    """The Command Center's "Hoje você pode gerar R$ X" — expected_value
-    summed over today's actionable leads (overdue or due today). Reuses the
-    same already-scored ranked list _compute_revenue_at_risk does."""
-    total = 0
-    for response in ranked:
-        due = response.next_action_due_at
-        if due is None:
-            continue
-        if response.is_overdue or due.date() == now.date():
-            total += response.expected_value
-    return total
-
-
 def _compute_deal_risk_summary(ranked: list[LeadResponse]) -> tuple[int, int]:
     """(money_at_risk_today, critical_deals_count) — AI Deal Coach round.
     Reuses whatever rank_leads_by_priority() already scored (deal_risk_level
     is populated by score_leads() for every response in `ranked`), zero
     extra query. Shared by GET /workday/summary and .../performance, same
-    "reuse the already-scored list" pattern as _compute_revenue_at_risk."""
+    "reuse the already-scored list" pattern as compute_revenue_at_risk."""
     critical = [response for response in ranked if response.deal_risk_level == "critical"]
     money_at_risk = sum(response.expected_value for response in critical)
     return money_at_risk, len(critical)
@@ -407,35 +369,6 @@ async def _compute_money_saved_today(db: AsyncSession, organization_id: str, tod
         for lead in completed_leads
         if (value := get_lead_estimated_value(lead)) >= HIGH_VALUE_LEAD_THRESHOLD
     )
-
-
-async def _compute_daily_target_revenue(db: AsyncSession, organization_id: str, cutoff: dt) -> float:
-    """GET /workday/target's revenue-based target (Autonomous-sales-OS
-    round) — average converted revenue per day over the last
-    _DAILY_TARGET_REVENUE_WINDOW_DAYS: sums estimated_value for every lead
-    with a "lead_won" LeadActivityLog entry (the same precise conversion-
-    moment marker compute_revenue_summary()'s own revenue_generated_today
-    reads, scoring.py) since `cutoff`, divided by the window length. 0.0
-    with no conversions in the window — a real "nothing to average yet"
-    answer, not a misleading default. Two queries: distinct lead_won
-    lead_ids in the window, then those leads' rows for enrichment_data."""
-    won_ids_stmt = (
-        select(LeadActivityLog.lead_id)
-        .distinct()
-        .where(
-            LeadActivityLog.organization_id == organization_id,
-            LeadActivityLog.event_type == "lead_won",
-            LeadActivityLog.created_at >= cutoff,
-        )
-    )
-    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
-    if not won_ids:
-        return 0.0
-
-    won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
-    won_leads = (await db.execute(won_leads_stmt)).scalars().all()
-    total = sum(get_lead_estimated_value(lead) for lead in won_leads)
-    return total / _DAILY_TARGET_REVENUE_WINDOW_DAYS
 
 
 async def _count_auto_actions_today(db: AsyncSession, organization_id: str, today_start: dt) -> int:
@@ -599,7 +532,7 @@ async def get_workday_summary(
 
     overdue_tasks = await _count_overdue_tasks(db, organization_id, now)
 
-    at_risk_cutoff = now - timedelta(days=_AT_RISK_STALE_AFTER_DAYS)
+    at_risk_cutoff = now - timedelta(days=AT_RISK_STALE_AFTER_DAYS)
     at_risk_stmt = (
         select(Lead)
         .where(
@@ -616,8 +549,8 @@ async def get_workday_summary(
 
     ranked = await rank_leads_by_priority(db, organization_id)
     high_priority_leads = len(ranked[:_HIGH_PRIORITY_TOP_N])
-    revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
-    today_potential_revenue = _sum_today_potential_revenue(ranked, now=now)
+    revenue_at_risk = compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+    today_potential_revenue = sum_today_potential_revenue(ranked, now=now)
     money_at_risk_today, critical_deals_count = _compute_deal_risk_summary(ranked)
     pending_responses_count, ignored_count, high_value_at_risk_count, pipeline_expected_value = (
         _compute_response_and_pipeline_pressure(ranked)
@@ -792,19 +725,11 @@ async def get_workday_enforcement_state(
             execution_time=time.perf_counter() - start,
         )
 
-    # Mirrors get_next_mandatory_lead()'s own OR condition, checked in the
-    # same order (critical first) so the reason always names whichever
-    # condition actually applied.
-    if mandatory_lead.deal_risk_level == "critical":
-        reason = "Você tem um lead crítico que precisa de ação imediata"
-    elif mandatory_lead.response_delay_minutes is not None and mandatory_lead.response_delay_minutes > 60:
-        reason = "Um lead está aguardando resposta há mais de 60 minutos"
-    else:
-        reason = "Ação necessária agora"
-
-    required_action = mandatory_lead.next_best_action_type
-    if required_action not in ("send_message", "call_now", "schedule_meeting"):
-        required_action = "send_message"
+    # Product-consolidation round: extracted into derive_required_action_
+    # and_reason() (workday_engine.py) so GET /product/summary and GET
+    # /intelligence/exec-insight reuse the exact same branching instead of
+    # re-deriving it — see that function's own docstring.
+    required_action, reason = derive_required_action_and_reason(mandatory_lead)
 
     return ApiResponse(
         success=True,
@@ -945,7 +870,7 @@ async def get_workday_performance(
     revenue_generated_today/avg_revenue_per_conversion), none per-row.
     Reuses _count_overdue_tasks and _workday_stats (both already used by
     /next and /summary), plus the same rank_leads_by_priority()/
-    _compute_revenue_at_risk()/_compute_deal_risk_summary() pairing GET
+    compute_revenue_at_risk()/_compute_deal_risk_summary() pairing GET
     /workday/summary already uses, instead of re-deriving any of this a
     third time."""
     start = time.perf_counter()
@@ -983,9 +908,9 @@ async def get_workday_performance(
     leads_ignored_yesterday = len(ignored_leads)
     estimated_revenue_lost = sum(get_lead_estimated_value(lead) for lead in ignored_leads)
 
-    at_risk_cutoff = now - timedelta(days=_AT_RISK_STALE_AFTER_DAYS)
+    at_risk_cutoff = now - timedelta(days=AT_RISK_STALE_AFTER_DAYS)
     ranked = await rank_leads_by_priority(db, organization_id)
-    revenue_at_risk = _compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+    revenue_at_risk = compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
     _money_at_risk_today, critical_deals = _compute_deal_risk_summary(ranked)
     money_saved_today = await _compute_money_saved_today(db, organization_id, today_start)
     auto_actions_executed_today = await _count_auto_actions_today(db, organization_id, today_start)
@@ -1070,8 +995,8 @@ async def get_workday_target(
     WorkdayTargetResponse's own docstring for why this doesn't replace the
     original fields the prompt's literal wording asked for). Four queries
     total: two inside _workday_stats, two inside
-    _compute_daily_target_revenue, plus rank_leads_by_priority()'s own
-    (reused for current_expected via _sum_today_potential_revenue, the
+    compute_daily_target_revenue, plus rank_leads_by_priority()'s own
+    (reused for current_expected via sum_today_potential_revenue, the
     same figure WorkdaySummaryResponse.today_potential_revenue already
     computes — no new aggregation logic)."""
     start = time.perf_counter()
@@ -1084,10 +1009,10 @@ async def get_workday_target(
         min(completed_today / _DEFAULT_DAILY_TARGET, 1.0) if _DEFAULT_DAILY_TARGET > 0 else 1.0
     )
 
-    revenue_cutoff = now - timedelta(days=_DAILY_TARGET_REVENUE_WINDOW_DAYS)
-    daily_target_revenue = await _compute_daily_target_revenue(db, organization_id, revenue_cutoff)
+    revenue_cutoff = now - timedelta(days=DAILY_TARGET_REVENUE_WINDOW_DAYS)
+    daily_target_revenue = await compute_daily_target_revenue(db, organization_id, revenue_cutoff)
     ranked = await rank_leads_by_priority(db, organization_id)
-    current_expected = _sum_today_potential_revenue(ranked, now=now)
+    current_expected = sum_today_potential_revenue(ranked, now=now)
     gap = daily_target_revenue - current_expected
     acceleration_mode = gap > _ACCELERATION_MODE_GAP_THRESHOLD
 

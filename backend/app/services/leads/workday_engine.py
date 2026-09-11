@@ -11,8 +11,26 @@ from app.models.leads.lead_activity_log import LeadActivityLog
 from app.models.notifications.user_notification import UserNotification
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.workday import FailureState
-from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD
+from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, get_lead_estimated_value
 from app.services.leads.scoring import rank_leads_by_priority
+
+# compute_daily_target_revenue()'s own averaging window — same 7-day span
+# this codebase's other "steady, not noisy" windows already use
+# (compute_response_metrics's own _RESPONSE_METRICS_WINDOW_DAYS uses 30 for
+# a rarer signal; a week is enough here since conversions are the much more
+# frequent event being averaged). Public (moved here from workday.py's own
+# router module, product-consolidation round) so GET /product/summary
+# (routers/product.py) can compute the same revenue_cutoff GET
+# /workday/target already does, without a router importing from another
+# router.
+DAILY_TARGET_REVENUE_WINDOW_DAYS = 7
+
+# GET /workday/summary's leads_at_risk criteria — same "contacted, no recent
+# touch" definition and default window as GET /leads/attention. Public
+# (moved here from workday.py's own router module, product-consolidation
+# round) so GET /product/summary (routers/product.py) can reuse the same
+# staleness window compute_revenue_at_risk() itself is built around.
+AT_RISK_STALE_AFTER_DAYS = 3
 
 # detect_user_failure_state()'s thresholds — see its own docstring.
 _FAILING_COMPLETION_RATE = 0.3
@@ -51,7 +69,7 @@ _IGNORED_LEADS_ALERT_THRESHOLD = 5
 _IGNORED_LEADS_ALERT_DEDUP_HOURS = 6
 # maybe_notify_pipeline_risk()'s trigger — the prompt's own number, against
 # the same probability-weighted revenue_at_risk GET /workday/summary
-# already computes (_compute_revenue_at_risk, workday.py).
+# already computes (compute_revenue_at_risk, this module).
 _PIPELINE_RISK_ALERT_THRESHOLD = 10000.0
 _PIPELINE_RISK_ALERT_DEDUP_HOURS = 6
 
@@ -374,7 +392,7 @@ async def maybe_notify_pipeline_risk(
 ) -> bool:
     """Sales-operating-system round — fires when revenue_at_risk (the same
     probability-weighted figure GET /workday/summary already computes,
-    _compute_revenue_at_risk in workday.py) clears
+    compute_revenue_at_risk() in this module) clears
     _PIPELINE_RISK_ALERT_THRESHOLD. Same own-marker dedup shape as
     maybe_notify_ignored_leads() above, for the same reason. Caller
     commits; returns whether a row was actually staged."""
@@ -674,3 +692,103 @@ def compute_lost_opportunity_today(ranked: list[LeadResponse]) -> int:
         for response in ranked
         if response.days_since_last_activity >= 1 and response.status not in ("converted", "lost")
     )
+
+
+def compute_revenue_at_risk(
+    ranked: list[LeadResponse], *, now: datetime, stale_cutoff: datetime
+) -> int:
+    """"Money genuinely at risk, probability-adjusted" — contacted leads
+    that are either overdue or stale (updated_at older than stale_cutoff),
+    summed by expected_value (not the raw estimated_value
+    estimated_revenue_at_risk/estimated_revenue_lost elsewhere use). Reuses
+    whatever rank_leads_by_priority() already scored — zero extra query.
+    Moved here from workday.py's own router module (product-consolidation
+    round) — public now (no longer router-private) so the new GET
+    /product/summary endpoint (routers/product.py) can reuse this exact sum
+    too, without a router importing from another router."""
+    total = 0
+    for response in ranked:
+        if response.status != "contacted":
+            continue
+        is_overdue = (
+            response.next_action_due_at is not None and response.next_action_due_at < now
+        )
+        is_stale = response.updated_at < stale_cutoff
+        if is_overdue or is_stale:
+            total += response.expected_value
+    return total
+
+
+def sum_today_potential_revenue(ranked: list[LeadResponse], *, now: datetime) -> int:
+    """The Command Center's "Hoje você pode gerar R$ X" — expected_value
+    summed over today's actionable leads (overdue or due today). Reuses the
+    same already-scored ranked list compute_revenue_at_risk does. Moved
+    here from workday.py's own router module (product-consolidation round)
+    for the same cross-router-reuse reason as compute_revenue_at_risk
+    above."""
+    total = 0
+    for response in ranked:
+        due = response.next_action_due_at
+        if due is None:
+            continue
+        if response.is_overdue or due.date() == now.date():
+            total += response.expected_value
+    return total
+
+
+def derive_required_action_and_reason(mandatory_lead: LeadResponse) -> tuple[str, str]:
+    """GET /workday/enforcement-state's own required_action/reason
+    derivation (Autonomous-sales-OS round), extracted into its own function
+    (product-consolidation round) so every caller that needs "what to do
+    about this mandatory lead, in words" reuses the exact same branching
+    instead of re-deriving it — this is what guarantees
+    compute_global_decision()'s own next_action can never disagree with
+    GET /workday/enforcement-state's required_action (Task 5). Mirrors
+    get_next_mandatory_lead()'s own OR condition, checked in the same order
+    (critical first) so the reason always names whichever condition
+    actually applied."""
+    if mandatory_lead.deal_risk_level == "critical":
+        reason = "Você tem um lead crítico que precisa de ação imediata"
+    elif mandatory_lead.response_delay_minutes is not None and mandatory_lead.response_delay_minutes > 60:
+        reason = "Um lead está aguardando resposta há mais de 60 minutos"
+    else:
+        reason = "Ação necessária agora"
+
+    required_action = mandatory_lead.next_best_action_type
+    if required_action not in ("send_message", "call_now", "schedule_meeting"):
+        required_action = "send_message"
+
+    return required_action, reason
+
+
+async def compute_daily_target_revenue(db: AsyncSession, organization_id: str, cutoff: datetime) -> float:
+    """GET /workday/target's revenue-based target (Autonomous-sales-OS
+    round) — average converted revenue per day over the last
+    DAILY_TARGET_REVENUE_WINDOW_DAYS: sums estimated_value for every lead
+    with a "lead_won" LeadActivityLog entry (the same precise conversion-
+    moment marker compute_revenue_summary()'s own revenue_generated_today
+    reads, scoring.py) since `cutoff`, divided by the window length. 0.0
+    with no conversions in the window — a real "nothing to average yet"
+    answer, not a misleading default. Two queries: distinct lead_won
+    lead_ids in the window, then those leads' rows for enrichment_data.
+    Moved here from workday.py's own router module (product-consolidation
+    round) — public now so GET /product/summary (routers/product.py) can
+    reuse this exact figure for its own revenue_today_gap, without a router
+    importing from another router."""
+    won_ids_stmt = (
+        select(LeadActivityLog.lead_id)
+        .distinct()
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type == "lead_won",
+            LeadActivityLog.created_at >= cutoff,
+        )
+    )
+    won_ids = (await db.execute(won_ids_stmt)).scalars().all()
+    if not won_ids:
+        return 0.0
+
+    won_leads_stmt = select(Lead).where(Lead.id.in_(won_ids))
+    won_leads = (await db.execute(won_leads_stmt)).scalars().all()
+    total = sum(get_lead_estimated_value(lead) for lead in won_leads)
+    return total / DAILY_TARGET_REVENUE_WINDOW_DAYS

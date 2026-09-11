@@ -25,6 +25,7 @@ from app.api.routers.notifications import router as notifications_router
 from app.api.routers.organizations import router as organizations_router
 from app.api.routers.outreach import router as outreach_router
 from app.api.routers.performance import router as performance_router
+from app.api.routers.product import router as product_router
 from app.api.routers.prospects import router as prospects_router
 from app.api.routers.read_models import router as read_models_router
 from app.api.routers.revenue import router as revenue_router
@@ -116,5 +117,6 @@ def create_app() -> FastAPI:
     app.include_router(revenue_router)
     app.include_router(performance_router)
     app.include_router(intelligence_router)
+    app.include_router(product_router)
 
     return app

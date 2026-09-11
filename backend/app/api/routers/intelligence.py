@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +15,7 @@ from app.schemas.intelligence import (
     RevenueLeaksResponse,
     RevenueSimulationResponse,
 )
-from app.services.leads.intelligence import generate_exec_insight
+from app.services.leads.intelligence import compute_global_decision, generate_exec_insight
 from app.services.leads.scoring import (
     compute_action_effectiveness,
     compute_adaptive_weights,
@@ -37,8 +38,20 @@ from app.services.leads.scoring import (
     top_revenue_bucket,
 )
 from app.services.leads.team_performance import compute_user_performance
-from app.services.leads.workday_engine import compute_lost_opportunity_today
+from app.services.leads.workday_engine import (
+    build_action_queue,
+    compute_lost_opportunity_today,
+    derive_required_action_and_reason,
+    get_next_mandatory_lead,
+    sum_today_potential_revenue,
+)
 
+# ADVANCED LAYER — every endpoint in this router is per-signal visibility/
+# debugging over one individual engine (adaptive weights, trends, a single
+# strategy signal, etc.). GET /product/summary (routers/product.py) is the
+# product-consolidation round's own PRIMARY endpoint — the single
+# aggregated view built from these same engines; nothing here should be
+# treated as the system's main entry point.
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/intelligence", tags=["Intelligence"])
 
 
@@ -340,47 +353,49 @@ async def get_exec_insight(
     session: dict = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[ExecInsightResponse]:
-    """CEO Insight Layer (Task 6/7/8, final round) — generate_exec_insight()
-    (services/leads/intelligence.py) now also fed by compute_aggression_
-    level(), compute_global_strategy(), and detect_revenue_leaks() (Task 7
-    upgrade), all sharing the exact same rank_leads_by_priority()/
-    compute_response_metrics()/compute_revenue_attribution()/
-    compute_user_performance() calls this router's own other three
-    endpoints already make — one request here costs the same as calling
-    /global-strategy + /aggression-level + /revenue-leaks separately, just
-    bundled into one narrative sentence."""
+    """CEO Insight Layer, final form (Task 4, product-consolidation round)
+    — generate_exec_insight() now returns exactly one fixed-template
+    sentence (see its own docstring, services/leads/intelligence.py) built
+    from revenue_today_expected (sum_today_potential_revenue(),
+    workday_engine.py), lost_opportunity_today
+    (compute_lost_opportunity_today()), and compute_global_decision()'s own
+    next_action — the SAME mandatory-lead pipeline (build_action_queue()+
+    get_next_mandatory_lead()+derive_required_action_and_reason()) GET
+    /workday/enforcement-state and GET /product/summary both read, so this
+    sentence's recommended action can never disagree with either (Task 5).
+    One rank_leads_by_priority() call, no heavier than before."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
 
     ranked = await rank_leads_by_priority(db, organization_id)
+    now = datetime.now(timezone.utc)
+
+    revenue_today_expected = sum_today_potential_revenue(ranked, now=now)
     lost_opportunity_today = compute_lost_opportunity_today(ranked)
     simulation = simulate_revenue_if_all_actions_executed(ranked)
-
-    response_metrics = await compute_response_metrics(db, organization_id)
-    revenue_attribution = await compute_revenue_attribution(db, organization_id)
-    top_revenue_action = top_revenue_bucket(revenue_attribution.revenue_by_action)
-    team_performance = await compute_user_performance(db, organization_id)
-    global_strategy = compute_global_strategy(
-        ranked,
-        response_rate=response_metrics.response_rate,
-        top_revenue_action=top_revenue_action,
-        team_performance=team_performance,
-    )
-
     aggression_level = compute_aggression_level(
         lost_opportunity_today=lost_opportunity_today,
         current_expected=simulation["current_expected"],
         delta=simulation["delta"],
     )
 
-    revenue_leaks = detect_revenue_leaks(ranked)
+    queue = build_action_queue(ranked)
+    mandatory_lead = get_next_mandatory_lead(queue)
+    required_action = reason = None
+    if mandatory_lead is not None:
+        required_action, reason = derive_required_action_and_reason(mandatory_lead)
+
+    decision = compute_global_decision(
+        mandatory_lead=mandatory_lead,
+        required_action=required_action,
+        reason=reason,
+        aggression_level=aggression_level,
+    )
 
     message = generate_exec_insight(
+        revenue_today_expected=revenue_today_expected,
         lost_opportunity_today=lost_opportunity_today,
-        simulation=simulation,
-        aggression_level=aggression_level,
-        global_strategy=global_strategy,
-        revenue_leaks=revenue_leaks,
+        next_action=decision["next_action"],
     )
 
     return ApiResponse(
