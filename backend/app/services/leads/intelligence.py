@@ -859,3 +859,210 @@ def compute_system_health(summary: dict, efficiency: dict) -> dict:
         status = "critical"
 
     return {"health_score": health_score, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# REVENUE OPERATING SYSTEM (revenue-operating-system round) — product
+# positioning/monetization layer, not intelligence: every function below
+# is a pure, O(1) lookup or arithmetic pass over the already-fully-
+# assembled product_summary dict (built by routers/product.py once every
+# other field above has already been computed) — no query, no per-lead
+# loop, no per-industry logic. This is the layer that turns the decision
+# engine above into something a prospect can be sold.
+# ---------------------------------------------------------------------------
+
+# compute_product_identity()'s own copy/lookups (Task 1). target_market
+# reuses product_mode (compute_product_mode(), above) rather than
+# re-deriving a market segment from raw leads; sales_complexity reuses
+# system_status (compute_system_health(), above) rather than a new
+# health computation.
+_TARGET_MARKET_BY_PRODUCT_MODE = {
+    "volume": "SMB",
+    "precision": "High Ticket",
+    "hybrid": "Enterprise",
+}
+_SALES_COMPLEXITY_BY_SYSTEM_STATUS = {
+    "critical": "low",
+    "leaking": "medium",
+    "stable": "medium",
+    "scaling": "high",
+}
+_PRIMARY_VALUE_PT = (
+    "Substitui CRM, gestão comercial e processo de follow-up por um único "
+    "sistema de decisão de receita: diz o que fazer agora, corrige a "
+    "execução sozinho e mostra exatamente onde está o dinheiro."
+)
+
+
+def compute_product_identity(product_summary: dict) -> dict:
+    """Product Identity Engine (Task 1, revenue-operating-system round) —
+    pure lookup over signals already on `product_summary`, no new
+    calculation. target_market reuses product_mode: volume tenants (many
+    small deals) read as SMB, precision tenants (few large deals) as High
+    Ticket, hybrid (both at once — the more operationally complex
+    profile) as Enterprise. sales_complexity reuses system_status: a
+    critical/leaking org has an obvious, easy-to-sell pain (low
+    complexity); a stable/scaling org already running well needs a more
+    consultative sell (medium/high)."""
+    product_mode = product_summary.get("product_mode")
+    system_status = product_summary.get("system_status")
+
+    return {
+        "product_category": "Revenue OS",
+        "primary_value": _PRIMARY_VALUE_PT,
+        "target_market": _TARGET_MARKET_BY_PRODUCT_MODE.get(product_mode, "SMB"),
+        "sales_complexity": _SALES_COMPLEXITY_BY_SYSTEM_STATUS.get(system_status, "medium"),
+    }
+
+
+# compute_roi_estimate()'s own projection window/reference (Task 2). 30
+# days keeps monthly/annual as simple, transparent multiples of the same
+# daily figure (no separate "business days" assumption to justify in a
+# sales conversation). _ROI_REFERENCE_MONTHLY_COST is this round's own
+# literal "starter" price anchor (see compute_pricing_suggestion()'s own
+# tiers below) — roi_multiple is illustrative ("this gain is worth N
+# starter-plan months"), not dependent on whichever plan a given prospect
+# actually ends up on.
+_ROI_ESTIMATE_DAYS_PER_MONTH = 30
+_ROI_REFERENCE_MONTHLY_COST = 297.0
+
+
+def compute_roi_estimate(product_summary: dict) -> dict:
+    """ROI Engine (Task 2, revenue-operating-system round) — projects
+    today's own already-computed shortfall into a monthly/annual gain, no
+    new signal: revenue_gap (compute_revenue_gap(), above — money not yet
+    captured against today's own target) plus revenue_at_risk
+    (compute_revenue_at_risk(), workday_engine.py — probability-weighted
+    money already in the pipeline that's overdue or stale) is today's
+    total recoverable upside, multiplied out to a month and a year.
+    roi_multiple is that monthly figure against _ROI_REFERENCE_MONTHLY_COST,
+    for a sales conversation's own "pays for itself N times over" framing."""
+    daily_upside = product_summary.get("revenue_gap", 0) + product_summary.get("revenue_at_risk", 0)
+
+    estimated_monthly_revenue_gain = daily_upside * _ROI_ESTIMATE_DAYS_PER_MONTH
+    estimated_annual_revenue_gain = estimated_monthly_revenue_gain * 12
+    roi_multiple = (
+        round(estimated_monthly_revenue_gain / _ROI_REFERENCE_MONTHLY_COST, 1)
+        if estimated_monthly_revenue_gain > 0
+        else 0.0
+    )
+
+    return {
+        "estimated_monthly_revenue_gain": estimated_monthly_revenue_gain,
+        "estimated_annual_revenue_gain": estimated_annual_revenue_gain,
+        "roi_multiple": roi_multiple,
+    }
+
+
+# compute_pricing_suggestion()'s own tiers (Task 3) — (plan, min monthly
+# gain to qualify, monthly_price, setup_price), checked lowest-first so
+# the last tier whose threshold is cleared wins. The round's own literal
+# price ranges (R$297-R$1.997/mês SaaS tiers; R$5k-R$20k high-ticket
+# setup).
+_PRICING_TIERS = (
+    ("starter", 0, 297.0, 0.0),
+    ("growth", 10_000, 997.0, 5_000.0),
+    ("scale", 50_000, 1_997.0, 15_000.0),
+)
+
+
+def compute_pricing_suggestion(product_summary: dict, roi_estimate: dict) -> dict:
+    """Pricing Engine (Task 3, revenue-operating-system round) — buckets
+    roi_estimate's own estimated_monthly_revenue_gain (above) into one of
+    _PRICING_TIERS: a low projected gain stays a low-ticket SaaS tier
+    (starter), a high one justifies a high-ticket plan with setup fee
+    (scale) — "if high revenue → high ticket, if low → SaaS tier" is
+    exactly this threshold ladder, not a separate calculation."""
+    monthly_gain = roi_estimate.get("estimated_monthly_revenue_gain", 0)
+
+    recommended_plan, _, monthly_price, setup_price = _PRICING_TIERS[0]
+    for plan, threshold, price, setup in _PRICING_TIERS:
+        if monthly_gain >= threshold:
+            recommended_plan, monthly_price, setup_price = plan, price, setup
+
+    pricing_logic = (
+        f"Ganho mensal estimado de R$ {format_brl(monthly_gain)} justifica o plano "
+        f"{recommended_plan} (R$ {format_brl(monthly_price)}/mês"
+        + (f" + R$ {format_brl(setup_price)} de setup" if setup_price > 0 else "")
+        + ")."
+    )
+
+    return {
+        "recommended_plan": recommended_plan,
+        "monthly_price": monthly_price,
+        "setup_price": setup_price,
+        "pricing_logic": pricing_logic,
+    }
+
+
+def generate_sales_script(product_summary: dict, roi_estimate: dict) -> str:
+    """Sales Script Engine (Task 4, revenue-operating-system round) — Hook/
+    Diagnosis/Opportunity/Solution/Close, built entirely from figures
+    already on `product_summary`/`roi_estimate`: the hook is pressure_
+    message (compute_pressure_message(), above — already the "impossible
+    to ignore" sentence); the diagnosis is next_best_move
+    (compute_next_best_move(), above — what this tenant is doing wrong
+    right now); the opportunity is roi_estimate's own monthly/annual
+    projection. Solution/close are fixed copy describing the product
+    itself, not a per-tenant calculation."""
+    hook = product_summary.get(
+        "pressure_message", "Você está deixando dinheiro na mesa todos os dias."
+    )
+    diagnosis = product_summary.get("next_best_move") or product_summary.get("main_action", "")
+
+    monthly_gain = roi_estimate.get("estimated_monthly_revenue_gain", 0)
+    annual_gain = roi_estimate.get("estimated_annual_revenue_gain", 0)
+    opportunity = (
+        f"Isso representa até R$ {format_brl(monthly_gain)} por mês "
+        f"(R$ {format_brl(annual_gain)} por ano) que você pode estar perdendo agora."
+    )
+
+    solution = (
+        "O sistema decide o que fazer, corrige a execução sozinho e mostra "
+        "exatamente onde está o dinheiro — todos os dias, sem depender de "
+        "planilha ou achismo."
+    )
+    close = "Quer ver quanto disso é recuperável a partir de hoje?"
+
+    return " ".join(part for part in (hook, diagnosis, opportunity, solution, close) if part)
+
+
+def generate_objection_handlers() -> list[dict]:
+    """Objection Handler (Task 5, revenue-operating-system round) — fixed
+    sales copy, not derived from any tenant's data (there is no per-tenant
+    signal an objection handler should vary by): the top objections this
+    product category actually gets, each with a direct answer."""
+    return [
+        {
+            "objection": "Já tenho CRM",
+            "answer": (
+                "Seu CRM guarda dados. Este sistema decide o que fazer com eles "
+                "— ele não compete com seu CRM, ele o substitui como ferramenta "
+                "de decisão."
+            ),
+        },
+        {
+            "objection": "Minha equipe já faz isso",
+            "answer": (
+                "Sua equipe reage ao que já aconteceu. O sistema aponta o que "
+                "vai acontecer antes de você perder a venda — e corrige "
+                "sozinho quando algo não está funcionando."
+            ),
+        },
+        {
+            "objection": "Não tenho tempo para implementar",
+            "answer": (
+                "Não há implementação manual: o sistema já lê seus leads e sua "
+                "operação e devolve a próxima ação em segundos, sem processo "
+                "novo para sua equipe aprender."
+            ),
+        },
+        {
+            "objection": "É caro",
+            "answer": (
+                "O custo é fixo; o dinheiro que você está deixando na mesa é "
+                "recorrente. O ROI estimado já mostra quanto disso volta no "
+                "primeiro mês."
+            ),
+        },
+    ]

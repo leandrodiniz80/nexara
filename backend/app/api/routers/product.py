@@ -21,13 +21,18 @@ from app.services.leads.intelligence import (
     compute_main_action,
     compute_next_best_move,
     compute_pressure_message,
+    compute_pricing_suggestion,
+    compute_product_identity,
     compute_product_mode,
     compute_product_summary,
     compute_required_actions,
     compute_revenue_efficiency,
     compute_revenue_gap,
+    compute_roi_estimate,
     compute_sales_readiness,
     compute_system_health,
+    generate_objection_handlers,
+    generate_sales_script,
     simplify_system_state,
 )
 from app.services.leads.scoring import (
@@ -285,6 +290,17 @@ async def get_product_summary(
     summary["failure_pattern_detected"] = bool(
         failure_patterns.get("top_loss_reason") or failure_patterns.get("worst_channel")
     )
+
+    # Revenue Operating System (revenue-operating-system round) — go-to-
+    # market layer, zero new queries: every function here is a pure O(1)
+    # lookup/arithmetic pass over `summary`, which by this point already
+    # carries every signal they need.
+    roi_estimate = compute_roi_estimate(summary)
+    summary["product_identity"] = compute_product_identity(summary)
+    summary["roi_estimate"] = roi_estimate
+    summary["pricing_suggestion"] = compute_pricing_suggestion(summary, roi_estimate)
+    summary["sales_script"] = generate_sales_script(summary, roi_estimate)
+    summary["objection_handlers"] = generate_objection_handlers()
 
     return ApiResponse(
         success=True,

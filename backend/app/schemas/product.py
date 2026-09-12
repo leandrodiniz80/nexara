@@ -36,6 +36,44 @@ class SystemState(BaseModel):
     message: str
 
 
+class ProductIdentity(BaseModel):
+    """compute_product_identity()'s own output (Task 1, revenue-operating-
+    system round) — how this product is positioned for this tenant."""
+
+    product_category: str
+    primary_value: str
+    target_market: str
+    sales_complexity: str
+
+
+class RoiEstimate(BaseModel):
+    """compute_roi_estimate()'s own output (Task 2, revenue-operating-
+    system round) — the monthly/annual recoverable upside a sales
+    conversation leads with."""
+
+    estimated_monthly_revenue_gain: float
+    estimated_annual_revenue_gain: float
+    roi_multiple: float
+
+
+class PricingSuggestion(BaseModel):
+    """compute_pricing_suggestion()'s own output (Task 3, revenue-
+    operating-system round)."""
+
+    recommended_plan: str
+    monthly_price: float
+    setup_price: float
+    pricing_logic: str
+
+
+class ObjectionHandler(BaseModel):
+    """One entry of generate_objection_handlers()'s own fixed list (Task
+    5, revenue-operating-system round)."""
+
+    objection: str
+    answer: str
+
+
 class ProductSummaryResponse(BaseModel):
     """GET /product/summary — the Revenue Decision System's single "explain
     it in seconds" view (Task 2/3, product-consolidation round; extended
@@ -100,3 +138,14 @@ class ProductSummaryResponse(BaseModel):
     system_health: int
     system_status: str
     failure_pattern_detected: bool
+
+    # Revenue Operating System (revenue-operating-system round) —
+    # additive, go-to-market layer. See services/leads/intelligence.py
+    # for compute_product_identity()/compute_roi_estimate()/
+    # compute_pricing_suggestion()/generate_sales_script()/
+    # generate_objection_handlers().
+    product_identity: ProductIdentity
+    roi_estimate: RoiEstimate
+    pricing_suggestion: PricingSuggestion
+    sales_script: str
+    objection_handlers: list[ObjectionHandler]
