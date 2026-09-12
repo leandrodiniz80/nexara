@@ -70,3 +70,18 @@ class ProductSummaryResponse(BaseModel):
     revenue_today_possible: int
     next_best_action: str
     top_priority_lead_id: uuid.UUID | None = None
+
+    # Revenue Command Center (revenue-command-center round) — additive.
+    # revenue_gap is the floored-at-zero, pressure-facing sibling of
+    # revenue_today_gap (see compute_revenue_gap()'s own docstring,
+    # services/leads/intelligence.py); decision_score quantifies urgency
+    # independently of sales_readiness_score; required_actions_today/
+    # required_calls_today/required_messages_today are compute_required_
+    # actions()'s own daily quota; pressure_message is the one sentence
+    # engineered to be impossible to ignore.
+    revenue_gap: float
+    decision_score: int
+    required_actions_today: int
+    required_calls_today: int
+    required_messages_today: int
+    pressure_message: str

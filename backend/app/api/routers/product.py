@@ -11,11 +11,15 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.schemas.product import ProductSummaryResponse
 from app.services.leads.intelligence import (
+    compute_decision_score,
     compute_dynamic_kpis,
     compute_global_decision,
     compute_main_action,
+    compute_pressure_message,
     compute_product_mode,
     compute_product_summary,
+    compute_required_actions,
+    compute_revenue_gap,
     compute_sales_readiness,
     simplify_system_state,
 )
@@ -86,7 +90,17 @@ async def get_product_summary(
     kpis()/compute_sales_readiness()/compute_main_action()/simplify_
     system_state(), services/leads/intelligence.py) — no per-industry
     logic anywhere, so this reads correctly for any vertical this tenant
-    happens to sell into."""
+    happens to sell into.
+
+    Revenue Command Center round adds revenue_gap/decision_score/
+    required_actions_today/required_calls_today/required_messages_today/
+    pressure_message — still zero new queries, all derived from `signals`
+    (which now also carries revenue_gap once compute_revenue_gap() runs)
+    and `kpis` (see compute_revenue_gap()/compute_required_actions()/
+    compute_decision_score()/compute_pressure_message(), same module).
+    compute_main_action() was replaced this round to name real leads by
+    count and value instead of a generic sentence — see its own
+    docstring."""
     start = time.perf_counter()
     organization_id = _require_organization(session)
     now = dt.now(timezone.utc)
@@ -143,6 +157,7 @@ async def get_product_summary(
     signals = {
         "revenue_today_expected": revenue_today_expected,
         "revenue_today_gap": revenue_today_gap,
+        "revenue_today_possible": revenue_today_expected,
         "current_expected": current_expected,
         "daily_target_revenue": daily_target_revenue,
         "response_rate": response_metrics.response_rate,
@@ -157,16 +172,30 @@ async def get_product_summary(
     kpis = compute_dynamic_kpis(product_mode, signals)
     sales_readiness_score = compute_sales_readiness(signals, performance=None, leaks=leaks)
 
+    # Revenue Command Center (revenue-command-center round) — revenue_gap
+    # feeds both compute_required_actions() and compute_decision_score(),
+    # so it's threaded into `signals` before either runs.
+    revenue_gap = compute_revenue_gap(signals, kpis)
+    signals["revenue_gap"] = revenue_gap
+    required_actions = compute_required_actions(signals, {"revenue_gap": revenue_gap}, kpis)
+    decision_score = compute_decision_score(signals)
+
     summary["product_mode"] = product_mode
     summary["sales_readiness_score"] = sales_readiness_score
+    summary["decision_score"] = decision_score
     summary["kpis"] = kpis
-    summary["main_action"] = compute_main_action({**signals, "product_mode": product_mode})
+    summary["main_action"] = compute_main_action(ranked)
     summary["system_state"] = simplify_system_state(summary)
     summary["revenue_today_possible"] = revenue_today_expected
     summary["next_best_action"] = decision["next_action"]
     summary["top_priority_lead_id"] = (
         summary["biggest_opportunity"]["lead_id"] if summary["biggest_opportunity"] else None
     )
+    summary["revenue_gap"] = revenue_gap
+    summary["required_actions_today"] = required_actions["required_actions_today"]
+    summary["required_calls_today"] = required_actions["required_calls_today"]
+    summary["required_messages_today"] = required_actions["required_messages_today"]
+    summary["pressure_message"] = compute_pressure_message(summary)
 
     return ApiResponse(
         success=True,

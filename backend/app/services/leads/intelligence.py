@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
+
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.performance import UserPerformanceResponse
-from app.services.leads.enrichment import format_brl
+from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, format_brl
 
 # ADVANCED LAYER — this module's original per-signal endpoints
 # (/intelligence/adaptive-weights, /trends, /global-strategy,
@@ -314,30 +316,254 @@ def compute_sales_readiness(
     return round(max(0, min(100, score)))
 
 
-def compute_main_action(product_summary: dict) -> str:
-    """Clear Action Directive (Task 4, product-layer round) — one blunt,
-    non-technical PT sentence, worst-signal-first (same severity-ordering
-    precedent _build_focus_message/generate_accountability_message already
-    set, workday_engine.py):
-      1. overdue_count > 0 — leads already late outrank everything else.
-      2. high_value_leads_without_action > 0 (detect_revenue_leaks()'s own
-         signal, scoring.py) — a big deal with no next step is the next
-         worst thing.
-      3. next_action == "call_now" (compute_global_decision()'s own
-         decision, this module) — a specific lead is mandatory right now.
-      4. product_mode == "volume" (compute_product_mode(), above) — no
-         single lead is on fire, but this tenant's own strategy profile
-         says more outbound volume is the lever.
-      5. otherwise — pipeline's under control, keep executing the plan."""
-    if product_summary.get("overdue_count", 0) > 0:
-        return "Foque em responder leads atrasados agora."
-    if product_summary.get("high_value_leads_without_action", 0) > 0:
-        return "Pare de ignorar leads de alto valor."
-    if product_summary.get("next_action") == "call_now":
-        return "Priorize ligações em leads quentes."
-    if product_summary.get("product_mode") == "volume":
-        return "Aumente volume de mensagens hoje."
-    return "Continue executando o plano atual — pipeline sob controle."
+# ---------------------------------------------------------------------------
+# REVENUE COMMAND CENTER (revenue-command-center round) — this round adds
+# no new intelligence: every function below still only aggregates figures
+# the product layer above (or scoring.py/workday_engine.py underneath it)
+# already computed. The goal is pressure and forced action, not new
+# analysis — no per-industry logic anywhere, same universal, currency-
+# unit-agnostic stance as the product layer.
+# ---------------------------------------------------------------------------
+
+
+def compute_revenue_gap(summary: dict, target: dict) -> float:
+    """Revenue Gap (Task 1, revenue-command-center round) — the pressure-
+    facing, floored-at-zero sibling of revenue_today_gap
+    (compute_product_summary(), above): revenue_today_gap can read
+    negative when this tenant is already ahead of daily_target_revenue (a
+    surplus, not a shortfall), which is fine for an informational field but
+    wrong for a number this round's pressure_message/required_actions
+    display as money being lost — 0 there means "no shortfall," never "no
+    data." target.daily_target_revenue is compute_dynamic_kpis()'s own
+    figure (itself compute_daily_target_revenue(), workday_engine.py,
+    reused not recomputed); summary.revenue_today_possible is sum_today_
+    potential_revenue()'s same figure under this round's own literal name
+    (compute_product_summary()'s revenue_today_expected)."""
+    daily_target_revenue = target.get("daily_target_revenue", 0)
+    revenue_today_possible = summary.get("revenue_today_possible", 0)
+    return max(daily_target_revenue - revenue_today_possible, 0)
+
+
+# compute_main_action()'s own thresholds/vocabulary (Task 2, revenue-
+# command-center round — REPLACES the prior generic version below).
+# HIGH_VALUE_LEAD_THRESHOLD (enrichment.py) is the same bar detect_
+# revenue_leaks() already uses; _HIGH_WIN_PROBABILITY_THRESHOLD mirrors
+# scoring.py's own private constant of the same name/value (70) — kept as
+# its own local copy rather than a cross-module import of a name used 11
+# times inside scoring.py's own internals, same "independent constant, same
+# value, disclosed" precedent GET /workday/target's own
+# _ACCELERATION_MODE_GAP_THRESHOLD already sets against scoring.py's
+# compute_acceleration_mode(). days_since_last_activity >= 1 is compute_
+# lost_opportunity_today()'s own idle bar (workday_engine.py).
+_HIGH_WIN_PROBABILITY_THRESHOLD = 70
+_MAIN_ACTION_IDLE_DAYS = 1
+
+_MAIN_ACTION_VERB_BY_TYPE = {
+    "call_now": "Ligue agora para",
+    "send_message": "Envie mensagem para",
+    "schedule_meeting": "Priorize reuniões com",
+}
+
+
+def _dominant_action_type(leads: list[LeadResponse]) -> str:
+    """The most common next_best_action_type (compute_action_type_and_
+    urgency()'s own vocabulary, scoring.py) among `leads` — picks
+    compute_main_action()'s verb without inventing a new classification."""
+    counts: dict[str, int] = {}
+    for lead in leads:
+        action_type = lead.next_best_action_type or "send_message"
+        counts[action_type] = counts.get(action_type, 0) + 1
+    return max(counts, key=counts.get)
+
+
+def compute_main_action(leads: list[LeadResponse]) -> str:
+    """Hard Main Action (Task 2, revenue-command-center round) — REPLACES
+    the prior generic version. Always specific, numeric, direct: a real
+    count of real leads clearing real thresholds, never a vague nudge.
+    Priority, worst-and-most-valuable-first:
+      1. open leads that are idle-or-overdue AND high-value (expected_
+         value >= HIGH_VALUE_LEAD_THRESHOLD) AND high-win-probability
+         (win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD) — the exact
+         "highest expected_value, highest win_probability, idle or
+         overdue" combination this round asks for, sorted by
+         (expected_value, win_probability) desc. The dominant
+         next_best_action_type among them (majority vote,
+         _dominant_action_type() above) picks the verb.
+      2. any overdue open lead, regardless of value — "leads atrasados."
+      3. any idle (not overdue) open lead — "leads parados há mais de
+         24h."
+      4. otherwise — pipeline genuinely under control, no candidate
+         clears even the idle bar."""
+    open_leads = [lead for lead in leads if lead.status not in ("converted", "lost")]
+    idle_or_overdue = [
+        lead
+        for lead in open_leads
+        if lead.is_overdue or lead.days_since_last_activity >= _MAIN_ACTION_IDLE_DAYS
+    ]
+    if not idle_or_overdue:
+        return "Continue executando o plano atual — pipeline sob controle."
+
+    hot = [
+        lead
+        for lead in idle_or_overdue
+        if lead.expected_value >= HIGH_VALUE_LEAD_THRESHOLD
+        and lead.win_probability >= _HIGH_WIN_PROBABILITY_THRESHOLD
+    ]
+    if hot:
+        hot.sort(key=lambda lead: (lead.expected_value, lead.win_probability), reverse=True)
+        verb = _MAIN_ACTION_VERB_BY_TYPE.get(_dominant_action_type(hot), "Priorize")
+        return (
+            f"{verb} {len(hot)} leads acima de R$ {format_brl(HIGH_VALUE_LEAD_THRESHOLD)} "
+            "com alta chance de fechamento."
+        )
+
+    overdue = [lead for lead in idle_or_overdue if lead.is_overdue]
+    if overdue:
+        verb = _MAIN_ACTION_VERB_BY_TYPE.get(_dominant_action_type(overdue), "Priorize")
+        return f"{verb} {len(overdue)} leads atrasados agora."
+
+    verb = _MAIN_ACTION_VERB_BY_TYPE.get(_dominant_action_type(idle_or_overdue), "Priorize")
+    return f"{verb} {len(idle_or_overdue)} leads parados há mais de 24h."
+
+
+# compute_required_actions()'s own bias ratio (Task 3, revenue-command-
+# center round) — the biased channel's own share of required_actions_today
+# when there's a clear next_action signal; the other channel takes the
+# remainder. Even 50/50 split otherwise. _FOCUS_BY_NEXT_ACTION reuses
+# compute_global_decision()'s own next_action (this module) rather than a
+# separate Global Strategy Engine call (compute_global_strategy(), which
+# needs two more queries GET /product/summary doesn't otherwise pay for) —
+# same "calls"/"messages"/"meetings" vocabulary that engine's own `focus`
+# field already uses, just derived from a signal already in hand.
+_REQUIRED_ACTIONS_BIAS_RATIO = 0.7
+_FOCUS_BY_NEXT_ACTION = {
+    "call_now": "calls",
+    "send_message": "messages",
+    "schedule_meeting": "meetings",
+}
+
+
+def compute_required_actions(summary: dict, target: dict, kpis: dict) -> dict:
+    """Forced KPI (Task 3, revenue-command-center round) — turns
+    revenue_gap into a concrete daily action quota, an obligation rather
+    than a suggestion. avg_expected_value_per_action is not a new figure:
+    summary's own current_expected (simulate_revenue_if_all_actions_
+    executed(), scoring.py) divided by total_open_leads (both already
+    counted off the same `ranked` pool every other figure here reads) —
+    the average expected value one open lead/action represents right now.
+    required_actions_today = ceil(target.revenue_gap /
+    avg_expected_value_per_action), floored at kpis.ideal_actions_per_day
+    (compute_dynamic_kpis(), above) — this tenant's own product_mode
+    baseline is never undercut by a small gap. 0/0/0 when there's no gap
+    or no open pipeline to act on at all.
+
+    Split by summary's own next_action via _FOCUS_BY_NEXT_ACTION above:
+    call_now biases required_calls_today, send_message biases required_
+    messages_today (each at _REQUIRED_ACTIONS_BIAS_RATIO of the total),
+    anything else splits evenly."""
+    revenue_gap = target.get("revenue_gap", 0)
+    current_expected = summary.get("current_expected", 0)
+    total_open_leads = summary.get("total_open_leads", 0)
+    avg_expected_value_per_action = (
+        current_expected / total_open_leads if total_open_leads > 0 else 0
+    )
+
+    if revenue_gap <= 0 or avg_expected_value_per_action <= 0:
+        return {
+            "required_actions_today": 0,
+            "required_calls_today": 0,
+            "required_messages_today": 0,
+        }
+
+    required_actions_today = math.ceil(revenue_gap / avg_expected_value_per_action)
+    required_actions_today = max(required_actions_today, kpis.get("ideal_actions_per_day", 0))
+
+    focus = _FOCUS_BY_NEXT_ACTION.get(summary.get("next_action"))
+    if focus == "calls":
+        required_calls_today = math.ceil(required_actions_today * _REQUIRED_ACTIONS_BIAS_RATIO)
+        required_messages_today = required_actions_today - required_calls_today
+    elif focus == "messages":
+        required_messages_today = math.ceil(required_actions_today * _REQUIRED_ACTIONS_BIAS_RATIO)
+        required_calls_today = required_actions_today - required_messages_today
+    else:
+        required_calls_today = required_actions_today // 2
+        required_messages_today = required_actions_today - required_calls_today
+
+    return {
+        "required_actions_today": required_actions_today,
+        "required_calls_today": required_calls_today,
+        "required_messages_today": required_messages_today,
+    }
+
+
+def compute_pressure_message(product_summary: dict) -> str:
+    """Pressure Message (Task 4, revenue-command-center round) — the one
+    sentence engineered to be impossible to ignore, worst-case first:
+    a critical system_state (simplify_system_state(), above) always leads
+    with "travado," even when revenue_gap alone wouldn't justify it on its
+    own; otherwise a positive revenue_gap (compute_revenue_gap(), above)
+    gets paired with main_action (compute_main_action(), above) so the
+    money and the fix land in the same sentence; a fully on-track pipeline
+    with no gap gets the calm confirmation. No new computation — every
+    value here is read straight off `product_summary`."""
+    gap = product_summary.get("revenue_gap", 0)
+    status = product_summary.get("system_state", {}).get("status")
+
+    if status == "critical":
+        return f"Seu sistema está travado. R$ {format_brl(gap)} estão sendo perdidos agora."
+    if gap > 0:
+        main_action = product_summary.get("main_action", "")
+        return f"Você está deixando R$ {format_brl(gap)} na mesa hoje. {main_action}"
+    return "Você está no controle. Continue executando."
+
+
+# compute_decision_score()'s own weights (Task 5, revenue-command-center
+# round) — the round's own literal point values.
+_DECISION_URGENCY_WEIGHT = 40
+_DECISION_GAP_WEIGHT = 40
+_DECISION_PIPELINE_WEIGHT = 20
+
+
+def compute_decision_score(summary: dict) -> int:
+    """Decision Priority Score (Task 5, revenue-command-center round) —
+    0-100, HOW URGENT taking action is right now. Deliberately independent
+    of sales_readiness_score (compute_sales_readiness(), above) — that one
+    measures overall pipeline health, this one measures pressure to act
+    today; collapsing them into one number would hide a healthy-but-urgent
+    pipeline (or vice versa) behind a single blended figure. Built from the
+    same already-counted signals every other function in this section
+    reads:
+      urgency (+40) — overdue_count / total_open_leads.
+      revenue gap (+40) — compute_revenue_gap()'s own figure as a share of
+        daily_target_revenue (no target yet, or no gap, contributes 0 from
+        this term — not a penalty).
+      pipeline value at stake (+20) — current_expected as a share of
+        daily_target_revenue, capped at 1.0 — a large uncaptured pipeline
+        sitting mostly idle is itself urgent, target-relative so it stays
+        meaningful across tenants of any size. Clamped to [0, 100]."""
+    total_open_leads = summary.get("total_open_leads", 0)
+    overdue_ratio = (
+        min(summary.get("overdue_count", 0) / total_open_leads, 1.0) if total_open_leads > 0 else 0.0
+    )
+
+    daily_target_revenue = summary.get("daily_target_revenue", 0)
+    gap_ratio = (
+        min(summary.get("revenue_gap", 0) / daily_target_revenue, 1.0)
+        if daily_target_revenue > 0
+        else 0.0
+    )
+
+    current_expected = summary.get("current_expected", 0)
+    pipeline_ratio = (
+        min(current_expected / daily_target_revenue, 1.0) if daily_target_revenue > 0 else 0.0
+    )
+
+    score = (
+        _DECISION_URGENCY_WEIGHT * overdue_ratio
+        + _DECISION_GAP_WEIGHT * gap_ratio
+        + _DECISION_PIPELINE_WEIGHT * pipeline_ratio
+    )
+    return round(max(0, min(100, score)))
 
 
 # simplify_system_state()'s own thresholds (Task 6, product-layer round) —
