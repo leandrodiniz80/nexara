@@ -5,6 +5,7 @@ import math
 from app.schemas.leads.lead import LeadResponse
 from app.schemas.performance import UserPerformanceResponse
 from app.services.leads.enrichment import HIGH_VALUE_LEAD_THRESHOLD, format_brl
+from app.services.leads.scoring import ACTION_EVENT_TYPE_TO_ACTION_TYPE
 
 # ADVANCED LAYER — this module's original per-signal endpoints
 # (/intelligence/adaptive-weights, /trends, /global-strategy,
@@ -585,3 +586,276 @@ def simplify_system_state(product_summary: dict) -> dict:
     if score >= _SYSTEM_STATE_ATTENTION_MIN:
         return {"status": "attention", "message": "Você está perdendo oportunidades importantes."}
     return {"status": "critical", "message": "Seu sistema está travado, ação imediata necessária."}
+
+
+# ---------------------------------------------------------------------------
+# SELF-OPTIMIZING REVENUE BRAIN (self-optimizing-revenue-brain round) —
+# still no new intelligence engine: everything below mines the same
+# LeadActivityLog outcomes compute_conversion_insights() (scoring.py)
+# already reads, and the same already-scored `ranked` pool every function
+# above already operates on. The one genuinely new data source is
+# `activities` — product.py's own single bounded query over lead_lost +
+# action_* rows, since no existing aggregate joins those two event
+# families together. No per-industry logic anywhere.
+# ---------------------------------------------------------------------------
+
+# compute_failure_patterns()'s own vocabulary/thresholds (Task 1). Reuses
+# scoring.py's own ACTION_EVENT_TYPE_TO_ACTION_TYPE (call_now/send_message/
+# schedule_meeting) rather than inventing a parallel "channel" vocabulary —
+# there is no channel dimension in this data model beyond action type.
+_ACTION_EVENT_TYPES = frozenset(ACTION_EVENT_TYPE_TO_ACTION_TYPE)
+_ACTION_TYPE_LABEL_PT = {
+    "call_now": "ligações",
+    "send_message": "mensagens",
+    "schedule_meeting": "reuniões",
+}
+# A lost lead whose own time-to-loss (duration_seconds on its lead_lost
+# LeadActivityLog entry, same field lead_won already carries for time-to-
+# close) is at or under this many days is "early" — mirrors
+# AT_RISK_STALE_AFTER_DAYS's own value (workday_engine.py) for consistency
+# with this codebase's other "steady" day-based bars.
+_FAILURE_TIMING_EARLY_DAYS_MAX = 3
+
+
+def compute_failure_patterns(leads: list[LeadResponse], activities: dict) -> dict:
+    """Failure Intelligence Engine (Task 1, self-optimizing-revenue-brain
+    round) — mines already-recorded outcomes for what's NOT working, no ML.
+
+    activities is a plain dict the caller (product.py) assembles:
+      "top_loss_reason" — compute_conversion_insights()'s own figure
+        (scoring.py, LOSS_REASON_MARKER technique), threaded through
+        rather than re-parsed here.
+      "rows" — lead_lost + action_call/action_message/action_meeting
+        LeadActivityLog rows for this org (one bounded query, capped at
+        product.py's own window/row limit), each
+        {"lead_id", "event_type", "created_at", "duration_seconds"}.
+
+    For every lost lead, the action_* row immediately preceding its
+    lead_lost entry is "the last thing tried before it died"; the most
+    common such action across all lost leads in the window is
+    worst_channel (in the same call_now/send_message/schedule_meeting
+    vocabulary next_best_action_type already uses — so apply_failure_
+    corrections()/compute_next_best_move() can compare against it
+    directly), and worst_action_pattern is that same finding as a PT
+    sentence for display. failure_timing compares the average lead_lost
+    duration_seconds (converted to days) against
+    _FAILURE_TIMING_EARLY_DAYS_MAX: "early" means deals are dying fast (the
+    fix is faster follow-up), "late" — including "no timing signal yet" —
+    means deals linger before dying (the fix is more persistence, not
+    urgency).
+
+    `leads` is accepted for signature parity with this round's own spec
+    and reserved for future blending (e.g. weighting patterns by the
+    current pipeline's own segment mix) — not read yet."""
+    rows = activities.get("rows", [])
+    lost_events = [row for row in rows if row["event_type"] == "lead_lost"]
+
+    if not lost_events:
+        return {
+            "top_loss_reason": activities.get("top_loss_reason"),
+            "worst_action_pattern": None,
+            "failure_timing": "late",
+            "worst_channel": None,
+        }
+
+    actions_by_lead: dict[str, list[dict]] = {}
+    for row in rows:
+        if row["event_type"] in _ACTION_EVENT_TYPES:
+            actions_by_lead.setdefault(row["lead_id"], []).append(row)
+
+    last_action_counts: dict[str, int] = {}
+    loss_days: list[float] = []
+    for lost in lost_events:
+        if lost["duration_seconds"] is not None:
+            loss_days.append(lost["duration_seconds"] / 86400)
+
+        candidates = [
+            action for action in actions_by_lead.get(lost["lead_id"], [])
+            if action["created_at"] <= lost["created_at"]
+        ]
+        if not candidates:
+            continue
+        last_action = max(candidates, key=lambda action: action["created_at"])
+        last_action_counts[last_action["event_type"]] = (
+            last_action_counts.get(last_action["event_type"], 0) + 1
+        )
+
+    worst_event_type = (
+        max(last_action_counts, key=last_action_counts.get) if last_action_counts else None
+    )
+    worst_channel = (
+        ACTION_EVENT_TYPE_TO_ACTION_TYPE.get(worst_event_type) if worst_event_type else None
+    )
+    worst_action_pattern = (
+        f"{_ACTION_TYPE_LABEL_PT.get(worst_channel, worst_channel)} antes da perda"
+        if worst_channel
+        else None
+    )
+
+    avg_loss_days = sum(loss_days) / len(loss_days) if loss_days else None
+    failure_timing = (
+        "early"
+        if avg_loss_days is not None and avg_loss_days <= _FAILURE_TIMING_EARLY_DAYS_MAX
+        else "late"
+    )
+
+    return {
+        "top_loss_reason": activities.get("top_loss_reason"),
+        "worst_action_pattern": worst_action_pattern,
+        "failure_timing": failure_timing,
+        "worst_channel": worst_channel,
+    }
+
+
+def compute_revenue_efficiency(leads: list[LeadResponse]) -> dict:
+    """Revenue Efficiency Engine (Task 3, self-optimizing-revenue-brain
+    round) — pure, leads-only, no query. revenue_per_lead is the same
+    expected_value-per-open-lead figure every other function in this
+    module already sums; revenue_per_action divides that same total by
+    chain_step (execution_engine.py's own per-lead cadence-progress
+    counter, already on LeadResponse) summed across leads — the actions
+    already taken on this pipeline, not a new count; conversion_efficiency
+    is the average win_probability across open leads, 0-100, the same
+    scale compute_sales_readiness()'s own response/execution ratios use."""
+    open_leads = [lead for lead in leads if lead.status not in ("converted", "lost")]
+    lead_count = len(open_leads)
+    if lead_count == 0:
+        return {"revenue_per_action": 0.0, "revenue_per_lead": 0.0, "conversion_efficiency": 0.0}
+
+    total_expected_value = sum(lead.expected_value for lead in open_leads)
+    total_actions_taken = sum(lead.chain_step or 0 for lead in open_leads)
+
+    return {
+        "revenue_per_action": (
+            total_expected_value / total_actions_taken if total_actions_taken > 0 else 0.0
+        ),
+        "revenue_per_lead": total_expected_value / lead_count,
+        "conversion_efficiency": sum(lead.win_probability for lead in open_leads) / lead_count,
+    }
+
+
+# compute_efficiency_mode()'s own bar (Task 3) — mirrors
+# _HIGH_WIN_PROBABILITY_THRESHOLD (scoring.py's own constant, already
+# locally mirrored above for compute_main_action()) rather than a third
+# copy of the same number under a new name.
+_EFFICIENCY_HIGH_CONVERSION_THRESHOLD = _HIGH_WIN_PROBABILITY_THRESHOLD
+
+
+def compute_efficiency_mode(efficiency: dict) -> str:
+    """Efficiency Mode (Task 3, self-optimizing-revenue-brain round) —
+    "efficient"/"underutilized"/"wasteful" from compute_revenue_
+    efficiency()'s own three numbers, no new signal:
+      efficient — conversion_efficiency already clears the same "hot
+        pipeline" bar compute_lead_score()'s own high-value-high-
+        probability bonus uses. Checked first: real conversions happening
+        outranks anything the other two ratios might suggest.
+      underutilized — revenue_per_action >= revenue_per_lead > 0: since
+        revenue_per_action divides the same total by actions taken
+        (usually >= number of leads once any cadence has run), this ratio
+        only reaches or exceeds revenue_per_lead when very few actions
+        have been taken per lead relative to the value sitting there —
+        good leads, barely worked.
+      wasteful — the default: effort is going in without a
+        proportionally high per-action or per-lead payoff."""
+    if efficiency.get("conversion_efficiency", 0) >= _EFFICIENCY_HIGH_CONVERSION_THRESHOLD:
+        return "efficient"
+    if efficiency.get("revenue_per_action", 0) >= efficiency.get("revenue_per_lead", 0) > 0:
+        return "underutilized"
+    return "wasteful"
+
+
+# compute_next_best_move()'s own copy (Task 4).
+_NEXT_BEST_MOVE_BY_EFFICIENCY_MODE = {
+    "underutilized": "Aumente o volume de ações agora — seus leads são bons, mas estão parados.",
+    "efficient": "Dobre a aposta no seu melhor segmento — o que está funcionando, funcione mais.",
+}
+_ALTERNATIVE_CHANNEL_VERB_PT = {
+    "call_now": "Ligue",
+    "send_message": "Envie mensagem",
+    "schedule_meeting": "Agende reuniões",
+}
+
+
+def compute_next_best_move(product_summary: dict, failure_patterns: dict, efficiency_mode: str) -> str:
+    """Decision Intelligence upgrade (Task 4, self-optimizing-revenue-brain
+    round) — one brutal sentence combining efficiency_mode's own directive
+    (compute_efficiency_mode(), above) with an explicit "stop doing X" lead
+    when failure_patterns has a worst_channel (compute_failure_patterns(),
+    above) to name. "wasteful" picks the OTHER of call_now/send_message as
+    the alternative channel (defaulting to call_now when there's no
+    worst_channel to avoid) and reuses HIGH_VALUE_LEAD_THRESHOLD/the
+    "alta probabilidade" framing compute_main_action() already uses, so
+    this stays the same vocabulary a reader of that field already knows.
+
+    `product_summary` is accepted for signature parity with this round's
+    own spec and reserved for future blending (e.g. deferring to
+    execution_blocked's own mandatory lead instead of the efficiency-mode
+    directive) — not read yet; every signal this function currently needs
+    already comes from failure_patterns/efficiency_mode."""
+    worst_channel = failure_patterns.get("worst_channel")
+    avoid_clause = (
+        f"Pare de investir em {_ACTION_TYPE_LABEL_PT.get(worst_channel, worst_channel)}."
+        if worst_channel
+        else None
+    )
+
+    if efficiency_mode == "wasteful":
+        alternative = "call_now" if worst_channel != "call_now" else "send_message"
+        verb = _ALTERNATIVE_CHANNEL_VERB_PT.get(alternative, "Priorize")
+        move = (
+            f"{verb} apenas para leads acima de R$ {format_brl(HIGH_VALUE_LEAD_THRESHOLD)} "
+            "com alta probabilidade — você está desperdiçando esforço."
+        )
+    else:
+        move = _NEXT_BEST_MOVE_BY_EFFICIENCY_MODE.get(
+            efficiency_mode, _NEXT_BEST_MOVE_BY_EFFICIENCY_MODE["underutilized"]
+        )
+
+    return f"{avoid_clause} {move}" if avoid_clause else move
+
+
+# compute_system_health()'s own weights/bands (Task 5). readiness/
+# efficiency each pull health up; urgency (decision_score) pulls it down —
+# leak/overdue signals are NOT re-read here since sales_readiness_score
+# already penalizes both internally (see compute_sales_readiness()'s own
+# docstring) — reusing that score is the whole point, not re-penalizing
+# the same two signals a second time.
+_HEALTH_READINESS_WEIGHT = 0.4
+_HEALTH_EFFICIENCY_WEIGHT = 0.3
+_HEALTH_URGENCY_PENALTY_WEIGHT = 0.3
+
+_SYSTEM_HEALTH_SCALING_MIN = 75
+_SYSTEM_HEALTH_STABLE_MIN = 50
+_SYSTEM_HEALTH_LEAKING_MIN = 25
+
+
+def compute_system_health(summary: dict, efficiency: dict) -> dict:
+    """System Self-Evaluation (Task 5, self-optimizing-revenue-brain
+    round) — 0-100 health_score blending sales_readiness_score (summary's
+    own figure, compute_sales_readiness() — already accounts for leaks and
+    overdue leads internally), decision_score (summary's own urgency
+    figure, compute_decision_score() — read as a penalty: high urgency
+    pulls health down), and conversion_efficiency (efficiency's own
+    figure, compute_revenue_efficiency() above). Banded into "scaling"/
+    "stable"/"leaking"/"critical", worst-first."""
+    readiness = summary.get("sales_readiness_score", 0)
+    urgency = summary.get("decision_score", 0)
+    conversion_efficiency = min(efficiency.get("conversion_efficiency", 0), 100)
+
+    health_score = round(
+        _HEALTH_READINESS_WEIGHT * readiness
+        + _HEALTH_EFFICIENCY_WEIGHT * conversion_efficiency
+        + _HEALTH_URGENCY_PENALTY_WEIGHT * (100 - urgency)
+    )
+    health_score = max(0, min(100, health_score))
+
+    if health_score >= _SYSTEM_HEALTH_SCALING_MIN:
+        status = "scaling"
+    elif health_score >= _SYSTEM_HEALTH_STABLE_MIN:
+        status = "stable"
+    elif health_score >= _SYSTEM_HEALTH_LEAKING_MIN:
+        status = "leaking"
+    else:
+        status = "critical"
+
+    return {"health_score": health_score, "status": status}

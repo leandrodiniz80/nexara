@@ -3,28 +3,37 @@ from datetime import datetime as dt
 from datetime import timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import get_current_session
 from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
+from app.models.leads.lead_activity_log import LeadActivityLog
 from app.schemas.product import ProductSummaryResponse
 from app.services.leads.intelligence import (
     compute_decision_score,
     compute_dynamic_kpis,
+    compute_efficiency_mode,
+    compute_failure_patterns,
     compute_global_decision,
     compute_main_action,
+    compute_next_best_move,
     compute_pressure_message,
     compute_product_mode,
     compute_product_summary,
     compute_required_actions,
+    compute_revenue_efficiency,
     compute_revenue_gap,
     compute_sales_readiness,
+    compute_system_health,
     simplify_system_state,
 )
 from app.services.leads.scoring import (
+    apply_failure_corrections,
     compute_aggression_level,
+    compute_conversion_insights,
     compute_response_metrics,
     detect_revenue_leaks,
     rank_leads_by_priority,
@@ -50,12 +59,56 @@ from app.services.leads.workday_engine import (
 # services/leads/intelligence.py).
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/product", tags=["Product"])
 
+# _fetch_failure_pattern_rows()'s own window/cap (self-optimizing-revenue-
+# brain round) — the one genuinely new query this endpoint pays for: no
+# existing aggregate joins lead_lost against the action_* events that
+# preceded it. Bounded the same "steady window, capped rows" way
+# compute_response_metrics()'s own window and rank_leads_by_priority()'s
+# own _PRIORITY_CANDIDATE_POOL_SIZE already are (scoring.py).
+_FAILURE_PATTERN_WINDOW_DAYS = 90
+_FAILURE_PATTERN_ROW_LIMIT = 2000
+
 
 def _require_organization(session: dict) -> str:
     organization_id = session.get("organization_id")
     if organization_id is None:
         raise HTTPException(status_code=403, detail="Your account isn't part of an organization")
     return organization_id
+
+
+async def _fetch_failure_pattern_rows(db: AsyncSession, organization_id: str, *, cutoff: dt) -> list[dict]:
+    """One bounded query backing compute_failure_patterns()'s own
+    activities["rows"] (services/leads/intelligence.py) — lead_lost +
+    action_call/action_message/action_meeting LeadActivityLog rows, the
+    only two event families that function needs and no existing aggregate
+    already joins."""
+    stmt = (
+        select(
+            LeadActivityLog.lead_id,
+            LeadActivityLog.event_type,
+            LeadActivityLog.created_at,
+            LeadActivityLog.duration_seconds,
+        )
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type.in_(
+                ("lead_lost", "action_call", "action_message", "action_meeting")
+            ),
+            LeadActivityLog.created_at >= cutoff,
+        )
+        .order_by(LeadActivityLog.created_at.asc())
+        .limit(_FAILURE_PATTERN_ROW_LIMIT)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "lead_id": row.lead_id,
+            "event_type": row.event_type,
+            "created_at": row.created_at,
+            "duration_seconds": row.duration_seconds,
+        }
+        for row in rows
+    ]
 
 
 @router.get("/summary", response_model=ApiResponse[ProductSummaryResponse])
@@ -106,6 +159,26 @@ async def get_product_summary(
     now = dt.now(timezone.utc)
 
     ranked = await rank_leads_by_priority(db, organization_id)
+
+    # Self-Optimizing Revenue Brain (self-optimizing-revenue-brain round)
+    # — failure_patterns is computed before anything else reads `ranked`
+    # so apply_failure_corrections() (scoring.py) can correct every lead's
+    # score/urgency in place, the same "apply_*_override, don't rewrite
+    # compute_lead_score()" precedent apply_strategy_override() already
+    # uses. Two new queries total: compute_conversion_insights()'s own two
+    # (already-established, reused verbatim for top_loss_reason — not
+    # re-parsed) and _fetch_failure_pattern_rows()'s own one bounded query.
+    failure_pattern_cutoff = now - timedelta(days=_FAILURE_PATTERN_WINDOW_DAYS)
+    conversion_insights = await compute_conversion_insights(db, organization_id)
+    failure_pattern_rows = await _fetch_failure_pattern_rows(
+        db, organization_id, cutoff=failure_pattern_cutoff
+    )
+    failure_patterns = compute_failure_patterns(
+        ranked,
+        {"top_loss_reason": conversion_insights.top_loss_reason, "rows": failure_pattern_rows},
+    )
+    ranked = [apply_failure_corrections(lead, failure_patterns) for lead in ranked]
+
     open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
 
     revenue_today_expected = sum_today_potential_revenue(ranked, now=now)
@@ -196,6 +269,22 @@ async def get_product_summary(
     summary["required_calls_today"] = required_actions["required_calls_today"]
     summary["required_messages_today"] = required_actions["required_messages_today"]
     summary["pressure_message"] = compute_pressure_message(summary)
+
+    # Self-Optimizing Revenue Brain (self-optimizing-revenue-brain round)
+    # — efficiency/health are pure aggregation over `ranked` (already
+    # corrected above) and `summary`'s own already-computed scores, zero
+    # further queries.
+    efficiency = compute_revenue_efficiency(ranked)
+    efficiency_mode = compute_efficiency_mode(efficiency)
+    system_health = compute_system_health(summary, efficiency)
+
+    summary["efficiency_mode"] = efficiency_mode
+    summary["next_best_move"] = compute_next_best_move(summary, failure_patterns, efficiency_mode)
+    summary["system_health"] = system_health["health_score"]
+    summary["system_status"] = system_health["status"]
+    summary["failure_pattern_detected"] = bool(
+        failure_patterns.get("top_loss_reason") or failure_patterns.get("worst_channel")
+    )
 
     return ApiResponse(
         success=True,

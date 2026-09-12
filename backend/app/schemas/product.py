@@ -85,3 +85,18 @@ class ProductSummaryResponse(BaseModel):
     required_calls_today: int
     required_messages_today: int
     pressure_message: str
+
+    # Self-Optimizing Revenue Brain (self-optimizing-revenue-brain round)
+    # — additive. efficiency_mode/next_best_move are compute_efficiency_
+    # mode()/compute_next_best_move()'s own output; system_health/
+    # system_status are compute_system_health()'s own health_score/status
+    # (renamed at this level so they don't collide with the product-layer
+    # round's own system_state object above); failure_pattern_detected is
+    # true when compute_failure_patterns() found a real top_loss_reason or
+    # worst_channel signal in the org's own recent outcomes. See
+    # services/leads/intelligence.py for all of the above.
+    efficiency_mode: str
+    next_best_move: str
+    system_health: int
+    system_status: str
+    failure_pattern_detected: bool

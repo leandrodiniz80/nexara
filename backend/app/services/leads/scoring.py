@@ -3086,6 +3086,79 @@ def apply_strategy_override(
     )
 
 
+# apply_failure_corrections()'s own tuning (Task 2, self-optimizing-
+# revenue-brain round).
+_FAILURE_CORRECTION_CHANNEL_PENALTY = -15
+_URGENCY_RANK = {"low": 0, "medium": 1, "high": 2, "immediate": 3}
+_URGENCY_BY_RANK = {0: "low", 1: "medium", 2: "high", 3: "immediate"}
+
+
+def apply_failure_corrections(response: LeadResponse, failure_patterns: dict) -> LeadResponse:
+    """Auto-Correction Engine (Task 2, self-optimizing-revenue-brain
+    round) — re-applies compute_failure_patterns()'s own findings
+    (services/leads/intelligence.py — a plain dict, no import needed here)
+    to an already-scored LeadResponse. Same "apply_*_override, don't
+    rewrite compute_lead_score()" precedent apply_strategy_override()
+    (just above) already sets: compute_lead_score() itself stays
+    completely unchanged, and every existing reader of score_leads() that
+    doesn't call this keeps the exact same score/urgency as before this
+    function existed.
+
+    Each rule independent and additive:
+      - next_best_action_type == failure_patterns["worst_channel"] (the
+        channel most associated with recent real losses) → score
+        penalized by _FAILURE_CORRECTION_CHANNEL_PENALTY and urgency
+        downgraded one rank on the low/medium/high/immediate ladder —
+        deprioritize a channel that's currently failing rather than keep
+        pushing it.
+      - failure_patterns["failure_timing"] == "early" (deals dying fast)
+        → urgency escalated one rank, capped at "immediate" — force
+        faster action before this lead dies the way recent ones have.
+      - failure_patterns["failure_timing"] == "late" (deals lingering a
+        long time before dying) → no escalation or downgrade from this
+        rule at all; "increase persistence" means this lead's own
+        recommendation is left exactly as risk-based scoring already set
+        it, not rushed or dropped.
+
+    Returns a new LeadResponse (score/score_breakdown/next_best_action_
+    urgency updated) — never mutates its input, and returns the same
+    object unchanged when nothing here actually changes anything (no
+    next_best_action_type/urgency to correct, no channel match, no
+    early-timing signal)."""
+    if response.next_best_action_type is None or response.next_best_action_urgency is None:
+        return response
+
+    score_delta = 0
+    breakdown_additions: list[ScoreBreakdownItem] = []
+    urgency_rank = _URGENCY_RANK.get(response.next_best_action_urgency, 1)
+
+    worst_channel = failure_patterns.get("worst_channel")
+    if worst_channel and response.next_best_action_type == worst_channel:
+        score_delta += _FAILURE_CORRECTION_CHANNEL_PENALTY
+        breakdown_additions.append(
+            ScoreBreakdownItem(
+                reason="Canal associado a perdas recentes",
+                impact=_FAILURE_CORRECTION_CHANNEL_PENALTY,
+            )
+        )
+        urgency_rank = max(urgency_rank - 1, 0)
+
+    if failure_patterns.get("failure_timing") == "early":
+        urgency_rank = min(urgency_rank + 1, 3)
+
+    new_urgency = _URGENCY_BY_RANK[urgency_rank]
+    if score_delta == 0 and new_urgency == response.next_best_action_urgency:
+        return response
+
+    return response.model_copy(
+        update={
+            "score": max(0, min(100, response.score + score_delta)),
+            "score_breakdown": [*response.score_breakdown, *breakdown_additions],
+            "next_best_action_urgency": new_urgency,
+        }
+    )
+
+
 async def score_leads(db: AsyncSession, leads: list[Lead]) -> list[LeadResponse]:
     """Builds LeadResponse for each lead with score/score_breakdown
     overridden by compute_lead_score(), instead of the plain
