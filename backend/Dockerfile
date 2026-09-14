@@ -24,4 +24,10 @@ EXPOSE 8000
 # monorepo's frontend-only commits also redeploy this service -- the
 # platform_auth migration is already applied, so re-running it on boot
 # isn't needed right now. Plain uvicorn start until root-caused properly.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# Shell form (not exec-form array) so ${PORT:-8000} actually expands: Railway
+# auto-detects this image's EXPOSE 8000 and doesn't require binding to its
+# own $PORT, but Render (and most other Docker PaaS) always inject $PORT and
+# expect the process to bind to it -- falling back to 8000 keeps this exact
+# image portable to both without maintaining two Dockerfiles.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

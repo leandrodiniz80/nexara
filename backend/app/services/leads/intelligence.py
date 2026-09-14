@@ -430,14 +430,14 @@ def compute_main_action(leads: list[LeadResponse]) -> str:
 # compute_required_actions()'s own bias ratio (Task 3, revenue-command-
 # center round) — the biased channel's own share of required_actions_today
 # when there's a clear next_action signal; the other channel takes the
-# remainder. Even 50/50 split otherwise. _FOCUS_BY_NEXT_ACTION reuses
+# remainder. Even 50/50 split otherwise. FOCUS_BY_NEXT_ACTION reuses
 # compute_global_decision()'s own next_action (this module) rather than a
 # separate Global Strategy Engine call (compute_global_strategy(), which
 # needs two more queries GET /product/summary doesn't otherwise pay for) —
 # same "calls"/"messages"/"meetings" vocabulary that engine's own `focus`
 # field already uses, just derived from a signal already in hand.
 _REQUIRED_ACTIONS_BIAS_RATIO = 0.7
-_FOCUS_BY_NEXT_ACTION = {
+FOCUS_BY_NEXT_ACTION = {
     "call_now": "calls",
     "send_message": "messages",
     "schedule_meeting": "meetings",
@@ -458,7 +458,7 @@ def compute_required_actions(summary: dict, target: dict, kpis: dict) -> dict:
     baseline is never undercut by a small gap. 0/0/0 when there's no gap
     or no open pipeline to act on at all.
 
-    Split by summary's own next_action via _FOCUS_BY_NEXT_ACTION above:
+    Split by summary's own next_action via FOCUS_BY_NEXT_ACTION above:
     call_now biases required_calls_today, send_message biases required_
     messages_today (each at _REQUIRED_ACTIONS_BIAS_RATIO of the total),
     anything else splits evenly."""
@@ -479,7 +479,7 @@ def compute_required_actions(summary: dict, target: dict, kpis: dict) -> dict:
     required_actions_today = math.ceil(revenue_gap / avg_expected_value_per_action)
     required_actions_today = max(required_actions_today, kpis.get("ideal_actions_per_day", 0))
 
-    focus = _FOCUS_BY_NEXT_ACTION.get(summary.get("next_action"))
+    focus = FOCUS_BY_NEXT_ACTION.get(summary.get("next_action"))
     if focus == "calls":
         required_calls_today = math.ceil(required_actions_today * _REQUIRED_ACTIONS_BIAS_RATIO)
         required_messages_today = required_actions_today - required_calls_today

@@ -16,7 +16,31 @@ from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
 from app.services.leads.enrichment import simulate_enrichment
 from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
-from app.services.leads.scoring import LOSS_REASON_MARKER, RESPONSE_EVENT_TYPE_BY_STATE, score_leads
+from app.services.leads.intelligence import (
+    FOCUS_BY_NEXT_ACTION,
+    compute_global_decision,
+    compute_required_actions,
+    compute_revenue_gap,
+)
+from app.services.leads.scoring import (
+    LOSS_REASON_MARKER,
+    RESPONSE_EVENT_TYPE_BY_STATE,
+    compute_aggression_level,
+    rank_leads_by_priority,
+    score_leads,
+    simulate_revenue_if_all_actions_executed,
+)
+from app.services.leads.workday_engine import (
+    AT_RISK_STALE_AFTER_DAYS,
+    DAILY_TARGET_REVENUE_WINDOW_DAYS,
+    build_action_queue,
+    compute_daily_target_revenue,
+    compute_lost_opportunity_today,
+    compute_revenue_at_risk,
+    derive_required_action_and_reason,
+    get_next_mandatory_lead,
+    sum_today_potential_revenue,
+)
 
 # BACKEND-DRIVEN OPERATION LAYER (system round) — lets the product be
 # operated, demoed, and sold from the API alone whenever the Next.js
@@ -38,6 +62,96 @@ def _require_organization(session: dict) -> str:
     if organization_id is None:
         raise HTTPException(status_code=403, detail="Your account isn't part of an organization")
     return organization_id
+
+
+async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -> dict:
+    """Shared pipeline behind /system/day-plan and /system/sales-view — the
+    same sequence of already-existing service calls GET /product/summary
+    (routers/product.py) itself makes (rank_leads_by_priority(),
+    sum_today_potential_revenue(), compute_revenue_at_risk(),
+    compute_daily_target_revenue(), compute_global_decision(),
+    compute_revenue_gap(), compute_required_actions()) — independently
+    orchestrated here rather than importing that endpoint's own body, the
+    same "each endpoint composes its own calls to shared services" pattern
+    this codebase already follows for any two endpoints reading the same
+    rank_leads_by_priority() pool (e.g. GET /intelligence/aggression-level
+    and .../global-strategy each pay for their own call rather than
+    sharing one). No new calculation anywhere in this function.
+
+    Skips product_mode/kpis entirely (ideal_actions_per_day floor passed
+    as 0 to compute_required_actions — no floor override) since none of
+    this snapshot's own callers need that dimension, only the revenue/
+    action-count figures product.py's own signals dict also carries."""
+    now = datetime.now(timezone.utc)
+    ranked = await rank_leads_by_priority(db, organization_id)
+    open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
+
+    revenue_today_expected = sum_today_potential_revenue(ranked, now=now)
+    at_risk_cutoff = now - timedelta(days=AT_RISK_STALE_AFTER_DAYS)
+    revenue_at_risk = compute_revenue_at_risk(ranked, now=now, stale_cutoff=at_risk_cutoff)
+
+    revenue_cutoff = now - timedelta(days=DAILY_TARGET_REVENUE_WINDOW_DAYS)
+    daily_target_revenue = await compute_daily_target_revenue(db, organization_id, revenue_cutoff)
+
+    queue = build_action_queue(ranked)
+    mandatory_lead = get_next_mandatory_lead(queue)
+    required_action = reason = None
+    if mandatory_lead is not None:
+        required_action, reason = derive_required_action_and_reason(mandatory_lead)
+
+    lost_opportunity_today = compute_lost_opportunity_today(ranked)
+    simulation = simulate_revenue_if_all_actions_executed(ranked)
+    aggression_level = compute_aggression_level(
+        lost_opportunity_today=lost_opportunity_today,
+        current_expected=simulation["current_expected"],
+        delta=simulation["delta"],
+    )
+
+    decision = compute_global_decision(
+        mandatory_lead=mandatory_lead,
+        required_action=required_action,
+        reason=reason,
+        aggression_level=aggression_level,
+    )
+
+    revenue_gap = compute_revenue_gap(
+        {"revenue_today_possible": revenue_today_expected},
+        {"daily_target_revenue": daily_target_revenue},
+    )
+    required_actions = compute_required_actions(
+        {
+            "current_expected": simulation["current_expected"],
+            "total_open_leads": len(open_leads),
+            "next_action": decision["next_action"],
+        },
+        {"revenue_gap": revenue_gap},
+        {"ideal_actions_per_day": 0},
+    )
+
+    biggest = max(open_leads, key=lambda lead: lead.expected_value, default=None)
+    biggest_opportunity = (
+        {
+            "lead_id": biggest.id,
+            "expected_value": biggest.expected_value,
+            "next_best_action_type": biggest.next_best_action_type,
+        }
+        if biggest is not None
+        else None
+    )
+
+    return {
+        "ranked": ranked,
+        "open_leads": open_leads,
+        "revenue_today_expected": revenue_today_expected,
+        "revenue_at_risk": revenue_at_risk,
+        "revenue_gap": revenue_gap,
+        "next_action": decision["next_action"],
+        "execution_blocked": decision["execution_blocked"],
+        "required_actions_today": required_actions["required_actions_today"],
+        "required_calls_today": required_actions["required_calls_today"],
+        "required_messages_today": required_actions["required_messages_today"],
+        "biggest_opportunity": biggest_opportunity,
+    }
 
 
 class SystemEntryResponse(BaseModel):
@@ -84,6 +198,86 @@ async def system_entry(
             frontend_url=FRONTEND_URL,
             api_docs_url=f"{settings.API_V1_PREFIX}/docs",
             message=message,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemFirstAccessResponse(BaseModel):
+    message: str
+    steps: list[str]
+    quick_start: dict[str, str]
+
+
+@router.get("/first-access", response_model=ApiResponse[SystemFirstAccessResponse])
+async def system_first_access(
+    request_id: str = Depends(get_request_id),
+) -> ApiResponse[SystemFirstAccessResponse]:
+    """Onboarding copy, public and unauthenticated — no signal to aggregate,
+    just fixed instructions pointing at endpoints that already exist
+    (/system/demo-seed, /product/summary, /system/execute-action)."""
+    start = time.perf_counter()
+
+    return ApiResponse(
+        success=True,
+        data=SystemFirstAccessResponse(
+            message=(
+                "Bem-vindo ao Nexara. Este sistema prioriza automaticamente "
+                "suas oportunidades de receita e diz exatamente o que fazer "
+                "agora."
+            ),
+            steps=[
+                "1. Crie ou carregue seus leads",
+                "2. Acesse o resumo em /product/summary",
+                "3. Execute a ação recomendada",
+                "4. Atualize o lead e observe o sistema aprender",
+            ],
+            quick_start={
+                "demo": f"{settings.API_V1_PREFIX}/system/demo-seed",
+                "summary": f"{settings.API_V1_PREFIX}/product/summary",
+                "execute": f"{settings.API_V1_PREFIX}/system/execute-action",
+            },
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemExplainResponse(BaseModel):
+    what_this_is: str
+    how_it_works: list[str]
+    what_you_gain: list[str]
+
+
+@router.get("/explain", response_model=ApiResponse[SystemExplainResponse])
+async def system_explain(
+    request_id: str = Depends(get_request_id),
+) -> ApiResponse[SystemExplainResponse]:
+    """Sales/positioning copy, public and unauthenticated — fixed text, no
+    per-tenant signal (a pitch describes the product category, not any one
+    organization's own data)."""
+    start = time.perf_counter()
+
+    return ApiResponse(
+        success=True,
+        data=SystemExplainResponse(
+            what_this_is=(
+                "Um sistema que analisa seus leads e mostra exatamente onde "
+                "está o dinheiro e o que fazer agora."
+            ),
+            how_it_works=[
+                "Analisa comportamento dos leads",
+                "Identifica oportunidades com maior chance de fechamento",
+                "Prioriza automaticamente",
+                "Define a ação exata para maximizar receita",
+            ],
+            what_you_gain=[
+                "Mais vendas com menos esforço",
+                "Zero desperdício de lead",
+                "Decisão guiada por dados",
+                "Execução clara e imediata",
+            ],
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -169,9 +363,172 @@ async def system_execute_action(
     )
 
 
+class GuidedExecutionItem(BaseModel):
+    lead_id: uuid.UUID
+    company: str
+    value: int
+    action: str | None
+    reason: str | None
+    urgency: str
+
+
+@router.get("/guided-execution", response_model=ApiResponse[list[GuidedExecutionItem]])
+async def system_guided_execution(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[GuidedExecutionItem]]:
+    """Guided Execution Mode (Task 2) — the top 5 of whatever rank_leads_
+    by_priority() already prioritized (scoring.py; that pool IS the
+    priority ordering, so "top 5" is simply its own first 5 entries, no
+    new ranking). Every field read straight off the already-scored
+    LeadResponse: company (company_name, falling back to name pre-
+    enrichment), value (expected_value), action (next_best_action, the
+    same full-sentence recommendation GET /leads already exposes), reason
+    (priority_reason), urgency (next_best_action_urgency, "low" when the
+    lead has no action at all — nothing urgent about it)."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    ranked = await rank_leads_by_priority(db, organization_id)
+    open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
+    top_five = open_leads[:5]
+
+    items = [
+        GuidedExecutionItem(
+            lead_id=lead.id,
+            company=lead.company_name or lead.name,
+            value=lead.expected_value,
+            action=lead.next_best_action,
+            reason=lead.priority_reason,
+            urgency=lead.next_best_action_urgency or "low",
+        )
+        for lead in top_five
+    ]
+
+    return ApiResponse(
+        success=True,
+        data=items,
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemDayPlanResponse(BaseModel):
+    total_revenue_possible: int
+    revenue_gap: float
+    required_actions: int
+    focus: str
+    plan: list[str]
+
+
+@router.get("/day-plan", response_model=ApiResponse[SystemDayPlanResponse])
+async def system_day_plan(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemDayPlanResponse]:
+    """One Click Day Plan (Task 3) — entirely derived from
+    _compute_operations_snapshot()'s own already-computed figures (above),
+    the same ones GET /product/summary exposes under different field
+    names. focus reuses FOCUS_BY_NEXT_ACTION (compute_required_actions()'s
+    own next_action -> calls/messages/meetings mapping, intelligence.py)
+    rather than a new channel classification. Each `plan` line is a plain-
+    language rendering of a real already-computed count — required_calls_
+    today/required_messages_today (compute_required_actions()) for the
+    first two lines, and a count of open leads whose own next_best_
+    action_type is already "schedule_meeting" (no new classification, just
+    tallying an existing field across the same `ranked` pool) for the
+    third — never a fabricated number."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+    focus = FOCUS_BY_NEXT_ACTION.get(snapshot["next_action"], "messages")
+
+    plan: list[str] = []
+    if snapshot["required_calls_today"] > 0:
+        plan.append(f"Ligue para {snapshot['required_calls_today']} leads hoje")
+    if snapshot["required_messages_today"] > 0:
+        plan.append(f"Envie mensagem para {snapshot['required_messages_today']} leads hoje")
+    meetings_due = sum(
+        1 for lead in snapshot["open_leads"] if lead.next_best_action_type == "schedule_meeting"
+    )
+    if meetings_due > 0:
+        plan.append(f"Agende {meetings_due} reuniões")
+    if not plan:
+        plan.append("Nenhuma ação obrigatória agora — continue monitorando o pipeline")
+
+    return ApiResponse(
+        success=True,
+        data=SystemDayPlanResponse(
+            total_revenue_possible=snapshot["revenue_today_expected"],
+            revenue_gap=snapshot["revenue_gap"],
+            required_actions=snapshot["required_actions_today"],
+            focus=focus,
+            plan=plan,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class TopLead(BaseModel):
+    id: uuid.UUID
+    value: int
+    action: str
+
+
+class SystemSalesViewResponse(BaseModel):
+    money_now: int
+    money_at_risk: int
+    next_action: str
+    top_lead: TopLead | None
+
+
+@router.get("/sales-view", response_model=ApiResponse[SystemSalesViewResponse])
+async def system_sales_view(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemSalesViewResponse]:
+    """Minimal Sales Dashboard / "pitch view" (Task 6) — the same
+    _compute_operations_snapshot() (above) day-plan uses, trimmed to the
+    four numbers a demo actually leads with. top_lead is that snapshot's
+    own biggest_opportunity (highest expected_value among open leads),
+    same pick GET /product/summary's own biggest_opportunity makes."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+
+    top_lead = None
+    biggest = snapshot["biggest_opportunity"]
+    if biggest is not None:
+        top_lead = TopLead(
+            id=biggest["lead_id"],
+            value=biggest["expected_value"],
+            action=biggest["next_best_action_type"] or "monitor",
+        )
+
+    return ApiResponse(
+        success=True,
+        data=SystemSalesViewResponse(
+            money_now=snapshot["revenue_today_expected"],
+            money_at_risk=snapshot["revenue_at_risk"],
+            next_action=snapshot["next_action"],
+            top_lead=top_lead,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
 class SystemDemoSeedResponse(BaseModel):
     created: int
     ready: bool
+    auto_open: str
+    expected_result: str
 
 
 _DEMO_LEADS = [
@@ -272,7 +629,12 @@ async def system_demo_seed(
 
     return ApiResponse(
         success=True,
-        data=SystemDemoSeedResponse(created=len(created_leads), ready=True),
+        data=SystemDemoSeedResponse(
+            created=len(created_leads),
+            ready=True,
+            auto_open=f"{settings.API_V1_PREFIX}/system/guided-execution",
+            expected_result="Sistema pronto para demonstração imediata",
+        ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
