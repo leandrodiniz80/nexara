@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: nexara-backend
+    runtime: docker
+    repo: https://github.com/leandrodiniz80/nexara
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: API_V1_PREFIX
+        value: /api/v1
+      - key: BACKEND_CORS_ORIGINS
+        sync: false
+      - key: REDIS_URL
+        sync: false
