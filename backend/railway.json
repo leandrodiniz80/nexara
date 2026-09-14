@@ -1,6 +1,3 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
-  "deploy": {
-    "releaseCommand": "alembic upgrade head"
-  }
+  "$schema": "https://railway.app/railway.schema.json"
 }
