@@ -30,6 +30,7 @@ from app.api.routers.prospects import router as prospects_router
 from app.api.routers.read_models import router as read_models_router
 from app.api.routers.revenue import router as revenue_router
 from app.api.routers.secure_demo import router as secure_demo_router
+from app.api.routers.system import router as system_router
 from app.api.routers.tenants import router as tenants_router
 from app.api.routers.workday import router as workday_router
 from app.api.routers.workspace import router as workspace_router
@@ -118,5 +119,6 @@ def create_app() -> FastAPI:
     app.include_router(performance_router)
     app.include_router(intelligence_router)
     app.include_router(product_router)
+    app.include_router(system_router)
 
     return app
