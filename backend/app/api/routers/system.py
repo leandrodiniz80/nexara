@@ -82,19 +82,23 @@ _VALIDATE_CONSISTENCY = (
 
 
 def validate_system_consistency(*, snapshot: dict, endpoint_name: str, response_fields: dict) -> bool:
-    """Regression guard (regression-guard round) for the exact invariant
-    the live-console-consistency round's own fix established: GET
-    /product/summary and every /system/* endpoint must read main_action/
-    execution_blocked/next_action (as next_best_action)/top_priority_
-    lead_id from one shared, failure-corrected _compute_operations_
-    snapshot() (above) — never re-derive or restate them. Comparing
-    against a second, independently-fetched /product/summary response
-    would mean running its entire pipeline again — a new query set Task
-    4's own "zero performance impact" rule forbids — so this instead
-    checks that an endpoint's own final response fields still match
-    exactly what `snapshot` (the same one that endpoint already computed
-    for its own business logic, no second call) says they should be. Pure
-    in-memory dict comparison, no query, no re-scoring.
+    """Regression guard (regression-guard round; source-of-truth-upgrade
+    round) — /product/summary is the only official decision source (its
+    own endpoint, routers/product.py); `expected` below is reconstructed
+    from that exact same authoritative value set, not a second, separate
+    opinion. This works with zero new request/queries specifically
+    because GET /product/summary and _compute_operations_snapshot()
+    (above) run the identical pipeline on the identical inputs
+    (rank_leads_by_priority() -> fetch_failure_pattern_rows() ->
+    compute_failure_patterns() -> apply_failure_corrections() -> ...,
+    live-console-consistency round's own fix) — so `snapshot` already
+    holds product_summary's own main_action/execution_blocked/
+    next_action/biggest_opportunity values verbatim, without calling that
+    endpoint or its queries a second time. Compares those against
+    whatever an endpoint's own response actually resolved to, catching
+    the case where a *different* future edit desyncs an endpoint's
+    response from the values product_summary would report for the same
+    data. Pure in-memory dict comparison, no query, no re-scoring.
 
     Only runs when _VALIDATE_CONSISTENCY is on (off by default — see
     that flag's own comment). Never raises: a regression here should be
@@ -769,17 +773,13 @@ async def system_console(
         for lead in snapshot["open_leads"][:5]
     ]
 
-    # top_priority_lead_id isn't checked here: console's own top_priorities
-    # is rank_leads_by_priority()'s ordering (its first entry is the
-    # highest-priority lead), while top_priority_lead_id is biggest_
-    # opportunity's pick (highest expected_value) — two deliberately
-    # different selections, not a regression if they differ.
     consistent = validate_system_consistency(
         snapshot=snapshot,
         endpoint_name="console",
         response_fields={
             "main_action": snapshot["main_action"],
             "execution_blocked": snapshot["execution_blocked"],
+            "top_priority_lead_id": top_priorities[0].lead_id if top_priorities else None,
         },
     )
 
