@@ -792,3 +792,51 @@ async def compute_daily_target_revenue(db: AsyncSession, organization_id: str, c
     won_leads = (await db.execute(won_leads_stmt)).scalars().all()
     total = sum(get_lead_estimated_value(lead) for lead in won_leads)
     return total / DAILY_TARGET_REVENUE_WINDOW_DAYS
+
+
+# fetch_failure_pattern_rows()'s own window/cap (self-optimizing-revenue-
+# brain round) — the one genuinely new query GET /product/summary pays
+# for its own failure-correction pass: no existing aggregate joins
+# lead_lost against the action_* events that preceded it. Public (moved
+# here from routers/product.py, live-console-consistency round) so
+# _compute_operations_snapshot() (routers/system.py) can run the exact
+# same correction pass /product/summary does, without a router importing
+# from another router.
+FAILURE_PATTERN_WINDOW_DAYS = 90
+FAILURE_PATTERN_ROW_LIMIT = 2000
+
+
+async def fetch_failure_pattern_rows(db: AsyncSession, organization_id: str, *, cutoff: datetime) -> list[dict]:
+    """One bounded query backing compute_failure_patterns()'s own
+    activities["rows"] (services/leads/intelligence.py) — lead_lost +
+    action_call/action_message/action_meeting LeadActivityLog rows, the
+    only two event families that function needs and no existing aggregate
+    already joins. Moved here from routers/product.py (live-console-
+    consistency round) — same query, same shape, not reimplemented."""
+    stmt = (
+        select(
+            LeadActivityLog.lead_id,
+            LeadActivityLog.event_type,
+            LeadActivityLog.created_at,
+            LeadActivityLog.duration_seconds,
+        )
+        .where(
+            LeadActivityLog.organization_id == organization_id,
+            LeadActivityLog.event_type.in_(
+                ("lead_lost", "action_call", "action_message", "action_meeting")
+            ),
+            LeadActivityLog.created_at >= cutoff,
+        )
+        .order_by(LeadActivityLog.created_at.asc())
+        .limit(FAILURE_PATTERN_ROW_LIMIT)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "lead_id": row.lead_id,
+            "event_type": row.event_type,
+            "created_at": row.created_at,
+            "duration_seconds": row.duration_seconds,
+        }
+        for row in rows
+    ]

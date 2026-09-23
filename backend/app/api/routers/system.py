@@ -19,6 +19,7 @@ from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_
 from app.services.leads.intelligence import (
     FOCUS_BY_NEXT_ACTION,
     compute_decision_score,
+    compute_failure_patterns,
     compute_global_decision,
     compute_main_action,
     compute_pressure_message,
@@ -30,6 +31,7 @@ from app.services.leads.intelligence import (
 from app.services.leads.scoring import (
     LOSS_REASON_MARKER,
     RESPONSE_EVENT_TYPE_BY_STATE,
+    apply_failure_corrections,
     compute_aggression_level,
     compute_response_metrics,
     detect_revenue_leaks,
@@ -40,11 +42,13 @@ from app.services.leads.scoring import (
 from app.services.leads.workday_engine import (
     AT_RISK_STALE_AFTER_DAYS,
     DAILY_TARGET_REVENUE_WINDOW_DAYS,
+    FAILURE_PATTERN_WINDOW_DAYS,
     build_action_queue,
     compute_daily_target_revenue,
     compute_lost_opportunity_today,
     compute_revenue_at_risk,
     derive_required_action_and_reason,
+    fetch_failure_pattern_rows,
     get_next_mandatory_lead,
     sum_today_potential_revenue,
 )
@@ -102,11 +106,38 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
     view scope (compute_response_metrics()) was added when /system/console
     started needing sales_readiness_score/system_state too — the same
     already-established aggregate GET /intelligence/global-strategy
-    already reuses; no further query added since (decision_score/
-    pressure_message are both pure functions over figures already in
-    scope)."""
+    already reuses; decision_score/pressure_message added no further query
+    (both pure functions over figures already in scope).
+
+    Live-console-consistency round: GET /product/summary applies compute_
+    failure_patterns()/apply_failure_corrections() to `ranked` before
+    anything else reads it (score/urgency corrections that can change
+    which lead is mandatory, and therefore main_action/next_action/
+    execution_blocked) — this function did not, so every /system/*
+    endpoint built on it could disagree with /product/summary in the
+    narrow case where a real failure pattern flips the mandatory pick.
+    Fixed by running the exact same pass here, in the exact same order,
+    reusing the exact same functions (compute_failure_patterns(),
+    apply_failure_corrections() — neither reimplemented). The one
+    unavoidable cost: fetch_failure_pattern_rows()'s own bounded query
+    (moved to workday_engine.py from routers/product.py so both routers
+    can call it without one importing from the other) — compute_
+    conversion_insights()'s own two queries are deliberately skipped
+    here, since apply_failure_corrections() never reads top_loss_reason
+    (only worst_channel/failure_timing), so paying for that data a second
+    time would buy nothing; top_loss_reason is passed as None instead."""
     now = datetime.now(timezone.utc)
     ranked = await rank_leads_by_priority(db, organization_id)
+
+    failure_pattern_cutoff = now - timedelta(days=FAILURE_PATTERN_WINDOW_DAYS)
+    failure_pattern_rows = await fetch_failure_pattern_rows(
+        db, organization_id, cutoff=failure_pattern_cutoff
+    )
+    failure_patterns = compute_failure_patterns(
+        ranked, {"top_loss_reason": None, "rows": failure_pattern_rows}
+    )
+    ranked = [apply_failure_corrections(lead, failure_patterns) for lead in ranked]
+
     open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
 
     revenue_today_expected = sum_today_potential_revenue(ranked, now=now)

@@ -3,14 +3,12 @@ from datetime import datetime as dt
 from datetime import timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.auth import get_current_session
 from app.api.dependencies.common import get_db, get_request_id
 from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
-from app.models.leads.lead_activity_log import LeadActivityLog
 from app.schemas.product import ProductSummaryResponse
 from app.services.leads.intelligence import (
     compute_decision_score,
@@ -47,11 +45,13 @@ from app.services.leads.scoring import (
 from app.services.leads.workday_engine import (
     AT_RISK_STALE_AFTER_DAYS,
     DAILY_TARGET_REVENUE_WINDOW_DAYS,
+    FAILURE_PATTERN_WINDOW_DAYS,
     build_action_queue,
     compute_daily_target_revenue,
     compute_lost_opportunity_today,
     compute_revenue_at_risk,
     derive_required_action_and_reason,
+    fetch_failure_pattern_rows,
     get_next_mandatory_lead,
     sum_today_potential_revenue,
 )
@@ -64,56 +64,12 @@ from app.services.leads.workday_engine import (
 # services/leads/intelligence.py).
 router = APIRouter(prefix=f"{settings.API_V1_PREFIX}/product", tags=["Product"])
 
-# _fetch_failure_pattern_rows()'s own window/cap (self-optimizing-revenue-
-# brain round) — the one genuinely new query this endpoint pays for: no
-# existing aggregate joins lead_lost against the action_* events that
-# preceded it. Bounded the same "steady window, capped rows" way
-# compute_response_metrics()'s own window and rank_leads_by_priority()'s
-# own _PRIORITY_CANDIDATE_POOL_SIZE already are (scoring.py).
-_FAILURE_PATTERN_WINDOW_DAYS = 90
-_FAILURE_PATTERN_ROW_LIMIT = 2000
-
 
 def _require_organization(session: dict) -> str:
     organization_id = session.get("organization_id")
     if organization_id is None:
         raise HTTPException(status_code=403, detail="Your account isn't part of an organization")
     return organization_id
-
-
-async def _fetch_failure_pattern_rows(db: AsyncSession, organization_id: str, *, cutoff: dt) -> list[dict]:
-    """One bounded query backing compute_failure_patterns()'s own
-    activities["rows"] (services/leads/intelligence.py) — lead_lost +
-    action_call/action_message/action_meeting LeadActivityLog rows, the
-    only two event families that function needs and no existing aggregate
-    already joins."""
-    stmt = (
-        select(
-            LeadActivityLog.lead_id,
-            LeadActivityLog.event_type,
-            LeadActivityLog.created_at,
-            LeadActivityLog.duration_seconds,
-        )
-        .where(
-            LeadActivityLog.organization_id == organization_id,
-            LeadActivityLog.event_type.in_(
-                ("lead_lost", "action_call", "action_message", "action_meeting")
-            ),
-            LeadActivityLog.created_at >= cutoff,
-        )
-        .order_by(LeadActivityLog.created_at.asc())
-        .limit(_FAILURE_PATTERN_ROW_LIMIT)
-    )
-    rows = (await db.execute(stmt)).all()
-    return [
-        {
-            "lead_id": row.lead_id,
-            "event_type": row.event_type,
-            "created_at": row.created_at,
-            "duration_seconds": row.duration_seconds,
-        }
-        for row in rows
-    ]
 
 
 @router.get("/summary", response_model=ApiResponse[ProductSummaryResponse])
@@ -172,10 +128,13 @@ async def get_product_summary(
     # compute_lead_score()" precedent apply_strategy_override() already
     # uses. Two new queries total: compute_conversion_insights()'s own two
     # (already-established, reused verbatim for top_loss_reason — not
-    # re-parsed) and _fetch_failure_pattern_rows()'s own one bounded query.
-    failure_pattern_cutoff = now - timedelta(days=_FAILURE_PATTERN_WINDOW_DAYS)
+    # re-parsed) and fetch_failure_pattern_rows()'s own one bounded query
+    # (workday_engine.py — moved there in the live-console-consistency
+    # round so routers/system.py's own _compute_operations_snapshot() can
+    # run this exact same pass too).
+    failure_pattern_cutoff = now - timedelta(days=FAILURE_PATTERN_WINDOW_DAYS)
     conversion_insights = await compute_conversion_insights(db, organization_id)
-    failure_pattern_rows = await _fetch_failure_pattern_rows(
+    failure_pattern_rows = await fetch_failure_pattern_rows(
         db, organization_id, cutoff=failure_pattern_cutoff
     )
     failure_patterns = compute_failure_patterns(
