@@ -14,12 +14,14 @@ from app.api.responses.api_response import ApiResponse
 from app.core.config import settings
 from app.models.leads.lead import Lead
 from app.models.leads.lead_activity_log import LeadActivityLog
-from app.services.leads.enrichment import simulate_enrichment
+from app.services.leads.enrichment import format_brl, simulate_enrichment
 from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_action
 from app.services.leads.intelligence import (
     FOCUS_BY_NEXT_ACTION,
+    compute_decision_score,
     compute_global_decision,
     compute_main_action,
+    compute_pressure_message,
     compute_required_actions,
     compute_revenue_gap,
     compute_sales_readiness,
@@ -70,21 +72,27 @@ def _require_organization(session: dict) -> str:
 
 
 async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -> dict:
-    """Shared pipeline behind /system/day-plan, /system/sales-view, and
-    /system/console — the same sequence of already-existing service calls
-    GET /product/summary (routers/product.py) itself makes
-    (rank_leads_by_priority(), sum_today_potential_revenue(),
-    compute_revenue_at_risk(), compute_daily_target_revenue(),
-    compute_global_decision(), compute_revenue_gap(),
-    compute_required_actions(), compute_response_metrics(),
-    detect_revenue_leaks(), compute_sales_readiness(),
-    simplify_system_state(), compute_main_action()) — independently
-    orchestrated here rather than importing that endpoint's own body, the
-    same "each endpoint composes its own calls to shared services" pattern
-    this codebase already follows for any two endpoints reading the same
-    rank_leads_by_priority() pool (e.g. GET /intelligence/aggression-level
-    and .../global-strategy each pay for their own call rather than
-    sharing one). No new calculation anywhere in this function.
+    """Shared pipeline behind /system/day-plan, /system/sales-view,
+    /system/console, /system/execution-lock, /system/execute-and-refresh,
+    /system/command-center, and /system/narrative — the same sequence of
+    already-existing service calls GET /product/summary (routers/
+    product.py) itself makes (rank_leads_by_priority(),
+    sum_today_potential_revenue(), compute_revenue_at_risk(),
+    compute_daily_target_revenue(), compute_global_decision(),
+    compute_revenue_gap(), compute_required_actions(),
+    compute_response_metrics(), detect_revenue_leaks(),
+    compute_sales_readiness(), simplify_system_state(),
+    compute_main_action(), compute_decision_score(),
+    compute_pressure_message()) — independently orchestrated here rather
+    than importing that endpoint's own body, the same "each endpoint
+    composes its own calls to shared services" pattern this codebase
+    already follows for any two endpoints reading the same rank_leads_by_
+    priority() pool (e.g. GET /intelligence/aggression-level and
+    .../global-strategy each pay for their own call rather than sharing
+    one). No new calculation anywhere in this function — every new
+    caller added since this helper was first written only reads keys
+    already computed here, or (decision_score/pressure_message) computed
+    from local variables that already existed for another field's sake.
 
     Skips product_mode/kpis/efficiency entirely (ideal_actions_per_day
     floor passed as 0 to compute_required_actions — no floor override)
@@ -94,8 +102,9 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
     view scope (compute_response_metrics()) was added when /system/console
     started needing sales_readiness_score/system_state too — the same
     already-established aggregate GET /intelligence/global-strategy
-    already reuses, additive to what day-plan/sales-view themselves read
-    from this dict, not a behavior change for either."""
+    already reuses; no further query added since (decision_score/
+    pressure_message are both pure functions over figures already in
+    scope)."""
     now = datetime.now(timezone.utc)
     ranked = await rank_leads_by_priority(db, organization_id)
     open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
@@ -159,20 +168,43 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
     execution_rate = (
         (simulation["current_expected"] / optimized_expected * 100) if optimized_expected > 0 else 100.0
     )
+    overdue_count = sum(1 for lead in open_leads if lead.is_overdue)
+    total_open_leads = len(open_leads)
     sales_readiness_score = compute_sales_readiness(
         {
             "daily_target_revenue": daily_target_revenue,
             "current_expected": simulation["current_expected"],
             "response_rate": response_metrics.response_rate,
             "execution_rate": execution_rate,
-            "total_open_leads": len(open_leads),
-            "overdue_count": sum(1 for lead in open_leads if lead.is_overdue),
+            "total_open_leads": total_open_leads,
+            "overdue_count": overdue_count,
         },
         performance=None,
         leaks=leaks,
     )
     system_state = simplify_system_state({"sales_readiness_score": sales_readiness_score})
     main_action = compute_main_action(ranked)
+
+    # decision_score/pressure_message (Task 4, live-console-finalization
+    # round) — compute_decision_score()/compute_pressure_message() are
+    # both already-existing intelligence.py functions (product.py already
+    # calls them); reused verbatim here, not reimplemented.
+    decision_score = compute_decision_score(
+        {
+            "total_open_leads": total_open_leads,
+            "overdue_count": overdue_count,
+            "daily_target_revenue": daily_target_revenue,
+            "revenue_gap": revenue_gap,
+            "current_expected": simulation["current_expected"],
+        }
+    )
+    pressure_message = compute_pressure_message(
+        {
+            "revenue_gap": revenue_gap,
+            "system_state": system_state,
+            "main_action": main_action,
+        }
+    )
 
     return {
         "ranked": ranked,
@@ -189,6 +221,10 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
         "sales_readiness_score": sales_readiness_score,
         "system_state": system_state,
         "main_action": main_action,
+        "overdue_count": overdue_count,
+        "total_open_leads": total_open_leads,
+        "decision_score": decision_score,
+        "pressure_message": pressure_message,
     }
 
 
@@ -594,6 +630,7 @@ class SystemConsoleResponse(BaseModel):
     focus: str
     main_action: str
     required_actions: int
+    execution_blocked: bool
     top_priorities: list[ConsoleTopPriority]
     execution_plan: list[str]
     next_steps: list[str]
@@ -657,9 +694,204 @@ async def system_console(
             focus=focus,
             main_action=snapshot["main_action"],
             required_actions=snapshot["required_actions_today"],
+            execution_blocked=snapshot["execution_blocked"],
             top_priorities=top_priorities,
             execution_plan=execution_plan,
             next_steps=_CONSOLE_NEXT_STEPS,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemExecutionLockResponse(BaseModel):
+    locked: bool
+    reason: str
+    required_action: str
+    cta: str
+
+
+@router.get("/execution-lock", response_model=ApiResponse[SystemExecutionLockResponse])
+async def system_execution_lock(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemExecutionLockResponse]:
+    """Execution Lock (Task 1, live-console-finalization round) — pure
+    composition over _compute_operations_snapshot() (above): locked is
+    that snapshot's own execution_blocked (compute_global_decision(),
+    intelligence.py); required_action is its own main_action
+    (compute_main_action()); reason is a plain-language rendering of two
+    already-computed numbers (overdue_count, revenue_at_risk), no new
+    calculation. cta is fixed copy — there's only one action this screen
+    can offer either way."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+
+    if snapshot["execution_blocked"]:
+        reason = (
+            f"Você tem {snapshot['overdue_count']} leads atrasados com "
+            f"R$ {format_brl(snapshot['revenue_at_risk'])} em risco"
+        )
+        cta = "Executar agora"
+    else:
+        reason = "Nenhum bloqueio ativo — pipeline sob controle"
+        cta = "Continuar monitorando"
+
+    return ApiResponse(
+        success=True,
+        data=SystemExecutionLockResponse(
+            locked=snapshot["execution_blocked"],
+            reason=reason,
+            required_action=snapshot["main_action"],
+            cta=cta,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemExecuteAndRefreshRequest(BaseModel):
+    lead_id: uuid.UUID
+    action: str
+
+
+class SystemExecuteAndRefreshResponse(BaseModel):
+    message: str
+    expected_impact: str
+    updated_summary: dict
+
+
+@router.post("/execute-and-refresh", response_model=ApiResponse[SystemExecuteAndRefreshResponse])
+async def system_execute_and_refresh(
+    body: SystemExecuteAndRefreshRequest,
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemExecuteAndRefreshResponse]:
+    """Execute and Refresh (Task 2, live-console-finalization round) — a
+    SIMULATION: reads and scores the lead (score_leads(), scoring.py — a
+    pure computation, writes nothing) but never calls execute_lead_action()
+    and never commits, so nothing is persisted. expected_impact is the
+    lead's own already-computed expected_value (scoring.py), not a new
+    projection. updated_summary is the current _compute_operations_
+    snapshot() (above), trimmed to its JSON-serializable scalar fields —
+    since nothing was persisted, this is the real current state, not a
+    fabricated "what if" delta."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    lead = await db.get(Lead, body.lead_id)
+    if lead is None or lead.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    (scored,) = await score_leads(db, [lead])
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+    updated_summary = {
+        "revenue_today_expected": snapshot["revenue_today_expected"],
+        "revenue_at_risk": snapshot["revenue_at_risk"],
+        "revenue_gap": snapshot["revenue_gap"],
+        "next_action": snapshot["next_action"],
+        "execution_blocked": snapshot["execution_blocked"],
+        "required_actions_today": snapshot["required_actions_today"],
+        "sales_readiness_score": snapshot["sales_readiness_score"],
+        "system_state": snapshot["system_state"],
+        "main_action": snapshot["main_action"],
+    }
+
+    return ApiResponse(
+        success=True,
+        data=SystemExecuteAndRefreshResponse(
+            message=f"Ação {body.action} simulada para {scored.name} — nada foi salvo.",
+            expected_impact=f"+R$ {format_brl(scored.expected_value)} potencial",
+            updated_summary=updated_summary,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemCommandCenterResponse(BaseModel):
+    status: str
+    money_now: int
+    money_lost: float
+    main_action: str
+    next_step: str
+    leads_to_act: int
+
+
+@router.get("/command-center", response_model=ApiResponse[SystemCommandCenterResponse])
+async def system_command_center(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemCommandCenterResponse]:
+    """Command Center, simplified view (Task 3, live-console-finalization
+    round) — every field read straight off _compute_operations_snapshot()
+    (above) or _build_focus_and_plan() (above, shared with GET /system/
+    day-plan): money_lost is revenue_gap (the real, present shortfall —
+    distinct from revenue_at_risk, which is pipeline-future risk);
+    next_step is the day plan's own first line (the single most concrete
+    already-computed action, distinct from main_action's one-sentence
+    framing); leads_to_act is required_actions_today. No new calculation."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+    _focus, plan = _build_focus_and_plan(snapshot)
+
+    return ApiResponse(
+        success=True,
+        data=SystemCommandCenterResponse(
+            status=snapshot["system_state"]["status"],
+            money_now=snapshot["revenue_today_expected"],
+            money_lost=snapshot["revenue_gap"],
+            main_action=snapshot["main_action"],
+            next_step=plan[0],
+            leads_to_act=snapshot["required_actions_today"],
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class SystemNarrativeResponse(BaseModel):
+    diagnosis: str
+    opportunity: str
+    action: str
+    urgency: str
+
+
+@router.get("/narrative", response_model=ApiResponse[SystemNarrativeResponse])
+async def system_narrative(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemNarrativeResponse]:
+    """Auto Narrative (Task 4, live-console-finalization round) — pure
+    composition over exactly the three signals named: diagnosis is
+    pressure_message verbatim (compute_pressure_message(),
+    intelligence.py — already a diagnosis-style sentence); opportunity is
+    a plain-language rendering of revenue_gap (part of the same product-
+    summary signal group); action is main_action verbatim; urgency is
+    decision_score (compute_decision_score(), intelligence.py) reported
+    as-is, not bucketed into a new label scheme — inventing thresholds to
+    classify that number would be new logic this round's rules forbid."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+
+    return ApiResponse(
+        success=True,
+        data=SystemNarrativeResponse(
+            diagnosis=snapshot["pressure_message"],
+            opportunity=f"R$ {format_brl(snapshot['revenue_gap'])} recuperáveis hoje",
+            action=snapshot["main_action"],
+            urgency=f"{snapshot['decision_score']}/100",
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -993,13 +1225,15 @@ _CONSOLE_VIEW_HTML = """<!doctype html>
   .money-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
   .money-value { font-size: 2.25rem; font-weight: 700; margin-top: 0.35rem; }
   .money-value.risk { color: var(--accent); }
-  .main-action-panel { text-align: center; padding: 2.5rem 1.5rem; }
+  .main-action-panel { text-align: center; padding: 3rem 1.5rem; }
   .main-action-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-  .main-action-text { font-size: 1.75rem; font-weight: 700; margin: 0.75rem auto; max-width: 700px; line-height: 1.3; }
+  .main-action-text { font-size: 2.5rem; font-weight: 800; margin: 1rem auto; max-width: 780px; line-height: 1.25; }
   .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; margin-bottom: 0.5rem; }
   .status-on_track { background: #14532d; color: #86efac; }
   .status-attention { background: #713f12; color: #fde047; }
   .status-critical { background: #7f1d1d; color: #fca5a5; }
+  .alert-block { background: #7f1d1d; border: 1px solid #b91c1c; border-radius: 1rem; padding: 1.25rem 1.5rem; margin-bottom: 1.5rem; font-weight: 700; font-size: 1.05rem; }
+  .alert-block .tag { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #fca5a5; font-weight: 600; margin-bottom: 0.35rem; }
   .exec-btn { background: var(--accent); color: #000; border: none; border-radius: 0.75rem; padding: 1rem 2rem; font-size: 1rem; font-weight: 700; cursor: pointer; margin-top: 1rem; }
   .exec-btn:hover { background: #fb923c; }
   .exec-btn:disabled { background: #404040; color: #a3a3a3; cursor: not-allowed; }
@@ -1035,11 +1269,15 @@ _CONSOLE_VIEW_HTML = """<!doctype html>
   </div>
 
   <div id="app" style="display:none">
+    <div id="alert-block" class="alert-block" style="display:none">
+      <span class="tag">Execução bloqueada</span>
+      <span id="alert-text"></span>
+    </div>
+
     <div class="panel">
       <div class="money-grid">
-        <div><div class="money-label">Hoje é possível gerar</div><div class="money-value" id="money-today">—</div></div>
-        <div><div class="money-label">Gap para meta</div><div class="money-value risk" id="money-gap">—</div></div>
-        <div><div class="money-label">Em risco</div><div class="money-value risk" id="money-risk">—</div></div>
+        <div><div class="money-label">Dinheiro hoje</div><div class="money-value" id="money-today">—</div></div>
+        <div><div class="money-label">Dinheiro perdido</div><div class="money-value risk" id="money-gap">—</div></div>
       </div>
     </div>
 
@@ -1051,7 +1289,7 @@ _CONSOLE_VIEW_HTML = """<!doctype html>
     </div>
 
     <div class="panel">
-      <h2>Top leads</h2>
+      <h2>Top 3 leads</h2>
       <div class="leads-grid" id="leads-grid"></div>
     </div>
 
@@ -1094,7 +1332,14 @@ async function loadConsole() {
 
   document.getElementById("money-today").textContent = money(data.money.today_possible);
   document.getElementById("money-gap").textContent = money(data.money.gap);
-  document.getElementById("money-risk").textContent = money(data.money.at_risk);
+
+  const alertBlock = document.getElementById("alert-block");
+  if (data.execution_blocked) {
+    document.getElementById("alert-text").textContent = data.message;
+    alertBlock.style.display = "block";
+  } else {
+    alertBlock.style.display = "none";
+  }
 
   const badge = document.getElementById("status-badge");
   badge.textContent = data.status.replace("_", " ");
@@ -1105,7 +1350,7 @@ async function loadConsole() {
   const grid = document.getElementById("leads-grid");
   grid.innerHTML = "";
   topLeadId = null;
-  data.top_priorities.forEach((lead, index) => {
+  data.top_priorities.slice(0, 3).forEach((lead, index) => {
     if (index === 0) topLeadId = lead.lead_id;
     const card = document.createElement("div");
     card.className = "lead-card";
@@ -1176,11 +1421,15 @@ if (token) {
 
 @router.get("/console-view", response_class=HTMLResponse, include_in_schema=False)
 async def console_view() -> HTMLResponse:
-    """Nexara Live Console UI (Task 2) — pure HTML/CSS/vanilla JS, no
-    build step, no React, same dependency-free pattern as GET /system/
+    """Nexara Live Console UI (product-layer round Task 2; enhanced Task 5,
+    live-console-finalization round) — pure HTML/CSS/vanilla JS, no build
+    step, no React, same dependency-free pattern as GET /system/
     admin-lite (which this reuses the login/token approach from). Fetches
     only GET /system/console (above), which is itself pure aggregation of
     already-existing signals — this page adds no computation of its own,
-    only rendering. "EXECUTAR AÇÃO AGORA" calls the existing POST
+    only rendering: top money block trimmed to today_possible/gap, the
+    alert block shown purely from execution_blocked/message (both already
+    on the same response, no second fetch), lead cards sliced to 3
+    client-side. "EXECUTAR AÇÃO AGORA" calls the existing POST
     /system/execute-action for whichever lead top_priorities[0] names."""
     return HTMLResponse(_CONSOLE_VIEW_HTML.replace("__API_PREFIX__", settings.API_V1_PREFIX))
