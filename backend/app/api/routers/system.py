@@ -19,13 +19,18 @@ from app.services.leads.execution_engine import InvalidLeadAction, execute_lead_
 from app.services.leads.intelligence import (
     FOCUS_BY_NEXT_ACTION,
     compute_global_decision,
+    compute_main_action,
     compute_required_actions,
     compute_revenue_gap,
+    compute_sales_readiness,
+    simplify_system_state,
 )
 from app.services.leads.scoring import (
     LOSS_REASON_MARKER,
     RESPONSE_EVENT_TYPE_BY_STATE,
     compute_aggression_level,
+    compute_response_metrics,
+    detect_revenue_leaks,
     rank_leads_by_priority,
     score_leads,
     simulate_revenue_if_all_actions_executed,
@@ -65,12 +70,15 @@ def _require_organization(session: dict) -> str:
 
 
 async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -> dict:
-    """Shared pipeline behind /system/day-plan and /system/sales-view — the
-    same sequence of already-existing service calls GET /product/summary
-    (routers/product.py) itself makes (rank_leads_by_priority(),
-    sum_today_potential_revenue(), compute_revenue_at_risk(),
-    compute_daily_target_revenue(), compute_global_decision(),
-    compute_revenue_gap(), compute_required_actions()) — independently
+    """Shared pipeline behind /system/day-plan, /system/sales-view, and
+    /system/console — the same sequence of already-existing service calls
+    GET /product/summary (routers/product.py) itself makes
+    (rank_leads_by_priority(), sum_today_potential_revenue(),
+    compute_revenue_at_risk(), compute_daily_target_revenue(),
+    compute_global_decision(), compute_revenue_gap(),
+    compute_required_actions(), compute_response_metrics(),
+    detect_revenue_leaks(), compute_sales_readiness(),
+    simplify_system_state(), compute_main_action()) — independently
     orchestrated here rather than importing that endpoint's own body, the
     same "each endpoint composes its own calls to shared services" pattern
     this codebase already follows for any two endpoints reading the same
@@ -78,10 +86,16 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
     and .../global-strategy each pay for their own call rather than
     sharing one). No new calculation anywhere in this function.
 
-    Skips product_mode/kpis entirely (ideal_actions_per_day floor passed
-    as 0 to compute_required_actions — no floor override) since none of
-    this snapshot's own callers need that dimension, only the revenue/
-    action-count figures product.py's own signals dict also carries."""
+    Skips product_mode/kpis/efficiency entirely (ideal_actions_per_day
+    floor passed as 0 to compute_required_actions — no floor override)
+    since none of this snapshot's own callers need those dimensions, only
+    the revenue/action-count/readiness figures product.py's own signals
+    dict also carries. One extra query beyond the original day-plan/sales-
+    view scope (compute_response_metrics()) was added when /system/console
+    started needing sales_readiness_score/system_state too — the same
+    already-established aggregate GET /intelligence/global-strategy
+    already reuses, additive to what day-plan/sales-view themselves read
+    from this dict, not a behavior change for either."""
     now = datetime.now(timezone.utc)
     ranked = await rank_leads_by_priority(db, organization_id)
     open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
@@ -139,6 +153,27 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
         else None
     )
 
+    response_metrics = await compute_response_metrics(db, organization_id)
+    leaks = detect_revenue_leaks(ranked)
+    optimized_expected = simulation["optimized_expected"]
+    execution_rate = (
+        (simulation["current_expected"] / optimized_expected * 100) if optimized_expected > 0 else 100.0
+    )
+    sales_readiness_score = compute_sales_readiness(
+        {
+            "daily_target_revenue": daily_target_revenue,
+            "current_expected": simulation["current_expected"],
+            "response_rate": response_metrics.response_rate,
+            "execution_rate": execution_rate,
+            "total_open_leads": len(open_leads),
+            "overdue_count": sum(1 for lead in open_leads if lead.is_overdue),
+        },
+        performance=None,
+        leaks=leaks,
+    )
+    system_state = simplify_system_state({"sales_readiness_score": sales_readiness_score})
+    main_action = compute_main_action(ranked)
+
     return {
         "ranked": ranked,
         "open_leads": open_leads,
@@ -151,6 +186,9 @@ async def _compute_operations_snapshot(db: AsyncSession, organization_id: str) -
         "required_calls_today": required_actions["required_calls_today"],
         "required_messages_today": required_actions["required_messages_today"],
         "biggest_opportunity": biggest_opportunity,
+        "sales_readiness_score": sales_readiness_score,
+        "system_state": system_state,
+        "main_action": main_action,
     }
 
 
@@ -372,6 +410,25 @@ class GuidedExecutionItem(BaseModel):
     urgency: str
 
 
+def _build_guided_execution_items(leads: list) -> list[GuidedExecutionItem]:
+    """Shared by GET /system/guided-execution and GET /system/console —
+    every field read straight off the already-scored LeadResponse, see
+    GET /system/guided-execution's own docstring for which one each maps
+    to. Pure formatting, no new computation; `leads` is whatever slice
+    (already top-N) the caller passes in."""
+    return [
+        GuidedExecutionItem(
+            lead_id=lead.id,
+            company=lead.company_name or lead.name,
+            value=lead.expected_value,
+            action=lead.next_best_action,
+            reason=lead.priority_reason,
+            urgency=lead.next_best_action_urgency or "low",
+        )
+        for lead in leads
+    ]
+
+
 @router.get("/guided-execution", response_model=ApiResponse[list[GuidedExecutionItem]])
 async def system_guided_execution(
     request_id: str = Depends(get_request_id),
@@ -392,23 +449,10 @@ async def system_guided_execution(
 
     ranked = await rank_leads_by_priority(db, organization_id)
     open_leads = [lead for lead in ranked if lead.status not in ("converted", "lost")]
-    top_five = open_leads[:5]
-
-    items = [
-        GuidedExecutionItem(
-            lead_id=lead.id,
-            company=lead.company_name or lead.name,
-            value=lead.expected_value,
-            action=lead.next_best_action,
-            reason=lead.priority_reason,
-            urgency=lead.next_best_action_urgency or "low",
-        )
-        for lead in top_five
-    ]
 
     return ApiResponse(
         success=True,
-        data=items,
+        data=_build_guided_execution_items(open_leads[:5]),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
     )
@@ -422,28 +466,12 @@ class SystemDayPlanResponse(BaseModel):
     plan: list[str]
 
 
-@router.get("/day-plan", response_model=ApiResponse[SystemDayPlanResponse])
-async def system_day_plan(
-    request_id: str = Depends(get_request_id),
-    session: dict = Depends(get_current_session),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse[SystemDayPlanResponse]:
-    """One Click Day Plan (Task 3) — entirely derived from
-    _compute_operations_snapshot()'s own already-computed figures (above),
-    the same ones GET /product/summary exposes under different field
-    names. focus reuses FOCUS_BY_NEXT_ACTION (compute_required_actions()'s
-    own next_action -> calls/messages/meetings mapping, intelligence.py)
-    rather than a new channel classification. Each `plan` line is a plain-
-    language rendering of a real already-computed count — required_calls_
-    today/required_messages_today (compute_required_actions()) for the
-    first two lines, and a count of open leads whose own next_best_
-    action_type is already "schedule_meeting" (no new classification, just
-    tallying an existing field across the same `ranked` pool) for the
-    third — never a fabricated number."""
-    start = time.perf_counter()
-    organization_id = _require_organization(session)
-
-    snapshot = await _compute_operations_snapshot(db, organization_id)
+def _build_focus_and_plan(snapshot: dict) -> tuple[str, list[str]]:
+    """Shared by GET /system/day-plan and GET /system/console — see GET
+    /system/day-plan's own docstring for exactly which already-computed
+    figure each `plan` line renders. Pure formatting/aggregation over
+    `snapshot` (_compute_operations_snapshot()'s own dict, above), no new
+    computation."""
     focus = FOCUS_BY_NEXT_ACTION.get(snapshot["next_action"], "messages")
 
     plan: list[str] = []
@@ -458,6 +486,26 @@ async def system_day_plan(
         plan.append(f"Agende {meetings_due} reuniões")
     if not plan:
         plan.append("Nenhuma ação obrigatória agora — continue monitorando o pipeline")
+
+    return focus, plan
+
+
+@router.get("/day-plan", response_model=ApiResponse[SystemDayPlanResponse])
+async def system_day_plan(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemDayPlanResponse]:
+    """One Click Day Plan (Task 3) — entirely derived from
+    _compute_operations_snapshot()'s own already-computed figures (above),
+    the same ones GET /product/summary exposes under different field
+    names. focus/plan come from _build_focus_and_plan() (above) — never a
+    fabricated number."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+    focus, plan = _build_focus_and_plan(snapshot)
 
     return ApiResponse(
         success=True,
@@ -518,6 +566,100 @@ async def system_sales_view(
             money_at_risk=snapshot["revenue_at_risk"],
             next_action=snapshot["next_action"],
             top_lead=top_lead,
+        ),
+        request_id=request_id,
+        execution_time=time.perf_counter() - start,
+    )
+
+
+class ConsoleMoney(BaseModel):
+    today_possible: int
+    gap: float
+    at_risk: int
+
+
+class ConsoleTopPriority(BaseModel):
+    lead_id: uuid.UUID
+    name: str
+    value: int
+    action: str | None
+    urgency: str
+    reason: str | None
+
+
+class SystemConsoleResponse(BaseModel):
+    status: str
+    message: str
+    money: ConsoleMoney
+    focus: str
+    main_action: str
+    required_actions: int
+    top_priorities: list[ConsoleTopPriority]
+    execution_plan: list[str]
+    next_steps: list[str]
+
+
+_CONSOLE_NEXT_STEPS = [
+    "Execute a ação principal listada acima",
+    "Atualize o status do lead logo após cada contato",
+    "Recarregue o console para ver o sistema se ajustar",
+]
+
+
+@router.get("/console", response_model=ApiResponse[SystemConsoleResponse])
+async def system_console(
+    request_id: str = Depends(get_request_id),
+    session: dict = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SystemConsoleResponse]:
+    """Nexara Live Console (Task 1) — the one call GET /system/console-view
+    itself makes. Zero new computation: one _compute_operations_snapshot()
+    call (above — the same pipeline day-plan/sales-view already share)
+    supplies everything here. status/message are simplify_system_state()'s
+    own output (intelligence.py, keyed on sales_readiness_score);
+    main_action is compute_main_action()'s own sentence (intelligence.py);
+    focus/execution_plan are _build_focus_and_plan()'s own output (above,
+    shared with GET /system/day-plan); top_priorities are _build_
+    guided_execution_items()'s own output (above, shared with GET
+    /system/guided-execution) reshaped with `name` instead of `company`
+    for this view specifically — same LeadResponse fields, no new ones.
+    next_steps is fixed onboarding-style copy, same spirit as GET
+    /system/first-access's own `steps` — no per-tenant signal to derive
+    it from."""
+    start = time.perf_counter()
+    organization_id = _require_organization(session)
+
+    snapshot = await _compute_operations_snapshot(db, organization_id)
+    focus, execution_plan = _build_focus_and_plan(snapshot)
+
+    top_priorities = [
+        ConsoleTopPriority(
+            lead_id=lead.id,
+            name=lead.name,
+            value=lead.expected_value,
+            action=lead.next_best_action,
+            urgency=lead.next_best_action_urgency or "low",
+            reason=lead.priority_reason,
+        )
+        for lead in snapshot["open_leads"][:5]
+    ]
+
+    return ApiResponse(
+        success=True,
+        data=SystemConsoleResponse(
+            status=snapshot["system_state"]["status"],
+            message=snapshot["system_state"]["message"],
+            money=ConsoleMoney(
+                today_possible=snapshot["revenue_today_expected"],
+                gap=snapshot["revenue_gap"],
+                at_risk=snapshot["revenue_at_risk"],
+            ),
+            focus=focus,
+            main_action=snapshot["main_action"],
+            required_actions=snapshot["required_actions_today"],
+            top_priorities=top_priorities,
+            execution_plan=execution_plan,
+            next_steps=_CONSOLE_NEXT_STEPS,
         ),
         request_id=request_id,
         execution_time=time.perf_counter() - start,
@@ -830,3 +972,215 @@ async def admin_lite() -> HTMLResponse:
     page's own CSS/JS is full of literal `%`/`{`/`}` characters that would
     collide with either % or .format()-style templating."""
     return HTMLResponse(_ADMIN_LITE_HTML.replace("__API_PREFIX__", settings.API_V1_PREFIX))
+
+
+_CONSOLE_VIEW_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nexara — Revenue Command Center</title>
+<style>
+  :root { --bg: #000; --panel: #111111; --border: #262626; --text: #ffffff; --muted: #a3a3a3; --accent: #f97316; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
+  header { padding: 2rem 2rem 1rem; }
+  header h1 { margin: 0; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
+  header .accent { color: var(--accent); }
+  main { padding: 0 2rem 3rem; max-width: 1000px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 1rem; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .money-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+  .money-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .money-value { font-size: 2.25rem; font-weight: 700; margin-top: 0.35rem; }
+  .money-value.risk { color: var(--accent); }
+  .main-action-panel { text-align: center; padding: 2.5rem 1.5rem; }
+  .main-action-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .main-action-text { font-size: 1.75rem; font-weight: 700; margin: 0.75rem auto; max-width: 700px; line-height: 1.3; }
+  .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; margin-bottom: 0.5rem; }
+  .status-on_track { background: #14532d; color: #86efac; }
+  .status-attention { background: #713f12; color: #fde047; }
+  .status-critical { background: #7f1d1d; color: #fca5a5; }
+  .exec-btn { background: var(--accent); color: #000; border: none; border-radius: 0.75rem; padding: 1rem 2rem; font-size: 1rem; font-weight: 700; cursor: pointer; margin-top: 1rem; }
+  .exec-btn:hover { background: #fb923c; }
+  .exec-btn:disabled { background: #404040; color: #a3a3a3; cursor: not-allowed; }
+  h2 { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 0 0 1rem; }
+  .leads-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+  .lead-card { background: #1a1a1a; border: 1px solid var(--border); border-radius: 0.75rem; padding: 1rem; }
+  .lead-card .name { font-weight: 700; font-size: 1.05rem; }
+  .lead-card .value { color: var(--accent); font-weight: 700; margin: 0.25rem 0; }
+  .lead-card .action { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
+  .urgency-tag { display: inline-block; font-size: 0.7rem; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 999px; }
+  .urgency-high, .urgency-immediate { background: #7f1d1d; color: #fca5a5; }
+  .urgency-medium { background: #713f12; color: #fde047; }
+  .urgency-low { background: #262626; color: #a3a3a3; }
+  ul.plan-list { margin: 0; padding-left: 1.25rem; }
+  ul.plan-list li { margin-bottom: 0.5rem; }
+  input { width: 100%; padding: 0.65rem; margin-bottom: 0.5rem; background: #1a1a1a; border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); }
+  #login-card { max-width: 380px; margin: 6rem auto; }
+  #login-card button { width: 100%; background: var(--accent); color: #000; border: none; border-radius: 0.5rem; padding: 0.75rem; font-weight: 700; cursor: pointer; }
+  #error { color: #fca5a5; font-size: 0.85rem; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NEXARA <span class="accent">–</span> Revenue Command Center</h1>
+</header>
+<main>
+  <div id="login-card" class="panel">
+    <h2>Sign in</h2>
+    <input id="email" type="email" placeholder="you@company.com" autocomplete="email" />
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
+    <button id="login-btn">Sign in</button>
+    <div id="error"></div>
+  </div>
+
+  <div id="app" style="display:none">
+    <div class="panel">
+      <div class="money-grid">
+        <div><div class="money-label">Hoje é possível gerar</div><div class="money-value" id="money-today">—</div></div>
+        <div><div class="money-label">Gap para meta</div><div class="money-value risk" id="money-gap">—</div></div>
+        <div><div class="money-label">Em risco</div><div class="money-value risk" id="money-risk">—</div></div>
+      </div>
+    </div>
+
+    <div class="panel main-action-panel">
+      <div class="status-badge" id="status-badge">—</div>
+      <div class="main-action-label">Ação principal</div>
+      <div class="main-action-text" id="main-action">—</div>
+      <button class="exec-btn" id="exec-btn">EXECUTAR AÇÃO AGORA</button>
+    </div>
+
+    <div class="panel">
+      <h2>Top leads</h2>
+      <div class="leads-grid" id="leads-grid"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Plano de execução</h2>
+      <ul class="plan-list" id="plan-list"></ul>
+    </div>
+  </div>
+</main>
+
+<script>
+const API = "__API_PREFIX__";
+let token = localStorage.getItem("nexara_console_token");
+let topLeadId = null;
+
+function showError(msg) {
+  document.getElementById("error").textContent = msg || "";
+}
+
+async function api(path, options) {
+  const res = await fetch(API + path, Object.assign({}, options, {
+    headers: Object.assign({ "Content-Type": "application/json" }, token ? { "Authorization": "Bearer " + token } : {}, (options && options.headers) || {}),
+  }));
+  const body = await res.json();
+  if (!res.ok || body.success === false) {
+    throw new Error((body.errors && body.errors[0] && body.errors[0].message) || "Request failed");
+  }
+  return body.data;
+}
+
+function money(value) {
+  return "R$ " + Math.round(value).toLocaleString("pt-BR");
+}
+
+async function loadConsole() {
+  document.getElementById("login-card").style.display = "none";
+  document.getElementById("app").style.display = "block";
+
+  const data = await api("/system/console");
+
+  document.getElementById("money-today").textContent = money(data.money.today_possible);
+  document.getElementById("money-gap").textContent = money(data.money.gap);
+  document.getElementById("money-risk").textContent = money(data.money.at_risk);
+
+  const badge = document.getElementById("status-badge");
+  badge.textContent = data.status.replace("_", " ");
+  badge.className = "status-badge status-" + data.status;
+
+  document.getElementById("main-action").textContent = data.main_action;
+
+  const grid = document.getElementById("leads-grid");
+  grid.innerHTML = "";
+  topLeadId = null;
+  data.top_priorities.forEach((lead, index) => {
+    if (index === 0) topLeadId = lead.lead_id;
+    const card = document.createElement("div");
+    card.className = "lead-card";
+    card.innerHTML =
+      "<div class=\\"name\\">" + lead.name + "</div>" +
+      "<div class=\\"value\\">" + money(lead.value) + "</div>" +
+      "<div class=\\"action\\">" + (lead.action || "—") + "</div>" +
+      "<span class=\\"urgency-tag urgency-" + lead.urgency + "\\">" + lead.urgency + "</span>";
+    grid.appendChild(card);
+  });
+
+  const planList = document.getElementById("plan-list");
+  planList.innerHTML = "";
+  data.execution_plan.forEach((line) => {
+    const li = document.createElement("li");
+    li.textContent = line;
+    planList.appendChild(li);
+  });
+
+  const execBtn = document.getElementById("exec-btn");
+  execBtn.disabled = !topLeadId;
+}
+
+document.getElementById("exec-btn").addEventListener("click", async () => {
+  if (!topLeadId) return;
+  const btn = document.getElementById("exec-btn");
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "Executando...";
+  try {
+    const result = await api("/system/execute-action", { method: "POST", body: JSON.stringify({ lead_id: topLeadId }) });
+    alert(result.executed ? ("Executado: " + result.action) : "Nada para executar neste lead agora.");
+    await loadConsole();
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = !topLeadId;
+  }
+});
+
+document.getElementById("login-btn").addEventListener("click", async () => {
+  showError("");
+  try {
+    const session = await api("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: document.getElementById("email").value, password: document.getElementById("password").value }),
+    });
+    token = session.token;
+    localStorage.setItem("nexara_console_token", token);
+    await loadConsole();
+  } catch (e) {
+    showError(e.message);
+  }
+});
+
+if (token) {
+  loadConsole().catch(() => {
+    localStorage.removeItem("nexara_console_token");
+    token = null;
+  });
+}
+</script>
+</body>
+</html>
+"""
+
+
+@router.get("/console-view", response_class=HTMLResponse, include_in_schema=False)
+async def console_view() -> HTMLResponse:
+    """Nexara Live Console UI (Task 2) — pure HTML/CSS/vanilla JS, no
+    build step, no React, same dependency-free pattern as GET /system/
+    admin-lite (which this reuses the login/token approach from). Fetches
+    only GET /system/console (above), which is itself pure aggregation of
+    already-existing signals — this page adds no computation of its own,
+    only rendering. "EXECUTAR AÇÃO AGORA" calls the existing POST
+    /system/execute-action for whichever lead top_priorities[0] names."""
+    return HTMLResponse(_CONSOLE_VIEW_HTML.replace("__API_PREFIX__", settings.API_V1_PREFIX))
