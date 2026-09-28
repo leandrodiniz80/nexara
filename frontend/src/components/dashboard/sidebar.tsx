@@ -1,6 +1,6 @@
 "use client";
 
-import { LayoutDashboard, Megaphone, Settings, Users, Zap, type LucideIcon } from "lucide-react";
+import { Gauge, LayoutDashboard, Megaphone, Settings, Users, Zap, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -20,6 +20,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
+  { label: "Command Center", href: "/console", icon: Gauge },
   { label: "Leads", href: "/leads", icon: Users },
   { label: "Campanhas", href: "/campaigns", icon: Megaphone },
   { label: "Automações", href: "/automations", icon: Zap },

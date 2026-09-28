@@ -65,7 +65,9 @@ export default function LoginPage() {
       <div className="w-full max-w-sm space-y-8">
         <div className="flex flex-col items-center gap-2 text-center">
           <NexaraLogo className="scale-125" />
-          <p className="text-sm text-muted-foreground">B2B revenue intelligence, in one place.</p>
+          <p className="text-sm text-muted-foreground">
+            Todo dia sem o Nexara é receita que você não vê escapar.
+          </p>
         </div>
 
         <Card>

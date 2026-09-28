@@ -45,6 +45,12 @@ frontend/
 └── next.config.js
 ```
 
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Descrição |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | Sim | URL base da API do backend, incluindo o prefixo `/api/v1` (ex.: `https://api.nexara.com/api/v1`). É embutida no bundle em tempo de build — em produção (Vercel/Railway), configure-a nas variáveis de ambiente do projeto de deploy, não apenas localmente, e gere um novo build após qualquer alteração. Veja `.env.local.example`. |
+
 ## Como iniciar o frontend localmente
 
 ```bash
