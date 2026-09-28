@@ -42,10 +42,10 @@ export function TeamLeaderboard({
   teamSummary?: TeamSummary;
   currentUserEmail?: string | null;
 }) {
-  if (leaderboard.length === 0) return null;
-
   const topPerformer = leaderboard[0];
   const worstPerformer = leaderboard[leaderboard.length - 1];
+  if (!topPerformer || !worstPerformer) return null;
+
   const isCurrentUserTop = leaderboard.length > 1 && currentUserEmail === topPerformer.userId;
   const isCurrentUserLast = leaderboard.length > 1 && currentUserEmail === worstPerformer.userId;
 
