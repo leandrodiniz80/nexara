@@ -37,7 +37,11 @@ import {
   getRevenueLeaks,
 } from "@/lib/api/intelligence";
 import { getLeaderboard, getPressureState, getTeamSummary } from "@/lib/api/performance";
-import { getRevenueForecast, getRevenuePerformanceTrend, getRevenueSummary } from "@/lib/api/revenue";
+import {
+  getRevenueForecast,
+  getRevenuePerformanceTrend,
+  getRevenueSummary,
+} from "@/lib/api/revenue";
 import {
   completeLeadTask,
   executeLeadAction,
@@ -64,6 +68,8 @@ import {
 } from "@/lib/api/workday";
 import { useAuth } from "@/lib/auth/auth-context";
 import { MOCK_BUSINESS_OVERVIEW } from "@/lib/mocks/business-overview";
+
+const ENFORCEMENT_SNOOZE_MS = 30 * 60 * 1000;
 
 export default function DashboardPage() {
   const { isAuthenticated, user } = useAuth();
@@ -190,7 +196,8 @@ export default function DashboardPage() {
     retry: false,
   });
 
-  const hasRecentReassignments = activityFeed?.some((entry) => entry.type === "lead_reassigned") ?? false;
+  const hasRecentReassignments =
+    activityFeed?.some((entry) => entry.type === "lead_reassigned") ?? false;
 
   // Execution-engine round — full leads, so the mandatory-lead button and
   // each action-queue row's own button can resolve an id into a full Lead
@@ -221,6 +228,20 @@ export default function DashboardPage() {
     retry: false,
     refetchInterval: 20000,
   });
+
+  // "Resolver depois" escape hatch: pauses the enforcement overlay for
+  // ENFORCEMENT_SNOOZE_MS (also applied automatically when executing the
+  // required action fails), so the user is never stuck behind it. The 20s
+  // poll above re-renders this page, so the overlay comes back on its own
+  // once the pause expires.
+  const [enforcementSnoozedUntil, setEnforcementSnoozedUntil] = useState(0);
+  const snoozeEnforcement = () => setEnforcementSnoozedUntil(Date.now() + ENFORCEMENT_SNOOZE_MS);
+  const isEnforcementSnoozed = Date.now() < enforcementSnoozedUntil;
+  // Leads whose required action the user already executed this session: a
+  // call_now doesn't clear a lead's critical risk, so the same lead can stay
+  // "mandatory" right after being handled — re-showing the overlay for it
+  // would look like the execution silently failed.
+  const [handledEnforcementLeadIds, setHandledEnforcementLeadIds] = useState<string[]>([]);
 
   const { data: revenueForecast } = useQuery({
     queryKey: ["revenue-forecast"],
@@ -412,7 +433,8 @@ export default function DashboardPage() {
         // through, so this is not a failure.
       }
     },
-    onSuccess: () => {
+    onSuccess: (_result, { leadId }) => {
+      setHandledEnforcementLeadIds((ids) => [...ids, leadId]);
       queryClient.invalidateQueries({ queryKey: ["enforcement-state"] });
       queryClient.invalidateQueries({ queryKey: ["leads"] });
       queryClient.invalidateQueries({ queryKey: ["leads-priority"] });
@@ -422,7 +444,8 @@ export default function DashboardPage() {
       showToast("Ação executada.");
     },
     onError: () => {
-      showToast("Não foi possível executar a ação automaticamente. Abra o lead para tratar manualmente.");
+      snoozeEnforcement();
+      showToast("Não foi possível executar a ação automaticamente. Trate este lead quando puder.");
     },
   });
 
@@ -493,9 +516,7 @@ export default function DashboardPage() {
               />
             )}
 
-            {revenueSummary && (
-              <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />
-            )}
+            {revenueSummary && <RevenuePanel summary={revenueSummary} trend={revenueTrend ?? []} />}
 
             <PressureBanner pressureState={pressureState} />
 
@@ -523,7 +544,7 @@ export default function DashboardPage() {
 
             {conversionInsights && <LearningPanel insights={conversionInsights} />}
 
-            <div className="flex flex-col items-start gap-2 rounded-lg border border-primary/30 bg-primary/5 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="border-primary/30 bg-primary/5 flex flex-col items-start gap-2 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-foreground">Ready to focus?</p>
                 <p className="text-xs text-muted-foreground">
@@ -642,22 +663,26 @@ export default function DashboardPage() {
           z-50, and the modal needs to actually be reachable, not hidden
           behind this. Reappears the moment that modal closes if the lead
           is still mandatory. */}
-      {enforcementState && detailsLead?.id !== enforcementState.leadId && (
-        <EnforcementOverlay
-          state={enforcementState}
-          isExecuting={enforcementExecuteMutation.isPending}
-          onExecute={() => {
-            if (!enforcementState.leadId || !enforcementState.requiredAction) return;
-            enforcementExecuteMutation.mutate({
-              leadId: enforcementState.leadId,
-              action: enforcementState.requiredAction as LeadExecutableAction,
-            });
-          }}
-          onOpenLead={() => {
-            if (enforcementState.leadId) openLeadById(enforcementState.leadId);
-          }}
-        />
-      )}
+      {enforcementState &&
+        !isEnforcementSnoozed &&
+        !(enforcementState.leadId && handledEnforcementLeadIds.includes(enforcementState.leadId)) &&
+        detailsLead?.id !== enforcementState.leadId && (
+          <EnforcementOverlay
+            state={enforcementState}
+            isExecuting={enforcementExecuteMutation.isPending}
+            onDismiss={snoozeEnforcement}
+            onExecute={() => {
+              if (!enforcementState.leadId || !enforcementState.requiredAction) return;
+              enforcementExecuteMutation.mutate({
+                leadId: enforcementState.leadId,
+                action: enforcementState.requiredAction as LeadExecutableAction,
+              });
+            }}
+            onOpenLead={() => {
+              if (enforcementState.leadId) openLeadById(enforcementState.leadId);
+            }}
+          />
+        )}
     </>
   );
 }

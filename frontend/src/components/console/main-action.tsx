@@ -20,6 +20,7 @@ export const MainAction = memo(function MainAction({
   onExecute,
   isExecuting,
   disabled,
+  targetLeadName,
 }: {
   mainAction: string;
   moneyGap: number;
@@ -27,13 +28,11 @@ export const MainAction = memo(function MainAction({
   onExecute: () => void;
   isExecuting: boolean;
   disabled: boolean;
+  targetLeadName: string | null;
 }) {
   return (
     <Card
-      className={cn(
-        "border-2",
-        executionBlocked ? "border-destructive/50" : "border-primary/40"
-      )}
+      className={cn("border-2", executionBlocked ? "border-destructive/50" : "border-primary/40")}
     >
       <CardContent className="flex flex-col items-center gap-8 py-10 text-center">
         {moneyGap > 0 ? (
@@ -41,18 +40,18 @@ export const MainAction = memo(function MainAction({
             <p className="text-base font-medium leading-snug text-muted-foreground sm:text-lg">
               Você vai perder
             </p>
-            <p className="text-3xl font-extrabold leading-tight tabular-nums tracking-tight text-destructive sm:text-5xl">
+            <p className="text-3xl font-extrabold tabular-nums leading-tight tracking-tight text-destructive sm:text-5xl">
               {formatBRL(moneyGap)}
             </p>
             <p className="text-base font-medium leading-snug text-muted-foreground sm:text-lg">
               se não fizer isso hoje:
             </p>
-            <p className="max-w-xl text-xl font-bold leading-snug text-balance text-foreground sm:text-2xl">
+            <p className="max-w-xl text-balance text-xl font-bold leading-snug text-foreground sm:text-2xl">
               {mainAction}
             </p>
           </div>
         ) : (
-          <p className="max-w-xl text-2xl font-bold leading-snug text-balance text-foreground sm:text-3xl">
+          <p className="max-w-xl text-balance text-2xl font-bold leading-snug text-foreground sm:text-3xl">
             {mainAction}
           </p>
         )}
@@ -66,6 +65,11 @@ export const MainAction = memo(function MainAction({
         >
           {isExecuting ? "Executando…" : "EXECUTAR AGORA"}
         </Button>
+        {targetLeadName && (
+          <p className="-mt-5 text-sm text-muted-foreground">
+            Executa a ação recomendada para <span className="font-medium">{targetLeadName}</span>
+          </p>
+        )}
       </CardContent>
     </Card>
   );

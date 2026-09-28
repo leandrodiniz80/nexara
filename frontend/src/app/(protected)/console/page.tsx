@@ -15,13 +15,37 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useToast } from "@/components/ui/toast";
 import { ApiClientError } from "@/lib/api/client";
-import { getConsole, executeSystemAction, seedDemoData } from "@/lib/api/system";
+import {
+  getConsole,
+  executeSystemAction,
+  seedDemoData,
+  type ExecuteActionResult,
+} from "@/lib/api/system";
 import { useAuth } from "@/lib/auth/auth-context";
 
 // Matches CommandCenter's own poll rhythm on /dashboard — fresh enough that
 // "what to do now" never goes stale, without a refetch on every tab focus
 // or remount in between polls.
 const CONSOLE_POLL_MS = 45000;
+
+const EXECUTED_ACTION_LABEL: Record<string, string> = {
+  send_message: "mensagem enviada",
+  call_now: "ligação registrada",
+  schedule_meeting: "reunião agendada",
+};
+
+/** Tells the owner what "EXECUTAR AGORA" actually did — the button is
+ * generic, and the backend may legitimately do nothing for this lead. */
+function describeExecuteResult(result: ExecuteActionResult, leadName: string): string {
+  if (result.executed) {
+    const label = (result.action && EXECUTED_ACTION_LABEL[result.action]) ?? "ação executada";
+    return `Ação executada com sucesso: ${label} para ${leadName}.`;
+  }
+  if (result.notExecutedReason === "no_ready_message") {
+    return `${leadName} ainda não tem mensagem pronta. Abra o lead e gere a mensagem.`;
+  }
+  return `${leadName} ainda está em monitoramento — nenhuma ação necessária agora.`;
+}
 
 export default function ConsolePage() {
   const { isAuthenticated } = useAuth();
@@ -46,13 +70,12 @@ export default function ConsolePage() {
 
   const executeMutation = useMutation({
     mutationFn: (leadId: string) => executeSystemAction(leadId),
-    onSuccess: (result) => {
+    onSuccess: (result, leadId) => {
       queryClient.invalidateQueries({ queryKey: ["system-console"] });
-      showToast(
-        result.executed
-          ? "Ação executada com sucesso."
-          : "Não há nenhuma ação pendente para este lead agora."
-      );
+      const leadName =
+        consoleData?.topPriorities.find((priority) => priority.leadId === leadId)?.name ??
+        "Este lead";
+      showToast(describeExecuteResult(result, leadName));
     },
     onError: () => {
       showToast("Não foi possível executar a ação. Tente novamente.");
@@ -107,7 +130,9 @@ export default function ConsolePage() {
       ) : isError ? (
         <EmptyState
           icon={AlertCircle}
-          title={authErrorMessage ? "Acesso indisponível" : "Não foi possível carregar o Command Center"}
+          title={
+            authErrorMessage ? "Acesso indisponível" : "Não foi possível carregar o Command Center"
+          }
           description={
             authErrorMessage ??
             "Houve um problema ao conectar com o servidor. Verifique sua conexão e tente novamente."
@@ -138,7 +163,10 @@ export default function ConsolePage() {
               order otherwise: money, the one action, the short plan, then
               exactly 3 leads. Never more than one clear next step. */}
           {consoleData.executionBlocked && (
-            <AlertBlock variant="critical" message="Execução travada — você precisa fazer isso agora" />
+            <AlertBlock
+              variant="critical"
+              message="Execução travada — você precisa fazer isso agora"
+            />
           )}
 
           <MoneyBlock money={consoleData.money} />
@@ -150,6 +178,7 @@ export default function ConsolePage() {
             disabled={!topPriorityLeadId}
             isExecuting={executeMutation.isPending}
             onExecute={handleExecuteMainAction}
+            targetLeadName={consoleData.topPriorities[0]?.name ?? null}
           />
 
           {consoleData.consistencyWarning && (

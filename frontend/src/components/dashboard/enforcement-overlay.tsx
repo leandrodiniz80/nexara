@@ -19,35 +19,36 @@ const REQUIRED_ACTION_LABEL: Record<string, string> = {
   schedule_meeting: "Agendar reunião",
 };
 
-/** Autonomous-sales-OS round's hard-enforcement gate — a fullscreen,
- * undismissable overlay (fixed inset-0, high z-index, opaque backdrop)
- * rendered whenever GET /workday/enforcement-state reports blocked=true.
- * There is no close button by design: the only way out is executing
- * requiredAction (onExecute) — "Abrir lead" opens the full details modal
- * for the rare case the automatic execution can't apply (e.g. no
- * suggested_message yet), it does not dismiss the block on its own. */
+/** Autonomous-sales-OS round's enforcement gate — a fullscreen overlay
+ * (fixed inset-0, high z-index, opaque backdrop) rendered whenever
+ * GET /workday/enforcement-state reports blocked=true. The primary way out
+ * is executing requiredAction (onExecute); "Abrir lead" opens the full
+ * details modal; "Resolver depois" (onDismiss) pauses the overlay so the
+ * user is never trapped — e.g. when the automatic execution fails. */
 export function EnforcementOverlay({
   state,
   onExecute,
   onOpenLead,
+  onDismiss,
   isExecuting,
 }: {
   state: EnforcementState;
   onExecute: () => void;
   onOpenLead: () => void;
+  onDismiss: () => void;
   isExecuting: boolean;
 }) {
   if (!state.blocked || !state.leadId) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md rounded-lg border border-destructive/40 bg-card p-6 shadow-2xl">
+    <div className="bg-background/95 fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+      <div className="border-destructive/40 w-full max-w-md rounded-lg border bg-card p-6 shadow-2xl">
         <p className="text-xs font-semibold uppercase tracking-wide text-destructive">
           🚨 Ação obrigatória
         </p>
         <p className="mt-1 text-sm font-medium text-foreground">{state.reason}</p>
 
-        <div className="mt-4 space-y-1 rounded-md border border-border bg-muted/30 p-3">
+        <div className="bg-muted/30 mt-4 space-y-1 rounded-md border border-border p-3">
           <p className="text-base font-semibold text-foreground">{state.name}</p>
           {state.companyName && (
             <p className="text-sm text-muted-foreground">{state.companyName}</p>
@@ -67,11 +68,15 @@ export function EnforcementOverlay({
           <Button size="lg" variant="destructive" onClick={onExecute} disabled={isExecuting}>
             {isExecuting
               ? "Executando…"
-              : (state.requiredAction && REQUIRED_ACTION_LABEL[state.requiredAction]) ??
-                "Executar ação"}
+              : ((state.requiredAction && REQUIRED_ACTION_LABEL[state.requiredAction]) ??
+                "Executar ação")}
           </Button>
           <Button size="sm" variant="outline" onClick={onOpenLead} disabled={isExecuting}>
             Abrir lead
+          </Button>
+          {/* Never disabled — even a hung execution must not trap the user. */}
+          <Button size="sm" variant="ghost" onClick={onDismiss}>
+            Resolver depois
           </Button>
         </div>
       </div>

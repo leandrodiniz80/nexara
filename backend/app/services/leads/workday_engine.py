@@ -188,14 +188,21 @@ def get_next_mandatory_lead(queue: list[LeadResponse]) -> LeadResponse | None:
     _MANDATORY_PENDING_RESPONSE_MINUTES minutes (response_delay_minutes);
     falls back to the queue's own first entry (already the single
     highest-priority lead by build_action_queue()'s own ordering) when
-    neither condition is met by anything in it."""
-    for lead in queue:
+    neither condition is met by anything in it.
+
+    Only leads whose required action is actually executable are eligible
+    (is_required_action_executable()): the frontend turns this lead into a
+    blocking overlay, and demanding an action POST /leads/{id}/execute-action
+    would reject (send_message with no ready message) left the user stuck
+    with no way out. No executable lead -> None -> nothing is blocked."""
+    executable = [lead for lead in queue if is_required_action_executable(lead)]
+    for lead in executable:
         if lead.deal_risk_level == "critical" or (
             lead.response_delay_minutes is not None
             and lead.response_delay_minutes > _MANDATORY_PENDING_RESPONSE_MINUTES
         ):
             return lead
-    return queue[0] if queue else None
+    return executable[0] if executable else None
 
 
 async def get_next_actionable_lead(
@@ -754,11 +761,29 @@ def derive_required_action_and_reason(mandatory_lead: LeadResponse) -> tuple[str
     else:
         reason = "Ação necessária agora"
 
-    required_action = mandatory_lead.next_best_action_type
-    if required_action not in ("send_message", "call_now", "schedule_meeting"):
-        required_action = "send_message"
+    return _required_action_for(mandatory_lead), reason
 
-    return required_action, reason
+
+def _required_action_for(lead: LeadResponse) -> str:
+    """The action enforcement demands for `lead`: its own
+    next_best_action_type when that's one of the three
+    POST /leads/{id}/execute-action accepts, send_message otherwise (see
+    EnforcementStateResponse's docstring for why)."""
+    action = lead.next_best_action_type
+    if action not in ("send_message", "call_now", "schedule_meeting"):
+        return "send_message"
+    return action
+
+
+def is_required_action_executable(lead: LeadResponse) -> bool:
+    """Mirrors execute_lead_action()'s own precondition (execution_engine.py):
+    send_message needs a ready-to-send message, which scoring only produces
+    when the lead's own action type is send_message AND it has a suggested
+    message — so the "monitor" -> send_message fallback above is never
+    executable by itself. call_now/schedule_meeting have no precondition."""
+    if _required_action_for(lead) == "send_message":
+        return bool(lead.ready_to_send_message)
+    return True
 
 
 async def compute_daily_target_revenue(db: AsyncSession, organization_id: str, cutoff: datetime) -> float:

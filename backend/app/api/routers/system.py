@@ -458,6 +458,11 @@ class SystemExecuteActionResponse(BaseModel):
     action: str | None
     message_generated: str | None
     expected_revenue_impact: int
+    # Why executed=false, so the frontend can say what actually happened:
+    # "monitoring" (nothing to do for this lead yet) or "no_ready_message"
+    # (send_message recommended but no message is ready to send). None
+    # whenever executed=true.
+    not_executed_reason: str | None = None
 
 
 @router.post("/execute-action", response_model=ApiResponse[SystemExecuteActionResponse])
@@ -488,7 +493,15 @@ async def system_execute_action(
     (scored,) = await score_leads(db, [lead])
     action_type = scored.next_best_action_type
 
+    not_executed_reason = None
     if action_type is None or action_type == "monitor":
+        not_executed_reason = "monitoring"
+    elif action_type == "send_message" and not scored.ready_to_send_message:
+        # execute_lead_action() would raise InvalidLeadAction here — report
+        # it as a normal "not executed" outcome instead of a 400.
+        not_executed_reason = "no_ready_message"
+
+    if not_executed_reason is not None:
         return ApiResponse(
             success=True,
             data=SystemExecuteActionResponse(
@@ -496,6 +509,7 @@ async def system_execute_action(
                 action=action_type,
                 message_generated=None,
                 expected_revenue_impact=0,
+                not_executed_reason=not_executed_reason,
             ),
             request_id=request_id,
             execution_time=time.perf_counter() - start,

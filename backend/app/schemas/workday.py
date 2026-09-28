@@ -122,8 +122,10 @@ class WorkdaySummaryResponse(BaseModel):
 
 class EnforcementStateResponse(BaseModel):
     """GET /workday/enforcement-state — Autonomous-sales-OS round's hard
-    block: when blocked=true, the frontend shows a fullscreen overlay the
-    user cannot dismiss except by executing required_action on lead_id.
+    block: when blocked=true, the frontend shows a fullscreen overlay
+    asking the user to execute required_action on lead_id (with a "Resolver
+    depois" escape hatch). blocked is only true when that action is actually
+    executable — see get_next_mandatory_lead()/is_required_action_executable().
     Reuses get_next_mandatory_lead() (workday_engine.py) — the exact same
     lead WorkdaySummaryResponse.next_mandatory_lead_id already points at,
     exposed here as an actual gate (with enough lead detail to render

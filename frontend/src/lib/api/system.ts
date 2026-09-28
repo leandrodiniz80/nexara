@@ -97,11 +97,15 @@ export async function getConsole(): Promise<SystemConsole> {
   }
 }
 
+/** Why the backend didn't execute anything (executed=false). */
+export type NotExecutedReason = "monitoring" | "no_ready_message";
+
 export interface ExecuteActionResult {
   executed: boolean;
   action: string | null;
   messageGenerated: string | null;
   expectedRevenueImpact: number;
+  notExecutedReason: NotExecutedReason | null;
 }
 
 interface SystemExecuteActionDto {
@@ -109,6 +113,7 @@ interface SystemExecuteActionDto {
   action: string | null;
   message_generated: string | null;
   expected_revenue_impact: number;
+  not_executed_reason?: NotExecutedReason | null;
 }
 
 /** POST /api/v1/system/execute-action — executes whatever action the
@@ -118,7 +123,7 @@ export async function executeSystemAction(leadId: string): Promise<ExecuteAction
   try {
     const { data } = await apiClient.post<ApiResponse<SystemExecuteActionDto>>(
       "/system/execute-action",
-      { lead_id: leadId }
+      { lead_id: leadId },
     );
     if (!data.data) {
       throw new Error("Execute-action request succeeded but returned no data");
@@ -128,6 +133,7 @@ export async function executeSystemAction(leadId: string): Promise<ExecuteAction
       action: data.data.action,
       messageGenerated: data.data.message_generated,
       expectedRevenueImpact: data.data.expected_revenue_impact,
+      notExecutedReason: data.data.not_executed_reason ?? null,
     };
   } catch (error) {
     throw toApiClientError(error);
