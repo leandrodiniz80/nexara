@@ -445,15 +445,23 @@ async def maybe_notify_performance_alert(
     the lead has an owner), so this is otherwise unambiguous. Caller
     commits; returns whether a row was actually staged."""
     cutoff = now - timedelta(hours=_PERFORMANCE_ALERT_DEDUP_HOURS)
-    recent_alert_stmt = select(UserNotification.id).where(
-        UserNotification.organization_id == organization_id,
-        UserNotification.user_email == user_email,
-        UserNotification.lead_id.is_(None),
-        UserNotification.created_at >= cutoff,
-        ~UserNotification.message.contains(IGNORED_LEADS_ALERT_MARKER),
-        ~UserNotification.message.contains(PIPELINE_RISK_ALERT_MARKER),
+    recent_alert_stmt = (
+        select(UserNotification.id)
+        .where(
+            UserNotification.organization_id == organization_id,
+            UserNotification.user_email == user_email,
+            UserNotification.lead_id.is_(None),
+            UserNotification.created_at >= cutoff,
+            ~UserNotification.message.contains(IGNORED_LEADS_ALERT_MARKER),
+            ~UserNotification.message.contains(PIPELINE_RISK_ALERT_MARKER),
+        )
+        .limit(1)
     )
-    already_sent = (await db.execute(recent_alert_stmt)).scalar_one_or_none()
+    # An existence check, not a single-row lookup: concurrent dashboard
+    # requests can both pass it and stage an alert, leaving two matching rows
+    # — scalar_one_or_none() then raised MultipleResultsFound (a 500 on every
+    # GET /workday/performance until the dedup window expired).
+    already_sent = (await db.execute(recent_alert_stmt)).scalars().first()
     if already_sent is not None:
         return False
 
