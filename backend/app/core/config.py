@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +23,16 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str
 
     BACKEND_CORS_ORIGINS: list[str] = []
+
+    # Who may call POST /auth/register (see that route's docstring):
+    # - "invite" (default, production): only a logged-in platform admin, or a
+    #   caller sending REGISTRATION_INVITE_TOKEN in the X-Invite-Token header.
+    #   With no token configured, sign-up is closed to everyone but admins.
+    # - "open": legacy anonymous self-registration, kept only so the automated
+    #   test suite (which builds its fixtures through this route) keeps
+    #   working. Never set this in production.
+    REGISTRATION_MODE: Literal["invite", "open"] = "invite"
+    REGISTRATION_INVITE_TOKEN: str = ""
 
     # Stripe is an optional feature toggle: empty defaults mean the platform
     # boots and runs fully without it (manual plan upgrades stay available).
