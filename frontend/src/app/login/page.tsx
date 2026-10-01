@@ -48,12 +48,15 @@ export default function LoginPage() {
       await login(values.email, values.password);
       router.replace("/dashboard");
     } catch (error) {
+      // Same message for unknown e-mail and wrong password (the backend
+      // answers 401 for both) so the form never reveals which e-mails exist.
+      const status = error instanceof ApiClientError ? error.status : null;
       const message =
-        error instanceof ApiClientError && error.status === 401
-          ? "Invalid email or password."
-          : error instanceof Error
-            ? error.message
-            : "Something went wrong. Please try again.";
+        status === 401
+          ? "E-mail ou senha incorretos."
+          : status === 429
+            ? "Muitas tentativas de login. Aguarde alguns minutos e tente novamente."
+            : "Não foi possível entrar agora. Tente novamente.";
       setSubmitError(message);
     } finally {
       setIsSubmitting(false);
@@ -86,9 +89,7 @@ export default function LoginPage() {
                   aria-invalid={errors.email ? "true" : "false"}
                   {...register("email")}
                 />
-                {errors.email && (
-                  <p className="text-sm text-destructive">{errors.email.message}</p>
-                )}
+                {errors.email && <p className="text-sm text-destructive">{errors.email.message}</p>}
               </div>
 
               <div className="space-y-2">
@@ -109,7 +110,7 @@ export default function LoginPage() {
               {submitError && (
                 <div
                   role="alert"
-                  className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                  className="border-destructive/30 bg-destructive/10 rounded-md border px-3 py-2 text-sm text-destructive"
                 >
                   {submitError}
                 </div>

@@ -52,7 +52,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
-    const session = await authApi.registerOrLogin(email, password);
+    // Login only authenticates — it must never create an account (a typo'd
+    // e-mail used to silently become a new, empty account).
+    const session = await authApi.login({ email, password });
     setToken(session.token);
     const me = await authApi.me();
     setUser(me);
